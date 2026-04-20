@@ -1,0 +1,28 @@
+routes:
+  - id: n8n
+    display_name: n8n MCP
+    path_prefix: /n8n
+    upstream: http://n8n-mcp:8080
+    upstream_mcp_path: /mcp
+    scopes_supported:
+      - mcp
+    forward_headers:
+      Authorization: "Bearer REPLACE_WITH_INTERNAL_N8N_AUTH_TOKEN"
+
+  - id: portainer
+    display_name: Portainer MCP
+    path_prefix: /portainer
+    upstream: http://portainer-mcp:8080
+    upstream_mcp_path: /mcp
+    scopes_supported:
+      - mcp
+
+  - id: camoufox
+    display_name: Camoufox MCP
+    path_prefix: /camoufox
+    upstream: http://camoufox-mcp:3000
+    upstream_mcp_path: /mcp
+    scopes_supported:
+      - mcp
+    forward_headers:
+      Authorization: "Bearer REPLACE_WITH_INTERNAL_CAMOUFOX_AUTH_TOKEN"
