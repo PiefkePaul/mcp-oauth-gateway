@@ -17,17 +17,13 @@ FROM debian:bookworm-slim
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --home /nonexistent --shell /usr/sbin/nologin appuser
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 COPY --from=build /out/mcp-oauth-gateway /usr/local/bin/mcp-oauth-gateway
 
-RUN mkdir -p /config /data \
-    && chown -R appuser:appuser /config /data
-
-USER appuser
+RUN mkdir -p /config /data
 
 EXPOSE 8080
 

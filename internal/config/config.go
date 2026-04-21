@@ -151,7 +151,16 @@ func (r Route) HeaderTemplates() map[string]string {
 func LoadRoutesFile(routesPath string) ([]Route, error) {
 	routesPayload, err := os.ReadFile(routesPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read routes config %q: %w", routesPath, err)
+		if os.IsNotExist(err) {
+			if err := SaveRoutesFile(routesPath, []Route{}); err != nil {
+				return nil, fmt.Errorf("failed to initialize empty routes config %q: %w", routesPath, err)
+			}
+			routesPayload = []byte("routes: []\n")
+		} else if os.IsPermission(err) {
+			return nil, fmt.Errorf("failed to read routes config %q: permission denied; ensure the mounted config directory is readable and writable by the gateway container: %w", routesPath, err)
+		} else {
+			return nil, fmt.Errorf("failed to read routes config %q: %w", routesPath, err)
+		}
 	}
 
 	var parsed routesFile

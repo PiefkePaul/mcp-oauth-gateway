@@ -57,6 +57,8 @@ Der Master-Key muss genau 32 Bytes nach Base64-, Base64URL- oder Hex-Decoding er
 3. Leite in deinem Reverse-Proxy den kompletten Host `mcp.example.com` auf `http://<gateway-host>:8080`.
 4. Die internen MCP-Container muessen im selben Docker-Netz wie der Gateway erreichbar sein.
 
+Wenn `/config/routes.yaml` beim Start fehlt, erstellt der Gateway automatisch eine leere Datei mit `routes: []`. Das `/config`-Volume muss trotzdem les- und schreibbar sein, damit das Dashboard Routen speichern kann.
+
 Ein Compose-Beispiel liegt in [docker-compose.example.yaml](/Volumes/ssd-data/Docker/mcp-oauth-gateway/docker-compose.example.yaml).
 
 ## Dashboard
