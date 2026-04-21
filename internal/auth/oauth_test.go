@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-func TestAuthorizeApprovalRedirectsWithSeeOther(t *testing.T) {
+func TestAuthorizeApprovalReturnsBrowserRedirectPage(t *testing.T) {
 	manager := newTestManager(t, "admin@example.com", "super-secret-password")
 
 	client, err := manager.registerClient(
@@ -53,22 +53,28 @@ func TestAuthorizeApprovalRedirectsWithSeeOther(t *testing.T) {
 
 	manager.HandleAuthorize(rec, req)
 
-	if rec.Code != http.StatusSeeOther {
-		t.Fatalf("expected 303, got %d with body %q", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d with body %q", rec.Code, rec.Body.String())
 	}
-	location := rec.Header().Get("Location")
-	if !strings.HasPrefix(location, "https://claude.ai/api/mcp/auth_callback?") {
-		t.Fatalf("unexpected redirect location %q", location)
+	if rec.Header().Get("Location") != "" {
+		t.Fatalf("expected no Location header, got %q", rec.Header().Get("Location"))
 	}
-	if !strings.Contains(location, "code=") {
-		t.Fatalf("expected code in redirect location %q", location)
+	if !strings.Contains(rec.Header().Get("Content-Security-Policy"), "script-src 'unsafe-inline'") {
+		t.Fatalf("expected redirect page CSP to allow inline redirect script, got %q", rec.Header().Get("Content-Security-Policy"))
 	}
-	if !strings.Contains(location, "state=state-value") {
-		t.Fatalf("expected state in redirect location %q", location)
+	body := rec.Body.String()
+	if !strings.Contains(body, "https://claude.ai/api/mcp/auth_callback?") {
+		t.Fatalf("expected callback URL in redirect page, got %q", body)
+	}
+	if !strings.Contains(body, "code=") {
+		t.Fatalf("expected code in redirect page, got %q", body)
+	}
+	if !strings.Contains(body, "state=state-value") {
+		t.Fatalf("expected state in redirect page, got %q", body)
 	}
 }
 
-func TestAuthorizeDenyRedirectsWithSeeOther(t *testing.T) {
+func TestAuthorizeDenyReturnsBrowserRedirectPage(t *testing.T) {
 	manager := newTestManager(t, "admin@example.com", "super-secret-password")
 
 	client, err := manager.registerClient(
@@ -113,14 +119,17 @@ func TestAuthorizeDenyRedirectsWithSeeOther(t *testing.T) {
 
 	manager.HandleAuthorize(rec, req)
 
-	if rec.Code != http.StatusSeeOther {
-		t.Fatalf("expected 303, got %d with body %q", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d with body %q", rec.Code, rec.Body.String())
 	}
-	location := rec.Header().Get("Location")
-	if !strings.HasPrefix(location, "https://claude.ai/api/mcp/auth_callback?") {
-		t.Fatalf("unexpected redirect location %q", location)
+	if rec.Header().Get("Location") != "" {
+		t.Fatalf("expected no Location header, got %q", rec.Header().Get("Location"))
 	}
-	if !strings.Contains(location, "error=access_denied") {
-		t.Fatalf("expected access_denied in redirect location %q", location)
+	body := rec.Body.String()
+	if !strings.Contains(body, "https://claude.ai/api/mcp/auth_callback?") {
+		t.Fatalf("expected callback URL in redirect page, got %q", body)
+	}
+	if !strings.Contains(body, "error=access_denied") {
+		t.Fatalf("expected access_denied in redirect page, got %q", body)
 	}
 }

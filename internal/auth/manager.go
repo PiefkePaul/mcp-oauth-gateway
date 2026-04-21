@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1397,17 +1398,17 @@ func renderHTML(w http.ResponseWriter, tmpl string, data map[string]any) {
 
 func renderRedirectHTML(w http.ResponseWriter, title, targetURL string) {
 	t := template.Must(template.New("redirect").Parse(redirectTemplate))
-	w.Header().Set("Location", targetURL)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Pragma", "no-cache")
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; navigate-to 'self' *")
-	w.WriteHeader(http.StatusSeeOther)
-	_ = t.Execute(w, map[string]string{
-		"Title":  title,
-		"Target": targetURL,
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; navigate-to 'self' *")
+	_ = t.Execute(w, map[string]any{
+		"Title":         title,
+		"TargetURL":     template.URL(targetURL),
+		"TargetURLJS":   template.JS(strconv.Quote(targetURL)),
+		"TargetDisplay": targetURL,
 	})
 }
 
@@ -1530,15 +1531,31 @@ const redirectTemplate = `
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta http-equiv="refresh" content="0; url={{.Target}}">
   <meta name="referrer" content="no-referrer">
   <title>{{.Title}}</title>
   <style>
     body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 2rem; color: #122033; }
+    code { background: #f2f5f9; padding: 0.1rem 0.35rem; border-radius: 6px; word-break: break-all; }
   </style>
+  <script>
+    (function () {
+      var target = {{.TargetURLJS}};
+      try { window.location.replace(target); } catch (e) {}
+      try {
+        if (window.top && window.top !== window) {
+          window.top.location.href = target;
+          return;
+        }
+      } catch (e) {}
+      setTimeout(function () {
+        try { window.location.href = target; } catch (e) {}
+      }, 50);
+    }());
+  </script>
 </head>
 <body>
-  <p>Redirecting… If nothing happens, <a href="{{.Target}}">continue here</a>.</p>
+  <p>Redirecting... If nothing happens, <a href="{{.TargetURL}}">continue here</a>.</p>
+  <p><code>{{.TargetDisplay}}</code></p>
 </body>
 </html>
 `
