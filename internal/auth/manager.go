@@ -1404,7 +1404,7 @@ func renderRedirectHTML(w http.ResponseWriter, title, targetURL string) {
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; navigate-to 'self' *")
-	w.WriteHeader(http.StatusFound)
+	w.WriteHeader(http.StatusSeeOther)
 	_ = t.Execute(w, map[string]string{
 		"Title":  title,
 		"Target": targetURL,
