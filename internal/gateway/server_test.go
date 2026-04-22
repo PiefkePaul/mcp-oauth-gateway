@@ -203,8 +203,11 @@ func TestRouteAccessPolicy(t *testing.T) {
 	if routeAccessAllowed(route, &auth.Identity{Email: "blocked@example.com", GroupNames: []string{"Legal Team"}}) {
 		t.Fatalf("expected denied user to be rejected")
 	}
+	if routeAccessAllowed(route, &auth.Identity{Email: "blocked@example.com", IsAdmin: true}) {
+		t.Fatalf("expected explicit deny to reject admins too")
+	}
 	if !routeAccessAllowed(route, &auth.Identity{Email: "admin@example.com", IsAdmin: true}) {
-		t.Fatalf("expected admin to bypass route restrictions")
+		t.Fatalf("expected non-denied admin to bypass route restrictions")
 	}
 }
 

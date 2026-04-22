@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/PiefkePaul/mcp-oauth-gateway/internal/config"
+	"github.com/ulikunitz/xz"
 )
 
 const (
@@ -28,6 +29,7 @@ const (
 	artifactSourceURL    = "url"
 	extractNone          = "none"
 	extractTarGZ         = "tar.gz"
+	extractTarXZ         = "tar.xz"
 	extractZip           = "zip"
 	buildContextFile     = "mcp-entrypoint"
 )
@@ -152,9 +154,9 @@ func (b *artifactBuilder) validateRequest(req artifactBuildRequest) error {
 		return fmt.Errorf("base image %q is not allowed", req.BaseImage)
 	}
 	switch strings.TrimSpace(req.ExtractMode) {
-	case extractNone, extractTarGZ, extractZip:
+	case extractNone, extractTarGZ, extractTarXZ, extractZip:
 	default:
-		return fmt.Errorf("extract mode must be none, tar.gz or zip")
+		return fmt.Errorf("extract mode must be none, tar.gz, tar.xz or zip")
 	}
 	if req.ExtractMode != extractNone && strings.TrimSpace(req.ArtifactPath) == "" {
 		return fmt.Errorf("artifact path inside archive is required")
@@ -257,6 +259,8 @@ func selectEntrypointArtifact(raw []byte, mode, artifactPath string, maxBytes in
 		return raw, nil
 	case extractTarGZ:
 		return extractFromTarGZ(raw, artifactPath, maxBytes)
+	case extractTarXZ:
+		return extractFromTarXZ(raw, artifactPath, maxBytes)
 	case extractZip:
 		return extractFromZip(raw, artifactPath, maxBytes)
 	default:
@@ -275,7 +279,22 @@ func extractFromTarGZ(raw []byte, artifactPath string, maxBytes int64) ([]byte, 
 	}
 	defer gz.Close()
 
-	tr := tar.NewReader(gz)
+	return extractFromTarReader(tar.NewReader(gz), target, artifactPath, maxBytes)
+}
+
+func extractFromTarXZ(raw []byte, artifactPath string, maxBytes int64) ([]byte, error) {
+	target, err := cleanArchivePath(artifactPath)
+	if err != nil {
+		return nil, err
+	}
+	xzr, err := xz.NewReader(bytes.NewReader(raw))
+	if err != nil {
+		return nil, fmt.Errorf("open tar.xz: %w", err)
+	}
+	return extractFromTarReader(tar.NewReader(xzr), target, artifactPath, maxBytes)
+}
+
+func extractFromTarReader(tr *tar.Reader, target, artifactPath string, maxBytes int64) ([]byte, error) {
 	for {
 		header, err := tr.Next()
 		if err == io.EOF {
@@ -283,6 +302,9 @@ func extractFromTarGZ(raw []byte, artifactPath string, maxBytes int64) ([]byte, 
 		}
 		if err != nil {
 			return nil, fmt.Errorf("read tar.gz: %w", err)
+		}
+		if header.Typeflag == tar.TypeDir && isArchiveRootPath(header.Name) {
+			continue
 		}
 		name, err := cleanArchivePath(header.Name)
 		if err != nil {
@@ -312,6 +334,9 @@ func extractFromZip(raw []byte, artifactPath string, maxBytes int64) ([]byte, er
 		return nil, fmt.Errorf("open zip: %w", err)
 	}
 	for _, file := range reader.File {
+		if file.FileInfo().IsDir() && isArchiveRootPath(file.Name) {
+			continue
+		}
 		name, err := cleanArchivePath(file.Name)
 		if err != nil {
 			return nil, fmt.Errorf("unsafe archive path %q", file.Name)
@@ -345,6 +370,11 @@ func cleanArchivePath(raw string) (string, error) {
 		return "", fmt.Errorf("archive path must not traverse directories")
 	}
 	return clean, nil
+}
+
+func isArchiveRootPath(raw string) bool {
+	value := strings.ReplaceAll(strings.TrimSpace(raw), "\\", "/")
+	return value != "" && path.Clean(value) == "."
 }
 
 func buildDockerContext(entrypoint []byte, baseImage string, entrypointArgs []string, internalPort int) ([]byte, error) {

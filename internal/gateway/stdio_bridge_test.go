@@ -31,7 +31,7 @@ done`
 		t.Fatalf("normalize route: %v", err)
 	}
 
-	handler, closeFn, err := newStdioBridge(route)
+	handler, closeFn, err := newStdioBridge(route, nil)
 	if err != nil {
 		t.Fatalf("create bridge: %v", err)
 	}
@@ -60,6 +60,52 @@ done`
 	}
 	if !strings.Contains(listRec.Body.String(), `"hello"`) {
 		t.Fatalf("unexpected tools/list body: %s", listRec.Body.String())
+	}
+}
+
+func TestStdioBridgeInjectsResolvedSecretEnvironment(t *testing.T) {
+	script := `while IFS= read -r line; do
+case "$line" in
+  *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"%s","version":"1.0.0"}}}\n' "$SECRET_ENV" ;;
+esac
+done`
+	route := config.Route{
+		ID:              "secret-stdio-test",
+		DisplayName:     "Secret STDIO Test",
+		Transport:       "stdio",
+		PathPrefix:      "/secret-stdio-test",
+		UpstreamMCPPath: "/mcp",
+		Stdio: &config.RouteStdio{
+			Command: "/bin/sh",
+			Args:    []string{"-c", script},
+			EnvSecretRefs: map[string]string{
+				"SECRET_ENV": "route:secret-stdio-test:env:SECRET_ENV",
+			},
+		},
+	}
+	if err := config.NormalizeRoute(&route); err != nil {
+		t.Fatalf("normalize route: %v", err)
+	}
+
+	handler, closeFn, err := newStdioBridge(route, func(got config.Route) (map[string]string, error) {
+		if got.ID != route.ID {
+			t.Fatalf("expected resolver route %q, got %q", route.ID, got.ID)
+		}
+		return map[string]string{"SECRET_ENV": "from-secret-store"}, nil
+	})
+	if err != nil {
+		t.Fatalf("create bridge: %v", err)
+	}
+	defer func() { _ = closeFn() }()
+
+	initReq := httptest.NewRequest(http.MethodPost, "/secret-stdio-test/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`))
+	initRec := httptest.NewRecorder()
+	handler.ServeHTTP(initRec, initReq)
+	if initRec.Code != http.StatusOK {
+		t.Fatalf("initialize status = %d body=%s", initRec.Code, initRec.Body.String())
+	}
+	if !strings.Contains(initRec.Body.String(), `"from-secret-store"`) {
+		t.Fatalf("expected resolved secret in child process environment, got %s", initRec.Body.String())
 	}
 }
 

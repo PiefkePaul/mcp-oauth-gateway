@@ -32,11 +32,14 @@ const (
 )
 
 type stdioBridge struct {
-	route config.Route
+	route          config.Route
+	secretResolver stdioSecretResolver
 
 	mu       sync.Mutex
 	sessions map[string]*stdioSession
 }
+
+type stdioSecretResolver func(route config.Route) (map[string]string, error)
 
 type stdioSession struct {
 	id     string
@@ -61,13 +64,14 @@ type rpcEnvelope struct {
 	Method string          `json:"method,omitempty"`
 }
 
-func newStdioBridge(route config.Route) (http.Handler, func() error, error) {
+func newStdioBridge(route config.Route, resolver stdioSecretResolver) (http.Handler, func() error, error) {
 	if route.Stdio == nil {
 		return nil, nil, fmt.Errorf("route %q stdio config is required", route.ID)
 	}
 	bridge := &stdioBridge{
-		route:    route,
-		sessions: make(map[string]*stdioSession),
+		route:          route,
+		secretResolver: resolver,
+		sessions:       make(map[string]*stdioSession),
 	}
 	return bridge, bridge.Close, nil
 }
@@ -233,7 +237,7 @@ func (b *stdioBridge) sessionForRequest(requestedID string, forceNew bool) (*std
 	if err != nil {
 		return nil, err
 	}
-	session, err := newStdioSession(sessionID, b.route)
+	session, err := newStdioSession(sessionID, b.route, b.secretResolver)
 	if err != nil {
 		return nil, err
 	}
@@ -259,16 +263,32 @@ func (b *stdioBridge) Close() error {
 	return closeErr
 }
 
-func newStdioSession(sessionID string, route config.Route) (*stdioSession, error) {
+func newStdioSession(sessionID string, route config.Route, resolver stdioSecretResolver) (*stdioSession, error) {
 	if route.Stdio == nil {
 		return nil, fmt.Errorf("stdio config is required")
+	}
+	env := make(map[string]string, len(route.Stdio.Env)+len(route.Stdio.EnvSecretRefs))
+	for key, value := range route.Stdio.Env {
+		env[key] = value
+	}
+	if len(route.Stdio.EnvSecretRefs) != 0 {
+		if resolver == nil {
+			return nil, fmt.Errorf("stdio route has secret refs but no secret resolver")
+		}
+		secrets, err := resolver(route)
+		if err != nil {
+			return nil, err
+		}
+		for key, value := range secrets {
+			env[key] = value
+		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(ctx, route.Stdio.Command, route.Stdio.Args...)
 	if route.Stdio.WorkingDir != "" {
 		cmd.Dir = route.Stdio.WorkingDir
 	}
-	cmd.Env = append(os.Environ(), envMapToList(route.Stdio.Env)...)
+	cmd.Env = append(os.Environ(), envMapToList(env)...)
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {

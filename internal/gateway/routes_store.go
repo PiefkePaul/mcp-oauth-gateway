@@ -14,7 +14,7 @@ type routeRuntime struct {
 }
 
 func (s *Server) replaceRoutes(routes []config.Route) error {
-	runtimes, err := buildRouteRuntime(routes)
+	runtimes, err := s.buildRouteRuntime(routes)
 	if err != nil {
 		return err
 	}
@@ -146,7 +146,7 @@ func (s *Server) validateUpsertRoute(originalID string, route config.Route) erro
 	if err := config.ValidateRoutes(nextRoutes); err != nil {
 		return err
 	}
-	_, err := buildRouteRuntime(nextRoutes)
+	_, err := s.buildRouteRuntime(nextRoutes)
 	return err
 }
 
@@ -182,7 +182,7 @@ func (s *Server) persistRoutesLocked(routes []config.Route) error {
 		return err
 	}
 
-	runtimes, err := buildRouteRuntime(cloned)
+	runtimes, err := s.buildRouteRuntime(cloned)
 	if err != nil {
 		return err
 	}
@@ -199,7 +199,7 @@ func (s *Server) persistRoutesLocked(routes []config.Route) error {
 	return nil
 }
 
-func buildRouteRuntime(routes []config.Route) (map[string]routeRuntime, error) {
+func (s *Server) buildRouteRuntime(routes []config.Route) (map[string]routeRuntime, error) {
 	runtimes := make(map[string]routeRuntime, len(routes))
 	for _, route := range cloneRoutes(routes) {
 		var (
@@ -209,7 +209,7 @@ func buildRouteRuntime(routes []config.Route) (map[string]routeRuntime, error) {
 		)
 		switch route.Transport {
 		case "stdio":
-			stdioHandler, stdioClose, stdioErr := newStdioBridge(route)
+			stdioHandler, stdioClose, stdioErr := newStdioBridge(route, s.resolveStdioSecrets)
 			handler = stdioHandler
 			closeFn = stdioClose
 			err = stdioErr
@@ -229,6 +229,13 @@ func buildRouteRuntime(routes []config.Route) (map[string]routeRuntime, error) {
 		}
 	}
 	return runtimes, nil
+}
+
+func (s *Server) resolveStdioSecrets(route config.Route) (map[string]string, error) {
+	if route.Stdio == nil || len(route.Stdio.EnvSecretRefs) == 0 {
+		return nil, nil
+	}
+	return s.authManager.ResolveRouteEnvSecretRefs(route.ID, route.Stdio.EnvSecretRefs)
 }
 
 func closeRouteRuntimes(runtimes map[string]routeRuntime) {
@@ -283,9 +290,10 @@ func cloneRoutes(routes []config.Route) []config.Route {
 		}
 		if routes[i].Stdio != nil {
 			cloned[i].Stdio = &config.RouteStdio{
-				Command:    routes[i].Stdio.Command,
-				Args:       append([]string(nil), routes[i].Stdio.Args...),
-				WorkingDir: routes[i].Stdio.WorkingDir,
+				Command:       routes[i].Stdio.Command,
+				Args:          append([]string(nil), routes[i].Stdio.Args...),
+				EnvSecretRefs: cloneStringMap(routes[i].Stdio.EnvSecretRefs),
+				WorkingDir:    routes[i].Stdio.WorkingDir,
 			}
 			if routes[i].Stdio.Env != nil {
 				cloned[i].Stdio.Env = make(map[string]string, len(routes[i].Stdio.Env))
@@ -294,6 +302,26 @@ func cloneRoutes(routes []config.Route) []config.Route {
 				}
 			}
 		}
+		if routes[i].OpenAPI != nil {
+			cloned[i].OpenAPI = &config.RouteOpenAPI{
+				SpecPath:       routes[i].OpenAPI.SpecPath,
+				SpecURL:        routes[i].OpenAPI.SpecURL,
+				BaseURL:        routes[i].OpenAPI.BaseURL,
+				Headers:        cloneStringMap(routes[i].OpenAPI.Headers),
+				TimeoutSeconds: routes[i].OpenAPI.TimeoutSeconds,
+			}
+		}
 	}
 	return cloned
+}
+
+func cloneStringMap(in map[string]string) map[string]string {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
 }

@@ -1,7 +1,9 @@
 package auth
 
 import (
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -139,6 +141,44 @@ func TestUserDevicesCanBeListedAndRevoked(t *testing.T) {
 	}
 	if got := manager.ListUserDevices(admin.ID); len(got) != 0 {
 		t.Fatalf("expected devices to be revoked, got %#v", got)
+	}
+}
+
+func TestRouteEnvSecretsAreEncryptedAndResolvable(t *testing.T) {
+	manager := newTestManager(t, "admin@example.com", "super-secret-password")
+	secret := " feedfacecafebeef "
+
+	if err := manager.SetRouteEnvSecrets("anna", map[string]string{
+		"ANNAS_SECRET_KEY": secret,
+	}); err != nil {
+		t.Fatalf("set route secrets: %v", err)
+	}
+
+	rawStore, err := os.ReadFile(manager.cfg.StorePath)
+	if err != nil {
+		t.Fatalf("read auth store: %v", err)
+	}
+	if strings.Contains(string(rawStore), secret) || strings.Contains(string(rawStore), "ANNAS_SECRET_KEY") {
+		t.Fatalf("expected route env secrets to be stored only in encrypted payload")
+	}
+
+	resolved, err := manager.ResolveRouteEnvSecretRefs("anna", map[string]string{
+		"ANNAS_SECRET_KEY": RouteEnvSecretRef("anna", "ANNAS_SECRET_KEY"),
+	})
+	if err != nil {
+		t.Fatalf("resolve route secrets: %v", err)
+	}
+	if got := resolved["ANNAS_SECRET_KEY"]; got != secret {
+		t.Fatalf("expected secret %q, got %q", secret, got)
+	}
+
+	if err := manager.DeleteRouteSecrets("anna"); err != nil {
+		t.Fatalf("delete route secrets: %v", err)
+	}
+	if _, err := manager.ResolveRouteEnvSecretRefs("anna", map[string]string{
+		"ANNAS_SECRET_KEY": RouteEnvSecretRef("anna", "ANNAS_SECRET_KEY"),
+	}); err == nil {
+		t.Fatalf("expected deleted route secret to be missing")
 	}
 }
 

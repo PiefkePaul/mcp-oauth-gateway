@@ -43,6 +43,10 @@ type UserDevice struct {
 	RefreshExpiresAt time.Time
 }
 
+func RouteEnvSecretRef(routeID, name string) string {
+	return "route:" + strings.TrimSpace(routeID) + ":env:" + strings.TrimSpace(name)
+}
+
 func (m *Manager) EnsureCSRFToken(w http.ResponseWriter, r *http.Request) string {
 	return ensureCSRFCookie(w, r)
 }
@@ -53,6 +57,103 @@ func (m *Manager) ValidateCSRF(r *http.Request) bool {
 
 func (m *Manager) CurrentIdentity(r *http.Request) (*Identity, error) {
 	return m.identityFromSession(r)
+}
+
+func (m *Manager) SetRouteEnvSecrets(routeID string, values map[string]string) error {
+	routeID = strings.TrimSpace(routeID)
+	if routeID == "" {
+		return fmt.Errorf("route id is required")
+	}
+
+	normalized := make(map[string]string, len(values))
+	for key, value := range values {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			return fmt.Errorf("secret env name is required")
+		}
+		normalized[key] = value
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(normalized) == 0 {
+		delete(m.data.RouteSecrets, routeID)
+		return m.saveLocked()
+	}
+	m.data.RouteSecrets[routeID] = &routeSecretRecord{
+		Env:       normalized,
+		UpdatedAt: time.Now().Unix(),
+	}
+	return m.saveLocked()
+}
+
+func (m *Manager) RouteEnvSecrets(routeID string) map[string]string {
+	routeID = strings.TrimSpace(routeID)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	record := m.data.RouteSecrets[routeID]
+	if record == nil || len(record.Env) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(record.Env))
+	for key, value := range record.Env {
+		out[key] = value
+	}
+	return out
+}
+
+func (m *Manager) ResolveRouteEnvSecretRefs(routeID string, refs map[string]string) (map[string]string, error) {
+	if len(refs) == 0 {
+		return nil, nil
+	}
+	routeID = strings.TrimSpace(routeID)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[string]string, len(refs))
+	for envName, ref := range refs {
+		refRouteID, secretName, ok := parseRouteEnvSecretRef(ref)
+		if !ok {
+			return nil, fmt.Errorf("invalid secret ref for %s", envName)
+		}
+		if refRouteID != routeID {
+			return nil, fmt.Errorf("secret ref for %s points to another route", envName)
+		}
+		record := m.data.RouteSecrets[refRouteID]
+		if record == nil {
+			return nil, fmt.Errorf("missing secrets for route %q", refRouteID)
+		}
+		value, exists := record.Env[secretName]
+		if !exists {
+			return nil, fmt.Errorf("missing secret %q for route %q", secretName, refRouteID)
+		}
+		out[envName] = value
+	}
+	return out, nil
+}
+
+func (m *Manager) DeleteRouteSecrets(routeID string) error {
+	routeID = strings.TrimSpace(routeID)
+	if routeID == "" {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.data.RouteSecrets[routeID]; !ok {
+		return nil
+	}
+	delete(m.data.RouteSecrets, routeID)
+	return m.saveLocked()
+}
+
+func parseRouteEnvSecretRef(ref string) (routeID, name string, ok bool) {
+	parts := strings.SplitN(strings.TrimSpace(ref), ":", 4)
+	if len(parts) != 4 || parts[0] != "route" || parts[2] != "env" {
+		return "", "", false
+	}
+	routeID = strings.TrimSpace(parts[1])
+	name = strings.TrimSpace(parts[3])
+	return routeID, name, routeID != "" && name != ""
 }
 
 func (m *Manager) ListUsers() []User {

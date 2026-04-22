@@ -87,6 +87,7 @@ type storeData struct {
 	AuthCodes     map[string]*authCodeRecord     `json:"auth_codes"`
 	AccessTokens  map[string]*accessTokenRecord  `json:"access_tokens"`
 	RefreshTokens map[string]*refreshTokenRecord `json:"refresh_tokens"`
+	RouteSecrets  map[string]*routeSecretRecord  `json:"route_secrets,omitempty"`
 }
 
 type encryptedStoreFile struct {
@@ -191,6 +192,11 @@ type refreshTokenRecord struct {
 	IssuedAt  int64  `json:"issued_at"`
 }
 
+type routeSecretRecord struct {
+	Env       map[string]string `json:"env,omitempty"`
+	UpdatedAt int64             `json:"updated_at"`
+}
+
 type tokenResponse struct {
 	AccessToken  string `json:"access_token"`
 	TokenType    string `json:"token_type"`
@@ -222,6 +228,7 @@ func NewManager(cfg Config) (*Manager, error) {
 			AuthCodes:     make(map[string]*authCodeRecord),
 			AccessTokens:  make(map[string]*accessTokenRecord),
 			RefreshTokens: make(map[string]*refreshTokenRecord),
+			RouteSecrets:  make(map[string]*routeSecretRecord),
 		},
 	}
 
@@ -795,6 +802,9 @@ func (m *Manager) load() error {
 	}
 	if data.RefreshTokens == nil {
 		data.RefreshTokens = make(map[string]*refreshTokenRecord)
+	}
+	if data.RouteSecrets == nil {
+		data.RouteSecrets = make(map[string]*routeSecretRecord)
 	}
 	for _, user := range data.Users {
 		user.GroupIDs = filterExistingGroupIDs(user.GroupIDs, data.Groups)

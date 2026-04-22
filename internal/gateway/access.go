@@ -46,13 +46,13 @@ func routeAccessAllowed(route config.Route, identity *auth.Identity) bool {
 	if identity == nil {
 		return false
 	}
-	if identity.IsAdmin {
-		return true
-	}
 
 	access := route.Access
 	if containsFold(access.DeniedUsers, identity.Email) || intersectsFold(access.DeniedGroups, identity.GroupNames) {
 		return false
+	}
+	if identity.IsAdmin {
+		return true
 	}
 
 	switch access.EffectiveMode() {

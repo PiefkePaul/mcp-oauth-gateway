@@ -62,6 +62,10 @@ routes:
         - --stdio
       env:
         EXAMPLE_SECRET: REPLACE_WITH_SECRET
+      # Routes created by the STDIO installer store secret values encrypted
+      # in auth-store.enc and persist only references here, for example:
+      # env_secret_refs:
+      #   EXAMPLE_SECRET: route:local-stdio:env:EXAMPLE_SECRET
       working_dir: /tools
 
   - id: example-openapi

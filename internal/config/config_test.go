@@ -102,6 +102,8 @@ routes:
         - https://portainer:9443
       env:
         PORTAINER_TOKEN: secret
+      env_secret_refs:
+        PORTAINER_API_KEY: route:portainer:env:PORTAINER_API_KEY
 `))
 	if err != nil {
 		t.Fatalf("parse routes: %v", err)
@@ -111,6 +113,9 @@ routes:
 	}
 	if routes[0].Stdio == nil || routes[0].Stdio.Command != "/tools/portainer-mcp" {
 		t.Fatalf("expected stdio config, got %#v", routes[0].Stdio)
+	}
+	if got := routes[0].Stdio.EnvSecretRefs["PORTAINER_API_KEY"]; got != "route:portainer:env:PORTAINER_API_KEY" {
+		t.Fatalf("expected env secret ref to be normalized, got %q", got)
 	}
 	if routes[0].Upstream != "" {
 		t.Fatalf("stdio route should not require upstream, got %q", routes[0].Upstream)

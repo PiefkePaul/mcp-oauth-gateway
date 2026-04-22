@@ -19,31 +19,35 @@ import (
 )
 
 type dashboardData struct {
-	Title             string
-	AdminEmail        string
-	Notice            string
-	Error             string
-	CSRFToken         string
-	PublicBaseURL     string
-	RoutesPath        string
-	SelfSignupEnabled bool
-	ActiveTab         string
-	DockerEnabled     bool
-	DockerHost        string
-	DockerNetworks    string
-	DockerError       string
-	BuildEnabled      bool
-	BuildMaxMB        int64
-	BuildHosts        string
-	BuildBaseImages   string
-	Routes            []dashboardRouteView
-	Deployments       []dashboardDeploymentView
-	Users             []dashboardUserView
-	Groups            []dashboardGroupView
-	SelectedUser      *dashboardUserDetailView
-	SelectedRoute     routeFormData
-	DeploymentForm    deploymentFormData
-	BuildForm         artifactBuildFormData
+	Title               string
+	AdminEmail          string
+	Notice              string
+	Error               string
+	CSRFToken           string
+	PublicBaseURL       string
+	RoutesPath          string
+	SelfSignupEnabled   bool
+	ActiveTab           string
+	DockerEnabled       bool
+	DockerHost          string
+	DockerNetworks      string
+	DockerError         string
+	BuildEnabled        bool
+	BuildMaxMB          int64
+	BuildHosts          string
+	BuildBaseImages     string
+	StdioInstallEnabled bool
+	StdioInstallMaxMB   int64
+	StdioInstallStore   string
+	Routes              []dashboardRouteView
+	Deployments         []dashboardDeploymentView
+	Users               []dashboardUserView
+	Groups              []dashboardGroupView
+	SelectedUser        *dashboardUserDetailView
+	SelectedRoute       routeFormData
+	DeploymentForm      deploymentFormData
+	BuildForm           artifactBuildFormData
+	StdioInstallForm    stdioInstallFormData
 }
 
 type dashboardRouteView struct {
@@ -154,6 +158,25 @@ type artifactBuildFormData struct {
 	ExtractMode    string
 	ArtifactPath   string
 	EntrypointArgs string
+}
+
+type stdioInstallFormData struct {
+	SourceKind      string
+	ID              string
+	DisplayName     string
+	PathPrefix      string
+	ScopesSupported string
+	DownloadURL     string
+	GitHubRepo      string
+	GitHubVersion   string
+	AssetPattern    string
+	SHA256          string
+	ExtractMode     string
+	ExecutablePath  string
+	Args            string
+	ExtraFolders    []string
+	EnvNames        []string
+	EnvValues       []string
 }
 
 type routeFormData struct {
@@ -324,6 +347,7 @@ func (s *Server) handleAdminRouteDelete(w http.ResponseWriter, r *http.Request) 
 		s.renderAdminDashboard(w, r, identity, newEmptyRouteFormData(), "", "route_id is required", http.StatusBadRequest)
 		return
 	}
+	route, routeFound := s.routeByID(routeID)
 	if err := s.deleteRoute(routeID); err != nil {
 		form := newEmptyRouteFormData()
 		form.OriginalID = routeID
@@ -333,6 +357,16 @@ func (s *Server) handleAdminRouteDelete(w http.ResponseWriter, r *http.Request) 
 		}
 		s.renderAdminDashboard(w, r, identity, form, "", err.Error(), http.StatusBadRequest)
 		return
+	}
+	if err := s.authManager.DeleteRouteSecrets(routeID); err != nil {
+		s.renderAdminDashboard(w, r, identity, newEmptyRouteFormData(), "", err.Error(), http.StatusBadRequest)
+		return
+	}
+	if routeFound {
+		if err := s.removeManagedStdioInstall(route); err != nil {
+			s.renderAdminDashboard(w, r, identity, newEmptyRouteFormData(), "", err.Error(), http.StatusBadRequest)
+			return
+		}
 	}
 
 	http.Redirect(w, r, adminRedirectURL("", "Route deleted successfully", ""), http.StatusFound)
@@ -769,6 +803,140 @@ func (s *Server) handleAdminArtifactBuild(w http.ResponseWriter, r *http.Request
 	http.Redirect(w, r, adminRedirectURLWithTab("deployments", "", notice, ""), http.StatusFound)
 }
 
+func (s *Server) handleAdminStdioInstall(w http.ResponseWriter, r *http.Request) {
+	identity, ok := s.requireAdmin(w, r)
+	if !ok {
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "unsupported method", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseMultipartForm(s.cfg.StdioInstaller.MaxArtifactBytes + (4 << 20)); err != nil {
+		http.Error(w, "invalid multipart form", http.StatusBadRequest)
+		return
+	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
+	}
+	if !s.authManager.ValidateCSRF(r) {
+		http.Error(w, "invalid CSRF token", http.StatusBadRequest)
+		return
+	}
+
+	formData := stdioInstallFormData{
+		SourceKind:      defaultIfEmpty(strings.TrimSpace(r.FormValue("stdio_install_source_kind")), stdioInstallGitHub),
+		ID:              strings.TrimSpace(r.FormValue("stdio_install_id")),
+		DisplayName:     strings.TrimSpace(r.FormValue("stdio_install_display_name")),
+		PathPrefix:      strings.TrimSpace(r.FormValue("stdio_install_path_prefix")),
+		ScopesSupported: strings.TrimSpace(r.FormValue("stdio_install_scopes_supported")),
+		DownloadURL:     strings.TrimSpace(r.FormValue("stdio_install_download_url")),
+		GitHubRepo:      strings.TrimSpace(r.FormValue("stdio_install_github_repo")),
+		GitHubVersion:   defaultIfEmpty(strings.TrimSpace(r.FormValue("stdio_install_github_version")), "latest"),
+		AssetPattern:    strings.TrimSpace(r.FormValue("stdio_install_asset_pattern")),
+		SHA256:          strings.TrimSpace(r.FormValue("stdio_install_sha256")),
+		ExtractMode:     defaultIfEmpty(strings.TrimSpace(r.FormValue("stdio_install_extract_mode")), "auto"),
+		ExecutablePath:  strings.TrimSpace(r.FormValue("stdio_install_executable_path")),
+		Args:            normalizeMultiline(r.FormValue("stdio_install_args")),
+		ExtraFolders:    valuesFromSelection(r.Form["stdio_install_folder"]),
+		EnvNames:        r.Form["stdio_install_env_name"],
+		EnvValues:       r.Form["stdio_install_env_value"],
+	}
+	env, err := parseEnvRows(formData.EnvNames, formData.EnvValues)
+	if err != nil {
+		s.renderAdminDashboard(w, r, identity, newEmptyRouteFormData(), "", err.Error(), http.StatusBadRequest)
+		return
+	}
+	if formData.DisplayName == "" {
+		formData.DisplayName = defaultIfEmpty(formData.ID, "STDIO MCP")
+	}
+	if formData.ID == "" {
+		formData.ID = s.nextRouteID(formData.DisplayName, formData.PathPrefix, "")
+	}
+	if formData.PathPrefix == "" {
+		formData.PathPrefix = "/" + formData.ID
+	}
+	if _, exists := s.routeByID(formData.ID); exists {
+		s.renderAdminDashboard(w, r, identity, newEmptyRouteFormData(), "", "route id already exists", http.StatusBadRequest)
+		return
+	}
+
+	installReq := stdioInstallRequest{
+		SourceKind:     formData.SourceKind,
+		RouteID:        formData.ID,
+		DisplayName:    formData.DisplayName,
+		DownloadURL:    formData.DownloadURL,
+		GitHubRepo:     formData.GitHubRepo,
+		GitHubVersion:  formData.GitHubVersion,
+		AssetPattern:   formData.AssetPattern,
+		SHA256:         formData.SHA256,
+		ExtractMode:    formData.ExtractMode,
+		ExecutablePath: formData.ExecutablePath,
+		Args:           parseFlexibleList(formData.Args),
+		ExtraFolders:   formData.ExtraFolders,
+	}
+	if formData.SourceKind == stdioInstallUpload {
+		file, header, err := r.FormFile("stdio_install_file")
+		if err != nil {
+			s.renderAdminDashboard(w, r, identity, newEmptyRouteFormData(), "", "STDIO artifact file is required", http.StatusBadRequest)
+			return
+		}
+		defer file.Close()
+		installReq.UploadName = header.Filename
+		installReq.UploadReader = file
+	}
+
+	result, err := s.stdioInstaller.Install(r.Context(), installReq)
+	if err != nil {
+		s.renderAdminDashboard(w, r, identity, newEmptyRouteFormData(), "", err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	envSecretRefs := make(map[string]string, len(env))
+	for key := range env {
+		envSecretRefs[key] = auth.RouteEnvSecretRef(result.RouteID, key)
+	}
+	route := config.Route{
+		ID:              result.RouteID,
+		DisplayName:     formData.DisplayName,
+		Transport:       "stdio",
+		PathPrefix:      formData.PathPrefix,
+		UpstreamMCPPath: "/mcp",
+		ScopesSupported: parseCommaList(defaultIfEmpty(formData.ScopesSupported, "mcp")),
+		Access: config.RouteAccess{
+			Visibility: "public",
+			Mode:       "public",
+		},
+		Stdio: &config.RouteStdio{
+			Command:       result.Command,
+			Args:          parseFlexibleList(formData.Args),
+			EnvSecretRefs: envSecretRefs,
+			WorkingDir:    result.WorkingDir,
+		},
+		Notes: fmt.Sprintf("Installed by STDIO installer from %s sha256:%s", defaultIfEmpty(result.SourceAsset, result.SourceURL), result.SHA256),
+	}
+	if err := s.validateUpsertRoute("", route); err != nil {
+		_ = os.RemoveAll(result.WorkingDir)
+		s.renderAdminDashboard(w, r, identity, newEmptyRouteFormData(), "", err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := s.authManager.SetRouteEnvSecrets(result.RouteID, env); err != nil {
+		_ = os.RemoveAll(result.WorkingDir)
+		s.renderAdminDashboard(w, r, identity, newEmptyRouteFormData(), "", err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := s.upsertRoute("", route); err != nil {
+		_ = s.authManager.DeleteRouteSecrets(result.RouteID)
+		_ = os.RemoveAll(result.WorkingDir)
+		s.renderAdminDashboard(w, r, identity, newEmptyRouteFormData(), "", err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	notice := fmt.Sprintf("STDIO MCP %s installed with executable %s", route.ID, result.ExecutablePath)
+	http.Redirect(w, r, adminRedirectURLWithTab("deployments", route.ID, notice, ""), http.StatusFound)
+}
+
 func (s *Server) handleAdminDeploymentAction(w http.ResponseWriter, r *http.Request, action string) {
 	identity, ok := s.requireAdmin(w, r)
 	if !ok {
@@ -909,31 +1077,35 @@ func (s *Server) renderAdminDashboard(w http.ResponseWriter, r *http.Request, id
 	}
 
 	data := dashboardData{
-		Title:             s.cfg.AccountPortalTitle + " Admin",
-		AdminEmail:        identity.Email,
-		Notice:            notice,
-		Error:             errText,
-		CSRFToken:         csrfToken,
-		PublicBaseURL:     s.cfg.PublicBaseURL,
-		RoutesPath:        s.cfg.RoutesPath,
-		SelfSignupEnabled: s.cfg.AllowSelfSignup,
-		ActiveTab:         adminActiveTab(r),
-		DockerEnabled:     s.cfg.DockerManagement.Enabled,
-		DockerHost:        s.cfg.DockerManagement.Host,
-		DockerNetworks:    strings.Join(s.cfg.DockerManagement.DefaultNetworks, ", "),
-		DockerError:       dockerErr,
-		BuildEnabled:      s.cfg.BuildManagement.Enabled,
-		BuildMaxMB:        s.cfg.BuildManagement.MaxArtifactBytes >> 20,
-		BuildHosts:        strings.Join(s.cfg.BuildManagement.AllowedDownloadHosts, ", "),
-		BuildBaseImages:   strings.Join(s.cfg.BuildManagement.AllowedBaseImages, ", "),
-		Routes:            routeViews,
-		Deployments:       deploymentViews,
-		Users:             userViews,
-		Groups:            groupViews,
-		SelectedUser:      selectedUser,
-		SelectedRoute:     selected,
-		DeploymentForm:    newDeploymentFormData(s.cfg.DockerManagement),
-		BuildForm:         newArtifactBuildFormData(s.cfg.BuildManagement),
+		Title:               s.cfg.AccountPortalTitle + " Admin",
+		AdminEmail:          identity.Email,
+		Notice:              notice,
+		Error:               errText,
+		CSRFToken:           csrfToken,
+		PublicBaseURL:       s.cfg.PublicBaseURL,
+		RoutesPath:          s.cfg.RoutesPath,
+		SelfSignupEnabled:   s.cfg.AllowSelfSignup,
+		ActiveTab:           adminActiveTab(r),
+		DockerEnabled:       s.cfg.DockerManagement.Enabled,
+		DockerHost:          s.cfg.DockerManagement.Host,
+		DockerNetworks:      strings.Join(s.cfg.DockerManagement.DefaultNetworks, ", "),
+		DockerError:         dockerErr,
+		BuildEnabled:        s.cfg.BuildManagement.Enabled,
+		BuildMaxMB:          s.cfg.BuildManagement.MaxArtifactBytes >> 20,
+		BuildHosts:          strings.Join(s.cfg.BuildManagement.AllowedDownloadHosts, ", "),
+		BuildBaseImages:     strings.Join(s.cfg.BuildManagement.AllowedBaseImages, ", "),
+		StdioInstallEnabled: s.cfg.StdioInstaller.Enabled,
+		StdioInstallMaxMB:   s.cfg.StdioInstaller.MaxArtifactBytes >> 20,
+		StdioInstallStore:   s.cfg.StdioInstaller.StoreDir,
+		Routes:              routeViews,
+		Deployments:         deploymentViews,
+		Users:               userViews,
+		Groups:              groupViews,
+		SelectedUser:        selectedUser,
+		SelectedRoute:       selected,
+		DeploymentForm:      newDeploymentFormData(s.cfg.DockerManagement),
+		BuildForm:           newArtifactBuildFormData(s.cfg.BuildManagement),
+		StdioInstallForm:    newStdioInstallFormData(),
 	}
 
 	renderAdminHTML(w, status, data)
@@ -1308,6 +1480,18 @@ func newArtifactBuildFormData(cfg config.BuildManagementConfig) artifactBuildFor
 	}
 }
 
+func newStdioInstallFormData() stdioInstallFormData {
+	return stdioInstallFormData{
+		SourceKind:      stdioInstallGitHub,
+		ScopesSupported: "mcp",
+		GitHubVersion:   "latest",
+		ExtractMode:     "auto",
+		EnvNames:        make([]string, 8),
+		EnvValues:       make([]string, 8),
+		ExtraFolders:    make([]string, 6),
+	}
+}
+
 func newEmptyRouteFormData() routeFormData {
 	return routeFormData{
 		Transport:             "http",
@@ -1423,6 +1607,47 @@ func parseFlexibleList(raw string) []string {
 		values = append(values, value)
 	}
 	return values
+}
+
+func parseEnvRows(names, values []string) (map[string]string, error) {
+	out := make(map[string]string)
+	for idx, rawName := range names {
+		name := strings.TrimSpace(rawName)
+		value := ""
+		if idx < len(values) {
+			value = values[idx]
+		}
+		if name == "" && strings.TrimSpace(value) == "" {
+			continue
+		}
+		if name == "" {
+			return nil, fmt.Errorf("environment variable name is required")
+		}
+		out[name] = value
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
+}
+
+func (s *Server) removeManagedStdioInstall(route config.Route) error {
+	if route.Transport != "stdio" || route.Stdio == nil || strings.TrimSpace(route.Stdio.WorkingDir) == "" {
+		return nil
+	}
+	storeDir := filepath.Clean(strings.TrimSpace(s.cfg.StdioInstaller.StoreDir))
+	workingDir := filepath.Clean(strings.TrimSpace(route.Stdio.WorkingDir))
+	if storeDir == "" || !filepath.IsAbs(storeDir) || !filepath.IsAbs(workingDir) {
+		return nil
+	}
+	rel, err := filepath.Rel(storeDir, workingDir)
+	if err != nil || rel == "." || rel == ".." || filepath.IsAbs(rel) || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return nil
+	}
+	if err := os.RemoveAll(workingDir); err != nil {
+		return fmt.Errorf("remove managed STDIO install %q: %w", workingDir, err)
+	}
+	return nil
 }
 
 func defaultIfEmpty(value, fallback string) string {
@@ -2209,7 +2434,7 @@ const adminDashboardTemplate = `
                 <div class="full">
                   <details>
                     <summary>Berechtigungsmatrix fuer Nutzer und Gruppen</summary>
-                    <p class="helper">Default nutzt den Modus oben. Allow gilt bei restricted Routen, Deny sperrt Nicht-Admins auch bei public Routen.</p>
+                    <p class="helper">Default nutzt den Modus oben. Allow gilt bei restricted Routen, Deny ist eine harte Sperre und gilt auch fuer Admins.</p>
                     <table class="access-table">
                       <thead>
                         <tr><th>Typ</th><th>Name</th><th>Berechtigung</th></tr>
@@ -2400,7 +2625,7 @@ const adminDashboardTemplate = `
                 </div>
                 <div class="full">
                   <label for="deploy_networks">Docker Networks</label>
-                  <textarea id="deploy_networks" name="networks" placeholder="nas-reverse-proxy&#10;mcp-internal">{{.DeploymentForm.Networks}}</textarea>
+                  <textarea id="deploy_networks" name="networks" placeholder="mcp-shared&#10;mcp-internal">{{.DeploymentForm.Networks}}</textarea>
                   <p class="helper">Mindestens ein gemeinsames Docker-Netz mit dem Gateway ist empfohlen, damit <code>http://container:port</code> aufloest.</p>
                 </div>
                 <div class="full">
@@ -2443,6 +2668,116 @@ const adminDashboardTemplate = `
           </div>
           <div class="form-actions">
             <button type="submit">Deployment erstellen & Route anlegen</button>
+          </div>
+        </form>
+        <div class="divider"></div>
+        <h2>STDIO MCP installieren</h2>
+        {{if .StdioInstallEnabled}}
+          <p class="muted">Installiert fertige STDIO-MCP-Artefakte nach <code>{{.StdioInstallStore}}</code>. Maximalgroesse: {{.StdioInstallMaxMB}} MB. Env-Werte werden verschluesselt im Auth-Store gespeichert.</p>
+        {{else}}
+          <p class="muted">Der STDIO Installer ist deaktiviert. Setze <code>MCP_GATEWAY_STDIO_INSTALL_ENABLED=true</code>, wenn Admins Uploads, GitHub-Releases oder Download-Links installieren duerfen.</p>
+        {{end}}
+        <form method="post" action="/admin/stdio/install" enctype="multipart/form-data" style="margin-top:1rem;">
+          <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+          <div class="field-grid">
+            <div>
+              <label for="stdio_install_source_kind">Quelle</label>
+              <select id="stdio_install_source_kind" name="stdio_install_source_kind">
+                <option value="github" {{if eq .StdioInstallForm.SourceKind "github"}}selected{{end}}>GitHub Release</option>
+                <option value="url" {{if eq .StdioInstallForm.SourceKind "url"}}selected{{end}}>HTTPS Download</option>
+                <option value="upload" {{if eq .StdioInstallForm.SourceKind "upload"}}selected{{end}}>File Upload</option>
+              </select>
+            </div>
+            <div>
+              <label for="stdio_install_id">Route ID</label>
+              <input id="stdio_install_id" name="stdio_install_id" type="text" value="{{.StdioInstallForm.ID}}" placeholder="annas">
+            </div>
+            <div>
+              <label for="stdio_install_display_name">Display Name</label>
+              <input id="stdio_install_display_name" name="stdio_install_display_name" type="text" value="{{.StdioInstallForm.DisplayName}}" placeholder="Anna's MCP">
+            </div>
+            <div>
+              <label for="stdio_install_path_prefix">Path Prefix</label>
+              <input id="stdio_install_path_prefix" name="stdio_install_path_prefix" type="text" value="{{.StdioInstallForm.PathPrefix}}" placeholder="/annas">
+            </div>
+            <div>
+              <label for="stdio_install_scopes">Scopes</label>
+              <input id="stdio_install_scopes" name="stdio_install_scopes_supported" type="text" value="{{.StdioInstallForm.ScopesSupported}}" placeholder="mcp">
+            </div>
+            <div class="full">
+              <label for="stdio_install_github_repo">GitHub Repo URL</label>
+              <input id="stdio_install_github_repo" name="stdio_install_github_repo" type="url" value="{{.StdioInstallForm.GitHubRepo}}" placeholder="https://github.com/iosifache/annas-mcp">
+            </div>
+            <div>
+              <label for="stdio_install_github_version">GitHub Version</label>
+              <input id="stdio_install_github_version" name="stdio_install_github_version" type="text" value="{{.StdioInstallForm.GitHubVersion}}" placeholder="latest oder v0.0.5">
+            </div>
+            <div>
+              <label for="stdio_install_asset_pattern">Asset Pattern</label>
+              <input id="stdio_install_asset_pattern" name="stdio_install_asset_pattern" type="text" value="{{.StdioInstallForm.AssetPattern}}" placeholder="linux_amd64">
+              <p class="helper">Leer nutzt automatisch linux_amd64, linux_arm64 usw. passend zur Gateway-Architektur.</p>
+            </div>
+            <div class="full">
+              <label for="stdio_install_download_url">HTTPS Download URL</label>
+              <input id="stdio_install_download_url" name="stdio_install_download_url" type="url" value="{{.StdioInstallForm.DownloadURL}}" placeholder="https://github.com/org/repo/releases/download/v1/server_linux_amd64.tar.xz">
+            </div>
+            <div class="full">
+              <label for="stdio_install_file">Artefakt hochladen</label>
+              <input id="stdio_install_file" name="stdio_install_file" type="file">
+            </div>
+            <div class="full">
+              <label for="stdio_install_sha256">SHA-256</label>
+              <input id="stdio_install_sha256" name="stdio_install_sha256" type="text" value="{{.StdioInstallForm.SHA256}}" placeholder="optional bei GitHub mit digest, Pflicht fuer Download URL">
+            </div>
+            <div>
+              <label for="stdio_install_extract_mode">Entpacken</label>
+              <select id="stdio_install_extract_mode" name="stdio_install_extract_mode">
+                <option value="auto" {{if eq .StdioInstallForm.ExtractMode "auto"}}selected{{end}}>Auto</option>
+                <option value="none" {{if eq .StdioInstallForm.ExtractMode "none"}}selected{{end}}>Nicht entpacken</option>
+                <option value="tar.gz" {{if eq .StdioInstallForm.ExtractMode "tar.gz"}}selected{{end}}>tar.gz</option>
+                <option value="tar.xz" {{if eq .StdioInstallForm.ExtractMode "tar.xz"}}selected{{end}}>tar.xz</option>
+                <option value="zip" {{if eq .StdioInstallForm.ExtractMode "zip"}}selected{{end}}>zip</option>
+              </select>
+            </div>
+            <div>
+              <label for="stdio_install_executable_path">Executable im Archiv</label>
+              <input id="stdio_install_executable_path" name="stdio_install_executable_path" type="text" value="{{.StdioInstallForm.ExecutablePath}}" placeholder="annas-mcp oder path/in/archive/annas-mcp">
+            </div>
+            <div class="full">
+              <label for="stdio_install_args">Start-Argumente</label>
+              <textarea id="stdio_install_args" name="stdio_install_args" placeholder="mcp">{{.StdioInstallForm.Args}}</textarea>
+              <p class="helper">Ein Argument pro Zeile. Fuer iosifache/annas-mcp: <code>mcp</code>.</p>
+            </div>
+            <div class="full">
+              <label>Zusatzordner</label>
+              <table class="access-table">
+                <thead><tr><th>Relativer Ordner unter der Installation</th></tr></thead>
+                <tbody>
+                  {{range .StdioInstallForm.ExtraFolders}}
+                    <tr><td><input name="stdio_install_folder" type="text" value="{{.}}" placeholder="downloads"></td></tr>
+                  {{end}}
+                </tbody>
+              </table>
+              <p class="helper">Leer lassen, wenn keine Ordner benoetigt werden. Absolute Pfade und <code>..</code> werden abgelehnt.</p>
+            </div>
+            <div class="full">
+              <label>Environment Secrets</label>
+              <table class="access-table">
+                <thead><tr><th>Name</th><th>Wert</th></tr></thead>
+                <tbody>
+                  {{range $idx, $name := .StdioInstallForm.EnvNames}}
+                    <tr>
+                      <td><input name="stdio_install_env_name" type="text" value="{{$name}}" placeholder="ANNAS_SECRET_KEY"></td>
+                      <td><input name="stdio_install_env_value" type="password" value="{{index $.StdioInstallForm.EnvValues $idx}}" placeholder="verschluesselt gespeichert"></td>
+                    </tr>
+                  {{end}}
+                </tbody>
+              </table>
+              <p class="helper">Diese Werte landen nicht in <code>routes.yaml</code>, sondern verschluesselt in <code>auth-store.enc</code> und werden erst beim STDIO-Prozessstart injiziert.</p>
+            </div>
+          </div>
+          <div class="form-actions">
+            <button type="submit">STDIO MCP installieren & Route anlegen</button>
           </div>
         </form>
         <div class="divider"></div>

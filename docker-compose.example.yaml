@@ -33,6 +33,12 @@ services:
       MCP_GATEWAY_BUILD_ALLOWED_DOWNLOAD_HOSTS: "github.com,objects.githubusercontent.com,github-releases.githubusercontent.com,release-assets.githubusercontent.com"
       MCP_GATEWAY_BUILD_DEFAULT_BASE_IMAGE: "debian:bookworm-slim"
       MCP_GATEWAY_BUILD_ALLOWED_BASE_IMAGES: "debian:bookworm-slim"
+      # Optional: install native STDIO MCP binaries from upload, HTTPS URL or GitHub releases.
+      MCP_GATEWAY_STDIO_INSTALL_ENABLED: "false"
+      MCP_GATEWAY_STDIO_STORE_DIR: "/data/stdio-mcp"
+      MCP_GATEWAY_STDIO_MAX_ARTIFACT_MB: "100"
+      MCP_GATEWAY_STDIO_ALLOWED_DOWNLOAD_HOSTS: "github.com,objects.githubusercontent.com,github-releases.githubusercontent.com,release-assets.githubusercontent.com"
+      MCP_GATEWAY_STDIO_ALLOW_ANY_DOWNLOAD_HOST: "false"
       MCP_GATEWAY_OPENAPI_STORE_DIR: "/data/openapi"
     volumes:
       - ./config:/config

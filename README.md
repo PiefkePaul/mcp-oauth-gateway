@@ -45,6 +45,7 @@ Wichtig:
 - Deployment-Metadaten wie `MCP_HTTP_SESSION_MODE` oder interne Upstream-Env-Werte pro Route speichern
 - Optionales Docker-Management fuer HTTP-MCP-Container aus bestehenden Images
 - Native STDIO-MCP-Routen ohne zusaetzlichen Adapter-Container
+- Optionaler STDIO-Installer fuer Uploads, HTTPS-Downloads und GitHub-Releases mit verschluesselten Env-Secrets
 - Optionaler, abgesicherter Artefakt-Build: Upload oder HTTPS/GitHub-Release-Download mit SHA-256-Pruefung und generiertem Dockerfile
 - OpenAPI-3.x-Routen, die Operationen aus einer OpenAPI-Spec als MCP-Tools bereitstellen
 - Verwaltete Docker-Deployments im Dashboard anlegen, starten, stoppen und entfernen
@@ -74,6 +75,11 @@ Wichtig:
 - `MCP_GATEWAY_BUILD_ALLOW_ANY_DOWNLOAD_HOST`
 - `MCP_GATEWAY_BUILD_DEFAULT_BASE_IMAGE`
 - `MCP_GATEWAY_BUILD_ALLOWED_BASE_IMAGES`
+- `MCP_GATEWAY_STDIO_INSTALL_ENABLED`
+- `MCP_GATEWAY_STDIO_STORE_DIR`
+- `MCP_GATEWAY_STDIO_MAX_ARTIFACT_MB`
+- `MCP_GATEWAY_STDIO_ALLOWED_DOWNLOAD_HOSTS`
+- `MCP_GATEWAY_STDIO_ALLOW_ANY_DOWNLOAD_HOST`
 - `MCP_GATEWAY_OPENAPI_STORE_DIR`
 
 Der Master-Key muss genau 32 Bytes nach Base64-, Base64URL- oder Hex-Decoding ergeben.
@@ -163,6 +169,27 @@ Wichtig:
 - Der Gateway bridged JSON-RPC direkt zwischen Streamable HTTP und STDIO. Server-seitige Reverse-Requests wie Sampling werden aktuell bewusst abgelehnt.
 - Admins sollten nur vertrauenswuerdige Executables eintragen. Native STDIO-Kommandos laufen mit den Rechten des Gateway-Containers.
 
+### STDIO Installer
+
+Der optionale STDIO-Installer nimmt dir die NAS-Handarbeit ab: Im Deployments-Reiter kannst du ein Binary-Artefakt hochladen, per HTTPS-URL herunterladen oder aus einem GitHub-Release auswaehlen. Der Gateway installiert die ausgewaehlte Executable in einen persistenten Ordner unter `MCP_GATEWAY_STDIO_STORE_DIR`, erstellt eine STDIO-Route und speichert eingegebene Env-Werte im verschluesselten Auth-Store.
+
+Aktivierung:
+
+- `MCP_GATEWAY_STDIO_INSTALL_ENABLED=true`
+- `MCP_GATEWAY_STDIO_STORE_DIR=/data/stdio-mcp`
+- `MCP_GATEWAY_STDIO_MAX_ARTIFACT_MB=100`
+- optional `MCP_GATEWAY_STDIO_ALLOWED_DOWNLOAD_HOSTS` fuer erlaubte Download-Hosts
+
+Sicherheitsregeln:
+
+- HTTPS-URL-Installs brauchen eine SHA-256-Checksum.
+- GitHub-Release-Installs nutzen vorhandene GitHub-Asset-Digests, falls verfuegbar; sonst kann eine SHA-256-Checksum angegeben werden.
+- Uploads sind lokal moeglich; die berechnete SHA-256 wird im Manifest gespeichert.
+- Entpackt werden `tar.gz`, `tar.xz` und `zip`; absolute Pfade, Traversal, Symlinks, Hardlinks und Spezialdateien werden abgelehnt.
+- Der Gateway kopiert nur die ausgewaehlte Executable nach `<store>/<route-id>/bin/` und macht sie ausfuehrbar.
+- Zusaetzliche Ordner wie `downloads` werden nur erstellt, wenn du sie im Dashboard explizit angibst.
+- Env-Werte aus dem Installer landen nicht in `routes.yaml`; dort stehen nur `stdio.env_secret_refs`. Beim Start des STDIO-Prozesses loest der Gateway diese Referenzen aus dem verschluesselten Store auf.
+
 ### OpenAPI Routes
 
 Phase 5 kann OpenAPI-3.x-Spezifikationen als MCP-Tools bereitstellen. Jede Operation unter `paths` wird zu einem Tool; `operationId` wird als Tool-Name genutzt, ansonsten erzeugt der Gateway einen stabilen Namen aus HTTP-Methode und Pfad.
@@ -207,6 +234,7 @@ Dort kannst du:
 - `forward_headers` pflegen
 - Route-IDs leer lassen, damit sie automatisch aus Display Name oder Path Prefix erzeugt werden
 - im Deployments-Reiter HTTP-MCP-Container aus Docker-Images oder native STDIO-Routen erstellen
+- im Deployments-Reiter STDIO-MCPs per Upload, Download oder GitHub-Release installieren
 - im Deployments-Reiter aus verifizierten Artefakten eigene Images bauen
 - OpenAPI-Specs hochladen oder per URL referenzieren und als MCP-Route speichern
 - Routen als public oder private markieren
@@ -219,8 +247,8 @@ Dort kannst du:
 Wichtig:
 
 - Das Dashboard aendert die Gateway-Routen live und schreibt sie nach `routes.yaml` zurueck.
-- Upstream-Umgebungsvariablen werden bei HTTP-Routen als Deployment-Metadaten gespeichert. Bei STDIO-Routen werden `stdio.env`-Werte an den gestarteten Prozess uebergeben.
-- Full Export kann interne Tokens in `forward_headers`, `upstream_environment` oder `stdio.env` enthalten. Nutze Redacted Export, wenn du die Datei teilen willst.
+- Upstream-Umgebungsvariablen werden bei HTTP-Routen als Deployment-Metadaten gespeichert. Bei manuell gepflegten STDIO-Routen werden `stdio.env`-Werte an den gestarteten Prozess uebergeben; vom Installer erfasste Env-Secrets werden verschluesselt gespeichert und per `stdio.env_secret_refs` referenziert.
+- Full Export kann interne Tokens in `forward_headers`, `upstream_environment` oder manuellem `stdio.env` enthalten. Installer-Secrets bleiben im verschluesselten Auth-Store und werden nicht als Klartext exportiert.
 
 ## Open WebUI Hinweise
 
@@ -278,6 +306,7 @@ Unterstuetzte Werte:
 - `mode: public` erlaubt allen angemeldeten Nutzern die Nutzung.
 - `mode: restricted` erlaubt nur explizit ausgewaehlten Nutzern oder Gruppen die Nutzung.
 - `mode: admin` erlaubt nur Admin-Nutzern die Nutzung.
+- Explizite Deny-Regeln haben Vorrang vor Allow-Regeln und sperren auch Admin-Nutzer.
 
 ## Beispielroute
 

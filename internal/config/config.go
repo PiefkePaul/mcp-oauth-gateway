@@ -22,6 +22,7 @@ const (
 	defaultDockerHost          = "unix:///var/run/docker.sock"
 	defaultBuildWorkDir        = "/data/builds"
 	defaultOpenAPIStoreDir     = "/data/openapi"
+	defaultStdioStoreDir       = "/data/stdio-mcp"
 	defaultBuildMaxArtifactMB  = 100
 	defaultAccessTokenTTL      = time.Hour
 	defaultRefreshTokenTTL     = 30 * 24 * time.Hour
@@ -46,6 +47,7 @@ type Config struct {
 	Auth                AuthConfig
 	DockerManagement    DockerManagementConfig
 	BuildManagement     BuildManagementConfig
+	StdioInstaller      StdioInstallerConfig
 	OpenAPIStoreDir     string
 	Routes              []Route
 }
@@ -75,6 +77,14 @@ type BuildManagementConfig struct {
 	AllowAnyDownloadHost bool
 	DefaultBaseImage     string
 	AllowedBaseImages    []string
+}
+
+type StdioInstallerConfig struct {
+	Enabled              bool
+	StoreDir             string
+	MaxArtifactBytes     int64
+	AllowedDownloadHosts []string
+	AllowAnyDownloadHost bool
 }
 
 type Route struct {
@@ -109,10 +119,11 @@ type RouteDeployment struct {
 }
 
 type RouteStdio struct {
-	Command    string            `yaml:"command"`
-	Args       []string          `yaml:"args,omitempty"`
-	Env        map[string]string `yaml:"env,omitempty"`
-	WorkingDir string            `yaml:"working_dir,omitempty"`
+	Command       string            `yaml:"command"`
+	Args          []string          `yaml:"args,omitempty"`
+	Env           map[string]string `yaml:"env,omitempty"`
+	EnvSecretRefs map[string]string `yaml:"env_secret_refs,omitempty"`
+	WorkingDir    string            `yaml:"working_dir,omitempty"`
 }
 
 type RouteOpenAPI struct {
@@ -176,6 +187,13 @@ func Load() (*Config, error) {
 			DefaultBaseImage:     getEnvOrDefault("MCP_GATEWAY_BUILD_DEFAULT_BASE_IMAGE", "debian:bookworm-slim"),
 			AllowedBaseImages:    parseCSVEnv("MCP_GATEWAY_BUILD_ALLOWED_BASE_IMAGES"),
 		},
+		StdioInstaller: StdioInstallerConfig{
+			Enabled:              getBoolEnv("MCP_GATEWAY_STDIO_INSTALL_ENABLED", false),
+			StoreDir:             getEnvOrDefault("MCP_GATEWAY_STDIO_STORE_DIR", defaultStdioStoreDir),
+			MaxArtifactBytes:     int64(getIntEnv("MCP_GATEWAY_STDIO_MAX_ARTIFACT_MB", defaultBuildMaxArtifactMB)) << 20,
+			AllowedDownloadHosts: parseCSVEnv("MCP_GATEWAY_STDIO_ALLOWED_DOWNLOAD_HOSTS"),
+			AllowAnyDownloadHost: getBoolEnv("MCP_GATEWAY_STDIO_ALLOW_ANY_DOWNLOAD_HOST", false),
+		},
 		OpenAPIStoreDir: getEnvOrDefault("MCP_GATEWAY_OPENAPI_STORE_DIR", defaultOpenAPIStoreDir),
 	}
 	if len(cfg.BuildManagement.AllowedDownloadHosts) == 0 {
@@ -192,6 +210,14 @@ func Load() (*Config, error) {
 	cfg.BuildManagement.AllowedDownloadHosts = normalizeStringList(cfg.BuildManagement.AllowedDownloadHosts, true)
 	cfg.BuildManagement.DefaultBaseImage = strings.ToLower(strings.TrimSpace(cfg.BuildManagement.DefaultBaseImage))
 	cfg.BuildManagement.AllowedBaseImages = normalizeStringList(cfg.BuildManagement.AllowedBaseImages, true)
+	if len(cfg.StdioInstaller.AllowedDownloadHosts) == 0 {
+		cfg.StdioInstaller.AllowedDownloadHosts = append([]string(nil), cfg.BuildManagement.AllowedDownloadHosts...)
+	}
+	cfg.StdioInstaller.AllowedDownloadHosts = normalizeStringList(cfg.StdioInstaller.AllowedDownloadHosts, true)
+	cfg.StdioInstaller.StoreDir = filepath.Clean(strings.TrimSpace(cfg.StdioInstaller.StoreDir))
+	if !filepath.IsAbs(cfg.StdioInstaller.StoreDir) {
+		return nil, fmt.Errorf("MCP_GATEWAY_STDIO_STORE_DIR must be an absolute path")
+	}
 
 	if (cfg.BootstrapEmail == "") != (cfg.BootstrapPassword == "") {
 		return nil, fmt.Errorf("MCP_GATEWAY_BOOTSTRAP_EMAIL and MCP_GATEWAY_BOOTSTRAP_PASSWORD must either both be set or both be empty")
@@ -573,6 +599,22 @@ func normalizeRouteStdio(stdio RouteStdio) (RouteStdio, error) {
 		env = nil
 	}
 	stdio.Env = env
+	refs := make(map[string]string, len(stdio.EnvSecretRefs))
+	for key, value := range stdio.EnvSecretRefs {
+		envName := strings.TrimSpace(key)
+		if envName == "" {
+			return RouteStdio{}, fmt.Errorf("env_secret_refs contains an empty key")
+		}
+		ref := strings.TrimSpace(value)
+		if ref == "" {
+			return RouteStdio{}, fmt.Errorf("env_secret_refs contains an empty ref for %q", envName)
+		}
+		refs[envName] = ref
+	}
+	if len(refs) == 0 {
+		refs = nil
+	}
+	stdio.EnvSecretRefs = refs
 	return stdio, nil
 }
 
@@ -728,6 +770,12 @@ func cloneRouteStdio(stdio RouteStdio) RouteStdio {
 		cloned.Env = make(map[string]string, len(stdio.Env))
 		for key, value := range stdio.Env {
 			cloned.Env[key] = value
+		}
+	}
+	if stdio.EnvSecretRefs != nil {
+		cloned.EnvSecretRefs = make(map[string]string, len(stdio.EnvSecretRefs))
+		for key, value := range stdio.EnvSecretRefs {
+			cloned.EnvSecretRefs[key] = value
 		}
 	}
 	return cloned
