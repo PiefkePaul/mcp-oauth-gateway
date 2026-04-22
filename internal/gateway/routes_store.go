@@ -213,6 +213,8 @@ func buildRouteRuntime(routes []config.Route) (map[string]routeRuntime, error) {
 			handler = stdioHandler
 			closeFn = stdioClose
 			err = stdioErr
+		case "openapi":
+			handler, err = newOpenAPIBridge(route)
 		default:
 			handler, err = newReverseProxy(route)
 		}

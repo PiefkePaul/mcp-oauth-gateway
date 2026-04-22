@@ -144,6 +144,10 @@ func (m *dockerManager) Inspect(ctx context.Context, containerName string) (dock
 	return m.client.inspectContainer(ctx, containerName)
 }
 
+func (m *dockerManager) BuildImage(ctx context.Context, tag string, contextTar []byte) error {
+	return m.client.buildImage(ctx, tag, contextTar)
+}
+
 func validateDockerDeploymentSpec(spec dockerDeploymentSpec) error {
 	if strings.TrimSpace(spec.Image) == "" {
 		return fmt.Errorf("image is required")
@@ -284,6 +288,49 @@ func (c *dockerClient) createContainer(ctx context.Context, spec dockerDeploymen
 		return dockerHTTPError(resp, "create container failed")
 	}
 	_, _ = io.Copy(io.Discard, resp.Body)
+	return nil
+}
+
+func (c *dockerClient) buildImage(ctx context.Context, tag string, contextTar []byte) error {
+	query := url.Values{}
+	query.Set("t", tag)
+	query.Set("pull", "1")
+	query.Set("rm", "1")
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/build?"+query.Encode(), bytes.NewReader(contextTar))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-tar")
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("build image %q failed: %w", tag, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return dockerHTTPError(resp, "build image failed")
+	}
+
+	payload, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	for _, line := range bytes.Split(payload, []byte("\n")) {
+		var event struct {
+			Error       string `json:"error"`
+			ErrorDetail struct {
+				Message string `json:"message"`
+			} `json:"errorDetail"`
+		}
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		if err := json.Unmarshal(line, &event); err == nil {
+			if event.Error != "" {
+				if event.ErrorDetail.Message != "" {
+					return fmt.Errorf("docker build failed: %s", event.ErrorDetail.Message)
+				}
+				return fmt.Errorf("docker build failed: %s", event.Error)
+			}
+		}
+	}
 	return nil
 }
 

@@ -63,3 +63,21 @@ routes:
       env:
         EXAMPLE_SECRET: REPLACE_WITH_SECRET
       working_dir: /tools
+
+  - id: example-openapi
+    display_name: Example OpenAPI Tools
+    transport: openapi
+    path_prefix: /example-openapi
+    scopes_supported:
+      - mcp
+    access:
+      visibility: private
+      mode: restricted
+      allowed_groups:
+        - API Team
+    openapi:
+      spec_path: /data/openapi/example.yaml
+      base_url: https://api.example.com
+      headers:
+        Authorization: "Bearer REPLACE_WITH_INTERNAL_API_TOKEN"
+      timeout_seconds: 30

@@ -20,6 +20,7 @@ type Server struct {
 	cfg           *config.Config
 	authManager   *auth.Manager
 	dockerManager *dockerManager
+	buildManager  *artifactBuilder
 	mu            sync.RWMutex
 	routes        []config.Route
 	runtime       map[string]routeRuntime
@@ -45,6 +46,7 @@ func New(cfg *config.Config, authManager *auth.Manager) (*Server, error) {
 		}
 		server.dockerManager = dockerManager
 	}
+	server.buildManager = newArtifactBuilder(cfg.BuildManagement, server.dockerManager)
 	if err := server.replaceRoutes(cfg.Routes); err != nil {
 		return nil, err
 	}
@@ -173,6 +175,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	case "/admin/deployments/remove":
 		s.handleAdminDeploymentRemove(w, r)
+		return
+	case "/admin/artifacts/build":
+		s.handleAdminArtifactBuild(w, r)
 		return
 	case "/admin/users/create":
 		s.handleAdminUserCreate(w, r)

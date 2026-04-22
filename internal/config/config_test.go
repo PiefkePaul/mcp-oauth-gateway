@@ -117,16 +117,47 @@ routes:
 	}
 }
 
+func TestRouteParsesOpenAPITransport(t *testing.T) {
+	specPath := filepath.Join(t.TempDir(), "openapi.yaml")
+	routes, err := ParseRoutesPayload([]byte(`
+routes:
+  - id: widgets
+    display_name: Widgets
+    transport: openapi
+    path_prefix: /widgets
+    scopes_supported:
+      - mcp
+    openapi:
+      spec_path: ` + specPath + `
+      base_url: https://api.example.com/v1
+      headers:
+        Authorization: Bearer internal
+      timeout_seconds: 20
+`))
+	if err != nil {
+		t.Fatalf("parse routes: %v", err)
+	}
+	if routes[0].Transport != "openapi" {
+		t.Fatalf("expected openapi transport, got %q", routes[0].Transport)
+	}
+	if routes[0].OpenAPI == nil || routes[0].OpenAPI.BaseURL != "https://api.example.com/v1" {
+		t.Fatalf("expected openapi config, got %#v", routes[0].OpenAPI)
+	}
+	if routes[0].Upstream != "https://api.example.com/v1" {
+		t.Fatalf("expected upstream label to default to base_url, got %q", routes[0].Upstream)
+	}
+}
+
 func TestNormalizeURLOrigins(t *testing.T) {
 	origins, err := normalizeURLOrigins([]string{
-		"http://192.168.178.254:8080/oauth/clients/callback",
+		"http://openwebui.internal:8080/oauth/clients/callback",
 		"https://openwebui.example.com/",
-		"http://192.168.178.254:8080",
+		"http://openwebui.internal:8080",
 	})
 	if err != nil {
 		t.Fatalf("normalize origins: %v", err)
 	}
-	want := []string{"http://192.168.178.254:8080", "https://openwebui.example.com"}
+	want := []string{"http://openwebui.internal:8080", "https://openwebui.example.com"}
 	if len(origins) != len(want) {
 		t.Fatalf("expected %d origins, got %#v", len(want), origins)
 	}

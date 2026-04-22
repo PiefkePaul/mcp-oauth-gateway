@@ -23,7 +23,7 @@ Wichtig:
 - `https://mcp.example.com/.well-known/oauth-protected-resource/<route>/mcp`
 - Zusaetzlich antwortet `https://mcp.example.com/.well-known/oauth-protected-resource` als Gateway-weite Fallback-Metadata fuer Clients wie Open WebUI, die Root-Discovery nutzen.
 - Open WebUI muss den Gateway aus seinem eigenen Container erreichen koennen. Wenn Open WebUI in Docker laeuft, ist `localhost` meistens der Open-WebUI-Container selbst; nutze dann die NAS-IP, die oeffentliche HTTPS-Domain oder ein gemeinsames Docker-Netz.
-- Fuer OAuth-Redirects sollte Open WebUI `WEBUI_URL` auf seine oeffentliche HTTPS-URL gesetzt haben. Falls du in einem privaten LAN bewusst eine HTTP-Redirect-URI nutzen musst, erlaube deren Origin explizit mit `MCP_GATEWAY_ALLOWED_REDIRECT_ORIGINS`, z.B. `http://192.168.178.254:8080`.
+- Fuer OAuth-Redirects sollte Open WebUI `WEBUI_URL` auf seine oeffentliche HTTPS-URL gesetzt haben. Falls du in einem privaten LAN bewusst eine HTTP-Redirect-URI nutzen musst, erlaube deren Origin explizit mit `MCP_GATEWAY_ALLOWED_REDIRECT_ORIGINS`, z.B. `http://openwebui.internal:8080`.
 
 ## Features
 
@@ -45,6 +45,8 @@ Wichtig:
 - Deployment-Metadaten wie `MCP_HTTP_SESSION_MODE` oder interne Upstream-Env-Werte pro Route speichern
 - Optionales Docker-Management fuer HTTP-MCP-Container aus bestehenden Images
 - Native STDIO-MCP-Routen ohne zusaetzlichen Adapter-Container
+- Optionaler, abgesicherter Artefakt-Build: Upload oder HTTPS/GitHub-Release-Download mit SHA-256-Pruefung und generiertem Dockerfile
+- OpenAPI-3.x-Routen, die Operationen aus einer OpenAPI-Spec als MCP-Tools bereitstellen
 - Verwaltete Docker-Deployments im Dashboard anlegen, starten, stoppen und entfernen
 - Verschluesselter Auth-Store auf Volume
 - Reverse-Proxy mit Header-Injektion pro Route
@@ -66,6 +68,13 @@ Wichtig:
 - `MCP_GATEWAY_DOCKER_HOST`
 - `MCP_GATEWAY_DOCKER_NETWORKS`
 - `MCP_GATEWAY_DOCKER_RESTART_POLICY`
+- `MCP_GATEWAY_BUILD_ENABLED`
+- `MCP_GATEWAY_BUILD_MAX_ARTIFACT_MB`
+- `MCP_GATEWAY_BUILD_ALLOWED_DOWNLOAD_HOSTS`
+- `MCP_GATEWAY_BUILD_ALLOW_ANY_DOWNLOAD_HOST`
+- `MCP_GATEWAY_BUILD_DEFAULT_BASE_IMAGE`
+- `MCP_GATEWAY_BUILD_ALLOWED_BASE_IMAGES`
+- `MCP_GATEWAY_OPENAPI_STORE_DIR`
 
 Der Master-Key muss genau 32 Bytes nach Base64-, Base64URL- oder Hex-Decoding ergeben.
 
@@ -96,6 +105,26 @@ Wichtig:
 - Docker-Socket-Zugriff entspricht praktisch Host-Docker-Adminrechten. Aktiviere das nur fuer vertrauenswuerdige Admins.
 - Phase 2 verwaltet HTTP-/Streamable-HTTP-MCP-Container aus bestehenden Images.
 - Beim Anlegen eines Deployments erstellt der Gateway den Container und speichert automatisch eine Route mit `deployment`-Metadaten in `routes.yaml`.
+
+### Artefakt-Builds
+
+Phase 4 kann aus einem verifizierten Binary-Artefakt ein eigenes Docker-Image bauen. Der Gateway nimmt dabei bewusst keine freien Dockerfiles und keine frei eingegebenen Shell-Kommandos entgegen.
+
+Aktivierung:
+
+- `MCP_GATEWAY_DOCKER_MANAGEMENT_ENABLED=true`
+- `MCP_GATEWAY_BUILD_ENABLED=true`
+- `/var/run/docker.sock:/var/run/docker.sock` als Volume mounten
+- `MCP_GATEWAY_BUILD_ALLOWED_BASE_IMAGES` auf die erlaubten Base Images begrenzen
+
+Sicherheitsregeln:
+
+- Uploads und Downloads brauchen immer eine SHA-256-Checksum.
+- Downloads muessen HTTPS nutzen und sind standardmaessig auf GitHub-Release-Hosts beschraenkt.
+- Wenn `MCP_GATEWAY_BUILD_ALLOW_ANY_DOWNLOAD_HOST=true` gesetzt wird, blockiert der Gateway weiterhin private, Loopback-, Link-Local- und unspezifizierte Zieladressen.
+- Entpackt werden nur `tar.gz` und `zip`; absolute Pfade, Traversal, Symlinks, Hardlinks und Spezialdateien werden abgelehnt.
+- Das Dockerfile wird vom Gateway generiert und kopiert nur das verifizierte Artefakt nach `/usr/local/bin/mcp-entrypoint`.
+- Optionale Start-Argumente werden als JSON-`ENTRYPOINT` geschrieben. Sie werden nicht durch eine Shell interpretiert.
 
 ### Native STDIO Routes
 
@@ -134,6 +163,37 @@ Wichtig:
 - Der Gateway bridged JSON-RPC direkt zwischen Streamable HTTP und STDIO. Server-seitige Reverse-Requests wie Sampling werden aktuell bewusst abgelehnt.
 - Admins sollten nur vertrauenswuerdige Executables eintragen. Native STDIO-Kommandos laufen mit den Rechten des Gateway-Containers.
 
+### OpenAPI Routes
+
+Phase 5 kann OpenAPI-3.x-Spezifikationen als MCP-Tools bereitstellen. Jede Operation unter `paths` wird zu einem Tool; `operationId` wird als Tool-Name genutzt, ansonsten erzeugt der Gateway einen stabilen Namen aus HTTP-Methode und Pfad.
+
+Beispiel:
+
+```yaml
+routes:
+  - id: example-openapi
+    display_name: Example OpenAPI Tools
+    transport: openapi
+    path_prefix: /example-openapi
+    scopes_supported:
+      - mcp
+    openapi:
+      spec_path: /data/openapi/example.yaml
+      base_url: https://api.example.com
+      headers:
+        Authorization: "Bearer REPLACE_WITH_INTERNAL_API_TOKEN"
+      timeout_seconds: 30
+```
+
+Hinweise:
+
+- Unterstuetzt werden OpenAPI-3.x-Dokumente, aktuell getestet gegen die offizielle OpenAPI Specification 3.2.0.
+- Der Gateway verarbeitet `path`, `query`, `querystring`, `header` und `cookie` Parameter. OpenAPI-Header-Parameter fuer `Accept`, `Content-Type` und `Authorization` werden gemaess OAS nicht als frei modellierte Parameter uebernommen; interne API-Auth setzt du ueber `openapi.headers`.
+- Request Bodies mit `application/json`, JSON-Suffix-Medientypen, `text/plain` und `application/x-www-form-urlencoded` werden unterstuetzt.
+- Lokale `$ref`s werden begrenzt aufgeloest; externe `$ref`s werden aus Sicherheitsgruenden nicht automatisch nachgeladen.
+- OpenAPI-Routen nutzen weiterhin den Gateway-OAuth-Schutz. Das bedeutet: Clients sehen nur den MCP-Endpunkt des Gateways, nicht direkt deine Ziel-API.
+- Offizielle Referenz: [OpenAPI Specification](https://spec.openapis.org/oas/latest.html).
+
 ## Dashboard
 
 Nach dem Login mit dem Bootstrap-Admin erreichst du das Dashboard unter:
@@ -147,6 +207,8 @@ Dort kannst du:
 - `forward_headers` pflegen
 - Route-IDs leer lassen, damit sie automatisch aus Display Name oder Path Prefix erzeugt werden
 - im Deployments-Reiter HTTP-MCP-Container aus Docker-Images oder native STDIO-Routen erstellen
+- im Deployments-Reiter aus verifizierten Artefakten eigene Images bauen
+- OpenAPI-Specs hochladen oder per URL referenzieren und als MCP-Route speichern
 - Routen als public oder private markieren
 - Routen auf alle angemeldeten Nutzer, bestimmte Nutzer/Gruppen oder nur Admins beschraenken
 - Gruppen anlegen und Nutzern zuweisen
@@ -166,7 +228,7 @@ Open WebUI speichert nach `Register Client` die OAuth-Client-Informationen in se
 
 Wenn Open WebUI beim Start des OAuth-Flows auf eine alte Domain wie `https://old.example.com/authorize` umleitet, kommt diese URL in der Regel aus gespeicherten Open-WebUI-`oauth_client_info`, nicht aus dem Gateway. Loesche in Open WebUI die betreffende Tool-Server-Verbindung oder fuehre `Register Client` erneut aus und speichere die Verbindung.
 
-Fuer lokale Tests muss `MCP_GATEWAY_PUBLIC_BASE_URL` exakt zu der URL passen, die Open WebUI nutzt, z.B. `http://192.168.178.107:18080`. Die OAuth-Metadata und der `WWW-Authenticate` Header muessen dieselbe Basis-URL ausgeben.
+Fuer lokale Tests muss `MCP_GATEWAY_PUBLIC_BASE_URL` exakt zu der URL passen, die Open WebUI nutzt, z.B. `http://gateway.internal:18080`. Die OAuth-Metadata und der `WWW-Authenticate` Header muessen dieselbe Basis-URL ausgeben.
 
 ## OAuth Standards
 

@@ -348,11 +348,11 @@ func TestClientRegistrationManagementRejectsOAuthAccessToken(t *testing.T) {
 
 func TestDynamicClientRegistrationAllowsTrustedHTTPRedirectOrigin(t *testing.T) {
 	manager := newTestManager(t, "admin@example.com", "super-secret-password")
-	manager.cfg.AllowedRedirectOrigins = []string{"http://192.168.178.254:8080"}
+	manager.cfg.AllowedRedirectOrigins = []string{"http://openwebui.internal:8080"}
 
 	req := httptest.NewRequest(http.MethodPost, "https://mcp.example.com/register", strings.NewReader(`{
 		"client_name": "Open WebUI",
-		"redirect_uris": ["http://192.168.178.254:8080/oauth/clients/mcp:camoufox/callback"],
+		"redirect_uris": ["http://openwebui.internal:8080/oauth/clients/mcp:camoufox/callback"],
 		"grant_types": ["authorization_code", "refresh_token"],
 		"response_types": ["code"],
 		"token_endpoint_auth_method": "client_secret_post"
@@ -372,7 +372,7 @@ func TestDynamicClientRegistrationRejectsUntrustedHTTPRedirectOrigin(t *testing.
 
 	req := httptest.NewRequest(http.MethodPost, "https://mcp.example.com/register", strings.NewReader(`{
 		"client_name": "Open WebUI",
-		"redirect_uris": ["http://192.168.178.254:8080/oauth/clients/mcp:camoufox/callback"],
+		"redirect_uris": ["http://openwebui.internal:8080/oauth/clients/mcp:camoufox/callback"],
 		"grant_types": ["authorization_code", "refresh_token"],
 		"response_types": ["code"],
 		"token_endpoint_auth_method": "client_secret_post"

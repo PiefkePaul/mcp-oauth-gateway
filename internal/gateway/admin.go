@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -30,6 +32,10 @@ type dashboardData struct {
 	DockerHost        string
 	DockerNetworks    string
 	DockerError       string
+	BuildEnabled      bool
+	BuildMaxMB        int64
+	BuildHosts        string
+	BuildBaseImages   string
 	Routes            []dashboardRouteView
 	Deployments       []dashboardDeploymentView
 	Users             []dashboardUserView
@@ -37,6 +43,7 @@ type dashboardData struct {
 	SelectedUser      *dashboardUserDetailView
 	SelectedRoute     routeFormData
 	DeploymentForm    deploymentFormData
+	BuildForm         artifactBuildFormData
 }
 
 type dashboardRouteView struct {
@@ -137,6 +144,18 @@ type deploymentFormData struct {
 	Notes                 string
 }
 
+type artifactBuildFormData struct {
+	SourceKind     string
+	ImageTag       string
+	BaseImage      string
+	InternalPort   string
+	DownloadURL    string
+	SHA256         string
+	ExtractMode    string
+	ArtifactPath   string
+	EntrypointArgs string
+}
+
 type routeFormData struct {
 	OriginalID            string
 	ID                    string
@@ -161,6 +180,11 @@ type routeFormData struct {
 	StdioArgs             string
 	StdioEnv              string
 	StdioWorkingDir       string
+	OpenAPISpecPath       string
+	OpenAPISpecURL        string
+	OpenAPIBaseURL        string
+	OpenAPIHeaders        string
+	OpenAPITimeoutSeconds string
 	Notes                 string
 }
 
@@ -195,9 +219,14 @@ func (s *Server) handleAdminRouteSave(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unsupported method", http.StatusMethodNotAllowed)
 		return
 	}
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, "invalid form", http.StatusBadRequest)
-		return
+	if err := r.ParseMultipartForm(maxOpenAPISpecBytes + (1 << 20)); err != nil {
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, "invalid form", http.StatusBadRequest)
+			return
+		}
+	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
 	}
 	if !s.authManager.ValidateCSRF(r) {
 		http.Error(w, "invalid CSRF token", http.StatusBadRequest)
@@ -217,6 +246,19 @@ func (s *Server) handleAdminRouteSave(w http.ResponseWriter, r *http.Request) {
 		}
 		formData.ID = route.ID
 	}
+	if route.Transport == "openapi" {
+		specPath, err := s.storeOpenAPISpecUpload(r, route.ID)
+		if err != nil {
+			s.renderAdminDashboard(w, r, identity, formData, "", err.Error(), http.StatusBadRequest)
+			return
+		}
+		if specPath != "" {
+			route.OpenAPI.SpecPath = specPath
+			route.OpenAPI.SpecURL = ""
+			formData.OpenAPISpecPath = specPath
+			formData.OpenAPISpecURL = ""
+		}
+	}
 
 	if err := s.upsertRoute(formData.OriginalID, route); err != nil {
 		s.renderAdminDashboard(w, r, identity, formData, "", err.Error(), http.StatusBadRequest)
@@ -224,6 +266,38 @@ func (s *Server) handleAdminRouteSave(w http.ResponseWriter, r *http.Request) {
 	}
 
 	http.Redirect(w, r, adminRedirectURL(route.ID, "Route saved successfully", ""), http.StatusFound)
+}
+
+func (s *Server) storeOpenAPISpecUpload(r *http.Request, routeID string) (string, error) {
+	file, header, err := r.FormFile("openapi_spec_file")
+	if err != nil {
+		return "", nil
+	}
+	defer file.Close()
+	if header == nil || strings.TrimSpace(header.Filename) == "" {
+		return "", nil
+	}
+
+	payload, err := readLimited(file, maxOpenAPISpecBytes)
+	if err != nil {
+		return "", fmt.Errorf("read OpenAPI spec upload: %w", err)
+	}
+	if _, err := parseOpenAPIOperations(payload); err != nil {
+		return "", fmt.Errorf("uploaded OpenAPI spec is invalid: %w", err)
+	}
+	if err := os.MkdirAll(s.cfg.OpenAPIStoreDir, 0o750); err != nil {
+		return "", fmt.Errorf("create OpenAPI store directory: %w", err)
+	}
+	filename := slugify(defaultIfEmpty(routeID, "openapi")) + ".yaml"
+	targetPath := filepath.Join(s.cfg.OpenAPIStoreDir, filename)
+	tempPath := targetPath + ".tmp"
+	if err := os.WriteFile(tempPath, payload, 0o640); err != nil {
+		return "", fmt.Errorf("write OpenAPI spec: %w", err)
+	}
+	if err := os.Rename(tempPath, targetPath); err != nil {
+		return "", fmt.Errorf("store OpenAPI spec: %w", err)
+	}
+	return targetPath, nil
 }
 
 func (s *Server) handleAdminRouteDelete(w http.ResponseWriter, r *http.Request) {
@@ -625,6 +699,76 @@ func (s *Server) handleAdminDeploymentRemove(w http.ResponseWriter, r *http.Requ
 	s.handleAdminDeploymentAction(w, r, "remove")
 }
 
+func (s *Server) handleAdminArtifactBuild(w http.ResponseWriter, r *http.Request) {
+	identity, ok := s.requireAdmin(w, r)
+	if !ok {
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "unsupported method", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseMultipartForm(s.cfg.BuildManagement.MaxArtifactBytes + (4 << 20)); err != nil {
+		http.Error(w, "invalid multipart form", http.StatusBadRequest)
+		return
+	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
+	}
+	if !s.authManager.ValidateCSRF(r) {
+		http.Error(w, "invalid CSRF token", http.StatusBadRequest)
+		return
+	}
+
+	formData := artifactBuildFormData{
+		SourceKind:     defaultIfEmpty(strings.TrimSpace(r.FormValue("source_kind")), artifactSourceURL),
+		ImageTag:       strings.TrimSpace(r.FormValue("image_tag")),
+		BaseImage:      defaultIfEmpty(strings.TrimSpace(r.FormValue("base_image")), s.cfg.BuildManagement.DefaultBaseImage),
+		InternalPort:   defaultIfEmpty(strings.TrimSpace(r.FormValue("internal_port")), "8080"),
+		DownloadURL:    strings.TrimSpace(r.FormValue("download_url")),
+		SHA256:         strings.TrimSpace(r.FormValue("sha256")),
+		ExtractMode:    defaultIfEmpty(strings.TrimSpace(r.FormValue("extract_mode")), extractNone),
+		ArtifactPath:   strings.TrimSpace(r.FormValue("artifact_path")),
+		EntrypointArgs: normalizeMultiline(r.FormValue("entrypoint_args")),
+	}
+
+	internalPort, err := strconv.Atoi(formData.InternalPort)
+	if err != nil {
+		s.renderAdminDashboard(w, r, identity, newEmptyRouteFormData(), "", "internal port must be numeric", http.StatusBadRequest)
+		return
+	}
+	buildReq := artifactBuildRequest{
+		SourceKind:     formData.SourceKind,
+		DownloadURL:    formData.DownloadURL,
+		SHA256:         formData.SHA256,
+		ExtractMode:    formData.ExtractMode,
+		ArtifactPath:   formData.ArtifactPath,
+		ImageTag:       formData.ImageTag,
+		BaseImage:      formData.BaseImage,
+		EntrypointArgs: parseFlexibleList(formData.EntrypointArgs),
+		InternalPort:   internalPort,
+	}
+	if formData.SourceKind == artifactSourceUpload {
+		file, header, err := r.FormFile("artifact_file")
+		if err != nil {
+			s.renderAdminDashboard(w, r, identity, newEmptyRouteFormData(), "", "artifact file is required", http.StatusBadRequest)
+			return
+		}
+		defer file.Close()
+		buildReq.UploadName = header.Filename
+		buildReq.UploadReader = file
+	}
+
+	result, err := s.buildManager.Build(r.Context(), buildReq)
+	if err != nil {
+		s.renderAdminDashboard(w, r, identity, newEmptyRouteFormData(), "", err.Error(), http.StatusBadRequest)
+		return
+	}
+	notice := fmt.Sprintf("Image %s built from verified artifact sha256:%s", result.ImageTag, result.SHA256)
+	http.Redirect(w, r, adminRedirectURLWithTab("deployments", "", notice, ""), http.StatusFound)
+}
+
 func (s *Server) handleAdminDeploymentAction(w http.ResponseWriter, r *http.Request, action string) {
 	identity, ok := s.requireAdmin(w, r)
 	if !ok {
@@ -778,6 +922,10 @@ func (s *Server) renderAdminDashboard(w http.ResponseWriter, r *http.Request, id
 		DockerHost:        s.cfg.DockerManagement.Host,
 		DockerNetworks:    strings.Join(s.cfg.DockerManagement.DefaultNetworks, ", "),
 		DockerError:       dockerErr,
+		BuildEnabled:      s.cfg.BuildManagement.Enabled,
+		BuildMaxMB:        s.cfg.BuildManagement.MaxArtifactBytes >> 20,
+		BuildHosts:        strings.Join(s.cfg.BuildManagement.AllowedDownloadHosts, ", "),
+		BuildBaseImages:   strings.Join(s.cfg.BuildManagement.AllowedBaseImages, ", "),
 		Routes:            routeViews,
 		Deployments:       deploymentViews,
 		Users:             userViews,
@@ -785,6 +933,7 @@ func (s *Server) renderAdminDashboard(w http.ResponseWriter, r *http.Request, id
 		SelectedUser:      selectedUser,
 		SelectedRoute:     selected,
 		DeploymentForm:    newDeploymentFormData(s.cfg.DockerManagement),
+		BuildForm:         newArtifactBuildFormData(s.cfg.BuildManagement),
 	}
 
 	renderAdminHTML(w, status, data)
@@ -852,13 +1001,18 @@ func parseRouteForm(r *http.Request) (routeFormData, config.Route, error) {
 		StdioArgs:             normalizeMultiline(r.FormValue("stdio_args")),
 		StdioEnv:              normalizeMultiline(r.FormValue("stdio_env")),
 		StdioWorkingDir:       strings.TrimSpace(r.FormValue("stdio_working_dir")),
+		OpenAPISpecPath:       strings.TrimSpace(r.FormValue("openapi_spec_path")),
+		OpenAPISpecURL:        strings.TrimSpace(r.FormValue("openapi_spec_url")),
+		OpenAPIBaseURL:        strings.TrimSpace(r.FormValue("openapi_base_url")),
+		OpenAPIHeaders:        normalizeMultiline(r.FormValue("openapi_headers")),
+		OpenAPITimeoutSeconds: defaultIfEmpty(strings.TrimSpace(r.FormValue("openapi_timeout_seconds")), "30"),
 		Notes:                 strings.TrimSpace(r.FormValue("notes")),
 	}
 	if len(r.Form["access_subject"]) != 0 {
 		formData.AllowedUsers, formData.AllowedGroups, formData.DeniedUsers, formData.DeniedGroups = parseAccessMatrix(r.Form["access_subject"], r.Form["access_decision"])
 	}
-	if formData.Transport != "http" && formData.Transport != "stdio" {
-		return formData, config.Route{}, fmt.Errorf("transport must be http or stdio")
+	if formData.Transport != "http" && formData.Transport != "stdio" && formData.Transport != "openapi" {
+		return formData, config.Route{}, fmt.Errorf("transport must be http, stdio or openapi")
 	}
 
 	forwardHeaders, err := parseMapTextarea(formData.ForwardHeaders, "header")
@@ -904,6 +1058,45 @@ func parseRouteForm(r *http.Request) (routeFormData, config.Route, error) {
 				Args:       parseFlexibleList(formData.StdioArgs),
 				Env:        stdioEnv,
 				WorkingDir: formData.StdioWorkingDir,
+			},
+		}
+		return formData, route, nil
+	}
+
+	if formData.Transport == "openapi" {
+		headers, err := parseMapTextarea(formData.OpenAPIHeaders, "header")
+		if err != nil {
+			return formData, config.Route{}, err
+		}
+		timeoutSeconds, err := strconv.Atoi(formData.OpenAPITimeoutSeconds)
+		if err != nil {
+			return formData, config.Route{}, fmt.Errorf("OpenAPI timeout must be numeric")
+		}
+		route := config.Route{
+			ID:                    formData.ID,
+			DisplayName:           formData.DisplayName,
+			Transport:             "openapi",
+			PathPrefix:            formData.PathPrefix,
+			UpstreamMCPPath:       defaultIfEmpty(formData.UpstreamMCPPath, "/mcp"),
+			ScopesSupported:       parseCommaList(formData.ScopesSupported),
+			ForwardHeaders:        forwardHeaders,
+			UpstreamEnvironment:   upstreamEnvironment,
+			ResourceDocumentation: formData.ResourceDocumentation,
+			Notes:                 formData.Notes,
+			Access: config.RouteAccess{
+				Visibility:    formData.AccessVisibility,
+				Mode:          formData.AccessMode,
+				AllowedUsers:  formData.AllowedUsers,
+				AllowedGroups: formData.AllowedGroups,
+				DeniedUsers:   formData.DeniedUsers,
+				DeniedGroups:  formData.DeniedGroups,
+			},
+			OpenAPI: &config.RouteOpenAPI{
+				SpecPath:       formData.OpenAPISpecPath,
+				SpecURL:        formData.OpenAPISpecURL,
+				BaseURL:        formData.OpenAPIBaseURL,
+				Headers:        headers,
+				TimeoutSeconds: timeoutSeconds,
 			},
 		}
 		return formData, route, nil
@@ -1085,6 +1278,13 @@ func newRouteFormData(route config.Route, originalID string) routeFormData {
 		form.StdioEnv = mapToLines(route.Stdio.Env, "env")
 		form.StdioWorkingDir = route.Stdio.WorkingDir
 	}
+	if route.OpenAPI != nil {
+		form.OpenAPISpecPath = route.OpenAPI.SpecPath
+		form.OpenAPISpecURL = route.OpenAPI.SpecURL
+		form.OpenAPIBaseURL = route.OpenAPI.BaseURL
+		form.OpenAPIHeaders = mapToLines(route.OpenAPI.Headers, "header")
+		form.OpenAPITimeoutSeconds = strconv.Itoa(route.OpenAPI.TimeoutSeconds)
+	}
 	return form
 }
 
@@ -1099,12 +1299,23 @@ func newDeploymentFormData(cfg config.DockerManagementConfig) deploymentFormData
 	}
 }
 
+func newArtifactBuildFormData(cfg config.BuildManagementConfig) artifactBuildFormData {
+	return artifactBuildFormData{
+		SourceKind:   artifactSourceURL,
+		BaseImage:    defaultIfEmpty(cfg.DefaultBaseImage, "debian:bookworm-slim"),
+		InternalPort: "8080",
+		ExtractMode:  extractNone,
+	}
+}
+
 func newEmptyRouteFormData() routeFormData {
 	return routeFormData{
-		Transport:        "http",
-		UpstreamMCPPath:  "/mcp",
-		AccessVisibility: "public",
-		AccessMode:       "public",
+		Transport:             "http",
+		UpstreamMCPPath:       "/mcp",
+		ScopesSupported:       "mcp",
+		OpenAPITimeoutSeconds: "30",
+		AccessVisibility:      "public",
+		AccessMode:            "public",
 	}
 }
 
@@ -1334,6 +1545,12 @@ func routeUpstreamLabel(route config.Route) string {
 			return "stdio"
 		}
 		return "stdio://" + route.Stdio.Command
+	}
+	if route.Transport == "openapi" {
+		if route.OpenAPI == nil {
+			return "openapi"
+		}
+		return "openapi://" + route.OpenAPI.BaseURL
 	}
 	return route.Upstream
 }
@@ -1867,7 +2084,7 @@ const adminDashboardTemplate = `
       <section>
         <h2>{{if .SelectedRoute.OriginalID}}Route bearbeiten{{else}}Route anlegen{{end}}</h2>
         <p class="muted">Die Route-ID ist optional. Wenn sie leer bleibt, erzeugt der Gateway sie aus dem Display Name oder Path Prefix.</p>
-        <form method="post" action="/admin/routes/save" style="margin-top: 1rem;">
+        <form method="post" action="/admin/routes/save" enctype="multipart/form-data" style="margin-top: 1rem;">
           <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
           <input type="hidden" name="original_id" value="{{.SelectedRoute.OriginalID}}">
           <div class="field-grid">
@@ -1885,6 +2102,7 @@ const adminDashboardTemplate = `
               <select id="route_transport" name="transport">
                 <option value="http" {{if eq .SelectedRoute.Transport "http"}}selected{{end}}>HTTP / Streamable HTTP</option>
                 <option value="stdio" {{if eq .SelectedRoute.Transport "stdio"}}selected{{end}}>Native STDIO</option>
+                <option value="openapi" {{if eq .SelectedRoute.Transport "openapi"}}selected{{end}}>OpenAPI -> MCP Tools</option>
               </select>
             </div>
             <div>
@@ -1927,6 +2145,38 @@ const adminDashboardTemplate = `
                 <div class="full">
                   <label for="stdio_working_dir">Working Directory</label>
                   <input id="stdio_working_dir" name="stdio_working_dir" type="text" value="{{.SelectedRoute.StdioWorkingDir}}" placeholder="/tools">
+                </div>
+              </div>
+            </details>
+            <details class="advanced full">
+              <summary>OpenAPI Tool-Bridge</summary>
+              <div class="field-grid" style="margin-top:.9rem;">
+                <div class="full">
+                  <label for="openapi_spec_file">OpenAPI Spec importieren</label>
+                  <input id="openapi_spec_file" name="openapi_spec_file" type="file" accept=".yaml,.yml,.json,application/yaml,application/json">
+                  <p class="helper">Optionaler Upload. Der Gateway prueft die Spec und speichert sie im konfigurierten OpenAPI Store.</p>
+                </div>
+                <div class="full">
+                  <label for="openapi_spec_path">OpenAPI Spec Path</label>
+                  <input id="openapi_spec_path" name="openapi_spec_path" type="text" value="{{.SelectedRoute.OpenAPISpecPath}}" placeholder="/data/openapi/example.yaml">
+                  <p class="helper">Absoluter Pfad im Gateway-Container. Wird durch Upload automatisch befuellt.</p>
+                </div>
+                <div class="full">
+                  <label for="openapi_spec_url">OpenAPI Spec URL</label>
+                  <input id="openapi_spec_url" name="openapi_spec_url" type="url" value="{{.SelectedRoute.OpenAPISpecURL}}" placeholder="https://api.example.com/openapi.yaml">
+                </div>
+                <div class="full">
+                  <label for="openapi_base_url">OpenAPI Base URL</label>
+                  <input id="openapi_base_url" name="openapi_base_url" type="url" value="{{.SelectedRoute.OpenAPIBaseURL}}" placeholder="https://api.example.com">
+                  <p class="helper">Ziel-API, gegen die die generierten Tools Requests ausfuehren.</p>
+                </div>
+                <div class="full">
+                  <label for="openapi_headers">OpenAPI API Headers</label>
+                  <textarea id="openapi_headers" name="openapi_headers" placeholder="Authorization: Bearer internal-api-token&#10;X-Api-Key: ...">{{.SelectedRoute.OpenAPIHeaders}}</textarea>
+                </div>
+                <div>
+                  <label for="openapi_timeout_seconds">OpenAPI Timeout Sekunden</label>
+                  <input id="openapi_timeout_seconds" name="openapi_timeout_seconds" type="text" value="{{.SelectedRoute.OpenAPITimeoutSeconds}}" placeholder="30">
                 </div>
               </div>
             </details>
@@ -2194,6 +2444,74 @@ const adminDashboardTemplate = `
           <div class="form-actions">
             <button type="submit">Deployment erstellen & Route anlegen</button>
           </div>
+        </form>
+        <div class="divider"></div>
+        <h2>Image aus Artefakt bauen</h2>
+        {{if .BuildEnabled}}
+          <p class="muted">Builds sind aktiv. Downloads sind auf erlaubte Hosts beschraenkt: <code>{{.BuildHosts}}</code>. Maximalgroesse: {{.BuildMaxMB}} MB.</p>
+        {{else}}
+          <p class="muted">Builds sind deaktiviert. Setze <code>MCP_GATEWAY_BUILD_ENABLED=true</code>, wenn Admins verifizierte Artefakte in eigene Images bauen duerfen.</p>
+        {{end}}
+        <form method="post" action="/admin/artifacts/build" enctype="multipart/form-data" style="margin-top:1rem;">
+          <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+          <div class="field-grid">
+            <div>
+              <label for="build_source_kind">Quelle</label>
+              <select id="build_source_kind" name="source_kind">
+                <option value="url" {{if eq .BuildForm.SourceKind "url"}}selected{{end}}>HTTPS Download</option>
+                <option value="upload" {{if eq .BuildForm.SourceKind "upload"}}selected{{end}}>File Upload</option>
+              </select>
+            </div>
+            <div>
+              <label for="build_image_tag">Image Tag</label>
+              <input id="build_image_tag" name="image_tag" type="text" value="{{.BuildForm.ImageTag}}" placeholder="local/portainer-mcp:0.7.0">
+            </div>
+            <div class="full">
+              <label for="build_download_url">GitHub Release / HTTPS URL</label>
+              <input id="build_download_url" name="download_url" type="url" value="{{.BuildForm.DownloadURL}}" placeholder="https://github.com/org/repo/releases/download/v1/server-linux-amd64.tar.gz">
+              <p class="helper">Nur HTTPS. Standardmaessig sind GitHub-Release-Hosts erlaubt; private/LAN-Ziele werden blockiert, wenn freie Hosts aktiviert werden.</p>
+            </div>
+            <div class="full">
+              <label for="build_artifact_file">Artefakt hochladen</label>
+              <input id="build_artifact_file" name="artifact_file" type="file">
+            </div>
+            <div class="full">
+              <label for="build_sha256">SHA-256 Checksum</label>
+              <input id="build_sha256" name="sha256" type="text" value="{{.BuildForm.SHA256}}" placeholder="64 hex chars oder sha256:...">
+              <p class="helper">Pflicht fuer Upload und Download. Verifiziert wird das Originalartefakt vor dem Entpacken.</p>
+            </div>
+            <div>
+              <label for="build_extract_mode">Entpacken</label>
+              <select id="build_extract_mode" name="extract_mode">
+                <option value="none" {{if eq .BuildForm.ExtractMode "none"}}selected{{end}}>Nicht entpacken</option>
+                <option value="tar.gz" {{if eq .BuildForm.ExtractMode "tar.gz"}}selected{{end}}>tar.gz</option>
+                <option value="zip" {{if eq .BuildForm.ExtractMode "zip"}}selected{{end}}>zip</option>
+              </select>
+            </div>
+            <div>
+              <label for="build_artifact_path">Pfad im Archiv</label>
+              <input id="build_artifact_path" name="artifact_path" type="text" value="{{.BuildForm.ArtifactPath}}" placeholder="portainer-mcp">
+              <p class="helper">Pflicht bei Archiven. Absolute Pfade, Symlinks und Traversal werden abgelehnt.</p>
+            </div>
+            <div>
+              <label for="build_base_image">Base Image</label>
+              <input id="build_base_image" name="base_image" type="text" value="{{.BuildForm.BaseImage}}" placeholder="debian:bookworm-slim">
+              <p class="helper">Erlaubt: <code>{{.BuildBaseImages}}</code></p>
+            </div>
+            <div class="full">
+              <label for="build_entrypoint_args">Feste Start-Argumente</label>
+              <textarea id="build_entrypoint_args" name="entrypoint_args" placeholder="mcp&#10;--port&#10;8080">{{.BuildForm.EntrypointArgs}}</textarea>
+              <p class="helper">Optional, ein Argument pro Zeile. Wird als JSON-ENTRYPOINT erzeugt, nicht als Shell-Command.</p>
+            </div>
+            <div>
+              <label for="build_internal_port">EXPOSE Port</label>
+              <input id="build_internal_port" name="internal_port" type="text" value="{{.BuildForm.InternalPort}}" placeholder="8080">
+            </div>
+          </div>
+          <div class="form-actions">
+            <button type="submit">Verifizieren & Image bauen</button>
+          </div>
+          <p class="helper">Der Dockerfile-Inhalt wird vom Gateway erzeugt. Es werden keine frei eingegebenen Shell-Kommandos in den Build uebernommen.</p>
         </form>
       </section>
     </div>

@@ -20,6 +20,9 @@ const (
 	defaultRoutesPath          = "/config/routes.yaml"
 	defaultAuthStorePath       = "/data/auth-store.enc"
 	defaultDockerHost          = "unix:///var/run/docker.sock"
+	defaultBuildWorkDir        = "/data/builds"
+	defaultOpenAPIStoreDir     = "/data/openapi"
+	defaultBuildMaxArtifactMB  = 100
 	defaultAccessTokenTTL      = time.Hour
 	defaultRefreshTokenTTL     = 30 * 24 * time.Hour
 	defaultAuthorizationTTL    = 10 * time.Minute
@@ -42,6 +45,8 @@ type Config struct {
 	AllowedEmailDomains []string
 	Auth                AuthConfig
 	DockerManagement    DockerManagementConfig
+	BuildManagement     BuildManagementConfig
+	OpenAPIStoreDir     string
 	Routes              []Route
 }
 
@@ -62,6 +67,16 @@ type DockerManagementConfig struct {
 	RestartPolicy   string
 }
 
+type BuildManagementConfig struct {
+	Enabled              bool
+	WorkDir              string
+	MaxArtifactBytes     int64
+	AllowedDownloadHosts []string
+	AllowAnyDownloadHost bool
+	DefaultBaseImage     string
+	AllowedBaseImages    []string
+}
+
 type Route struct {
 	ID                     string            `yaml:"id"`
 	DisplayName            string            `yaml:"display_name"`
@@ -76,6 +91,7 @@ type Route struct {
 	Access                 RouteAccess       `yaml:"access"`
 	Deployment             *RouteDeployment  `yaml:"deployment,omitempty"`
 	Stdio                  *RouteStdio       `yaml:"stdio,omitempty"`
+	OpenAPI                *RouteOpenAPI     `yaml:"openapi,omitempty"`
 	ResourceDocumentation  string            `yaml:"resource_documentation"`
 	Notes                  string            `yaml:"notes"`
 	NormalizedPathPrefix   string            `yaml:"-"`
@@ -97,6 +113,14 @@ type RouteStdio struct {
 	Args       []string          `yaml:"args,omitempty"`
 	Env        map[string]string `yaml:"env,omitempty"`
 	WorkingDir string            `yaml:"working_dir,omitempty"`
+}
+
+type RouteOpenAPI struct {
+	SpecPath       string            `yaml:"spec_path,omitempty"`
+	SpecURL        string            `yaml:"spec_url,omitempty"`
+	BaseURL        string            `yaml:"base_url"`
+	Headers        map[string]string `yaml:"headers,omitempty"`
+	TimeoutSeconds int               `yaml:"timeout_seconds,omitempty"`
 }
 
 type RouteAccess struct {
@@ -143,7 +167,31 @@ func Load() (*Config, error) {
 			DefaultNetworks: parseCSVEnv("MCP_GATEWAY_DOCKER_NETWORKS"),
 			RestartPolicy:   getEnvOrDefault("MCP_GATEWAY_DOCKER_RESTART_POLICY", "unless-stopped"),
 		},
+		BuildManagement: BuildManagementConfig{
+			Enabled:              getBoolEnv("MCP_GATEWAY_BUILD_ENABLED", false),
+			WorkDir:              getEnvOrDefault("MCP_GATEWAY_BUILD_WORK_DIR", defaultBuildWorkDir),
+			MaxArtifactBytes:     int64(getIntEnv("MCP_GATEWAY_BUILD_MAX_ARTIFACT_MB", defaultBuildMaxArtifactMB)) << 20,
+			AllowedDownloadHosts: parseCSVEnv("MCP_GATEWAY_BUILD_ALLOWED_DOWNLOAD_HOSTS"),
+			AllowAnyDownloadHost: getBoolEnv("MCP_GATEWAY_BUILD_ALLOW_ANY_DOWNLOAD_HOST", false),
+			DefaultBaseImage:     getEnvOrDefault("MCP_GATEWAY_BUILD_DEFAULT_BASE_IMAGE", "debian:bookworm-slim"),
+			AllowedBaseImages:    parseCSVEnv("MCP_GATEWAY_BUILD_ALLOWED_BASE_IMAGES"),
+		},
+		OpenAPIStoreDir: getEnvOrDefault("MCP_GATEWAY_OPENAPI_STORE_DIR", defaultOpenAPIStoreDir),
 	}
+	if len(cfg.BuildManagement.AllowedDownloadHosts) == 0 {
+		cfg.BuildManagement.AllowedDownloadHosts = []string{
+			"github.com",
+			"objects.githubusercontent.com",
+			"github-releases.githubusercontent.com",
+			"release-assets.githubusercontent.com",
+		}
+	}
+	if len(cfg.BuildManagement.AllowedBaseImages) == 0 {
+		cfg.BuildManagement.AllowedBaseImages = []string{strings.ToLower(cfg.BuildManagement.DefaultBaseImage)}
+	}
+	cfg.BuildManagement.AllowedDownloadHosts = normalizeStringList(cfg.BuildManagement.AllowedDownloadHosts, true)
+	cfg.BuildManagement.DefaultBaseImage = strings.ToLower(strings.TrimSpace(cfg.BuildManagement.DefaultBaseImage))
+	cfg.BuildManagement.AllowedBaseImages = normalizeStringList(cfg.BuildManagement.AllowedBaseImages, true)
 
 	if (cfg.BootstrapEmail == "") != (cfg.BootstrapPassword == "") {
 		return nil, fmt.Errorf("MCP_GATEWAY_BOOTSTRAP_EMAIL and MCP_GATEWAY_BOOTSTRAP_PASSWORD must either both be set or both be empty")
@@ -312,12 +360,14 @@ func normalizeRoute(route *Route) error {
 	if route.Transport == "" {
 		if route.Stdio != nil {
 			route.Transport = "stdio"
+		} else if route.OpenAPI != nil {
+			route.Transport = "openapi"
 		} else {
 			route.Transport = "http"
 		}
 	}
-	if route.Transport != "http" && route.Transport != "stdio" {
-		return fmt.Errorf("route %q transport must be http or stdio", route.ID)
+	if route.Transport != "http" && route.Transport != "stdio" && route.Transport != "openapi" {
+		return fmt.Errorf("route %q transport must be http, stdio or openapi", route.ID)
 	}
 
 	pathPrefix := strings.TrimSpace(route.PathPrefix)
@@ -358,6 +408,7 @@ func normalizeRoute(route *Route) error {
 		}
 		route.Upstream = upstreamURL.String()
 		route.Stdio = nil
+		route.OpenAPI = nil
 	case "stdio":
 		route.Upstream = strings.TrimSpace(route.Upstream)
 		if route.Stdio == nil {
@@ -368,6 +419,21 @@ func normalizeRoute(route *Route) error {
 			return fmt.Errorf("route %q stdio config is invalid: %w", route.ID, err)
 		}
 		route.Stdio = &stdio
+		route.OpenAPI = nil
+	case "openapi":
+		route.Upstream = strings.TrimSpace(route.Upstream)
+		route.Stdio = nil
+		if route.OpenAPI == nil {
+			return fmt.Errorf("route %q openapi config is required", route.ID)
+		}
+		openapi, err := normalizeRouteOpenAPI(*route.OpenAPI)
+		if err != nil {
+			return fmt.Errorf("route %q openapi config is invalid: %w", route.ID, err)
+		}
+		route.OpenAPI = &openapi
+		if route.Upstream == "" {
+			route.Upstream = openapi.BaseURL
+		}
 	}
 
 	if route.ResourceDocumentation != "" {
@@ -510,6 +576,58 @@ func normalizeRouteStdio(stdio RouteStdio) (RouteStdio, error) {
 	return stdio, nil
 }
 
+func normalizeRouteOpenAPI(openapi RouteOpenAPI) (RouteOpenAPI, error) {
+	openapi.SpecPath = strings.TrimSpace(openapi.SpecPath)
+	openapi.SpecURL = strings.TrimSpace(openapi.SpecURL)
+	if openapi.SpecPath == "" && openapi.SpecURL == "" {
+		return RouteOpenAPI{}, fmt.Errorf("spec_path or spec_url is required")
+	}
+	if openapi.SpecPath != "" && !filepath.IsAbs(openapi.SpecPath) {
+		return RouteOpenAPI{}, fmt.Errorf("spec_path must be an absolute path")
+	}
+	if openapi.SpecURL != "" {
+		specURL, err := url.Parse(openapi.SpecURL)
+		if err != nil || specURL.Scheme == "" || specURL.Host == "" {
+			return RouteOpenAPI{}, fmt.Errorf("spec_url must be an absolute URL")
+		}
+		if specURL.Scheme != "https" && specURL.Scheme != "http" {
+			return RouteOpenAPI{}, fmt.Errorf("spec_url must use http or https")
+		}
+		openapi.SpecURL = specURL.String()
+	}
+
+	baseURL, err := url.Parse(strings.TrimSpace(openapi.BaseURL))
+	if err != nil || baseURL.Scheme == "" || baseURL.Host == "" {
+		return RouteOpenAPI{}, fmt.Errorf("base_url must be an absolute URL")
+	}
+	if baseURL.Scheme != "https" && baseURL.Scheme != "http" {
+		return RouteOpenAPI{}, fmt.Errorf("base_url must use http or https")
+	}
+	baseURL.RawQuery = ""
+	baseURL.Fragment = ""
+	openapi.BaseURL = strings.TrimRight(baseURL.String(), "/")
+
+	headers := make(map[string]string, len(openapi.Headers))
+	for key, value := range openapi.Headers {
+		headerName := strings.TrimSpace(key)
+		if headerName == "" {
+			return RouteOpenAPI{}, fmt.Errorf("headers contains an empty key")
+		}
+		headers[headerName] = strings.TrimSpace(value)
+	}
+	if len(headers) == 0 {
+		headers = nil
+	}
+	openapi.Headers = headers
+	if openapi.TimeoutSeconds <= 0 {
+		openapi.TimeoutSeconds = 30
+	}
+	if openapi.TimeoutSeconds > 300 {
+		return RouteOpenAPI{}, fmt.Errorf("timeout_seconds must be <= 300")
+	}
+	return openapi, nil
+}
+
 func normalizeStringList(values []string, lower bool) []string {
 	if len(values) == 0 {
 		return nil
@@ -569,6 +687,10 @@ func cloneRoutes(routes []Route) []Route {
 			stdio := cloneRouteStdio(*routes[i].Stdio)
 			cloned[i].Stdio = &stdio
 		}
+		if routes[i].OpenAPI != nil {
+			openapi := cloneRouteOpenAPI(*routes[i].OpenAPI)
+			cloned[i].OpenAPI = &openapi
+		}
 	}
 	return cloned
 }
@@ -606,6 +728,22 @@ func cloneRouteStdio(stdio RouteStdio) RouteStdio {
 		cloned.Env = make(map[string]string, len(stdio.Env))
 		for key, value := range stdio.Env {
 			cloned.Env[key] = value
+		}
+	}
+	return cloned
+}
+
+func cloneRouteOpenAPI(openapi RouteOpenAPI) RouteOpenAPI {
+	cloned := RouteOpenAPI{
+		SpecPath:       openapi.SpecPath,
+		SpecURL:        openapi.SpecURL,
+		BaseURL:        openapi.BaseURL,
+		TimeoutSeconds: openapi.TimeoutSeconds,
+	}
+	if openapi.Headers != nil {
+		cloned.Headers = make(map[string]string, len(openapi.Headers))
+		for key, value := range openapi.Headers {
+			cloned.Headers[key] = value
 		}
 	}
 	return cloned
@@ -733,6 +871,18 @@ func getBoolEnv(key string, fallback bool) bool {
 		return fallback
 	}
 	return raw == "1" || raw == "true" || raw == "yes" || raw == "on"
+}
+
+func getIntEnv(key string, fallback int) int {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	var parsed int
+	if _, err := fmt.Sscanf(raw, "%d", &parsed); err != nil || parsed <= 0 {
+		return fallback
+	}
+	return parsed
 }
 
 func parseCSVEnv(key string) []string {
