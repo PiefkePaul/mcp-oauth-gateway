@@ -35,6 +35,48 @@ func TestProtectedResourceMetadata(t *testing.T) {
 	}
 }
 
+func TestGatewayProtectedResourceMetadata(t *testing.T) {
+	handler := newTestServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "https://mcp.example.com/.well-known/oauth-protected-resource", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if got, want := payload["resource"], "https://mcp.example.com"; got != want {
+		t.Fatalf("expected gateway resource %q, got %#v", want, got)
+	}
+}
+
+func TestPathInsertedAuthorizationMetadata(t *testing.T) {
+	handler := newTestServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "https://mcp.example.com/.well-known/oauth-authorization-server/n8n/mcp", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if got, want := payload["issuer"], "https://mcp.example.com"; got != want {
+		t.Fatalf("expected issuer %q, got %#v", want, got)
+	}
+}
+
 func TestProxyChallengesWithoutBearerToken(t *testing.T) {
 	handler := newTestServer(t)
 
@@ -74,22 +116,120 @@ func TestRouteInfo(t *testing.T) {
 	}
 }
 
+func TestPublicDashboardHidesPrivateRoutes(t *testing.T) {
+	routes, err := config.ParseRoutesPayload([]byte(`
+routes:
+  - id: legal
+    display_name: Legal MCP
+    path_prefix: /legal
+    upstream: http://legal-mcp:8000
+    upstream_mcp_path: /mcp
+  - id: secret
+    display_name: Secret MCP
+    path_prefix: /secret
+    upstream: http://secret-mcp:8000
+    upstream_mcp_path: /mcp
+    access:
+      visibility: private
+      mode: restricted
+`))
+	if err != nil {
+		t.Fatalf("parse routes: %v", err)
+	}
+	handler := newTestServerWithRoutes(t, routes)
+
+	req := httptest.NewRequest(http.MethodGet, "https://mcp.example.com/", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "Legal MCP") {
+		t.Fatalf("expected public route in dashboard")
+	}
+	if strings.Contains(body, "Secret MCP") {
+		t.Fatalf("did not expect private route in dashboard")
+	}
+}
+
+func TestAdminDashboardTemplateRenders(t *testing.T) {
+	handler := newTestServer(t)
+	group, err := handler.authManager.CreateGroup("Legal Team")
+	if err != nil {
+		t.Fatalf("create group: %v", err)
+	}
+	user, err := handler.authManager.CreateUser("user@example.com", "another-secret-password", false)
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	if err := handler.authManager.SetUserGroups(user.ID, []string{group.ID}); err != nil {
+		t.Fatalf("set user groups: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "https://mcp.example.com/admin", nil)
+	rec := httptest.NewRecorder()
+
+	handler.renderAdminDashboard(rec, req, &auth.Identity{
+		UserID:  "admin",
+		Email:   "admin@example.com",
+		IsAdmin: true,
+	}, newEmptyRouteFormData(), "", "", http.StatusOK)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "Import / Export") {
+		t.Fatalf("expected import/export section to render")
+	}
+}
+
+func TestRouteAccessPolicy(t *testing.T) {
+	route := config.Route{
+		ID:          "legal",
+		DisplayName: "Legal",
+		Access: config.RouteAccess{
+			Mode:          "restricted",
+			AllowedGroups: []string{"Legal Team"},
+			DeniedUsers:   []string{"blocked@example.com"},
+		},
+	}
+
+	if !routeAccessAllowed(route, &auth.Identity{Email: "user@example.com", GroupNames: []string{"Legal Team"}}) {
+		t.Fatalf("expected legal team member to be allowed")
+	}
+	if routeAccessAllowed(route, &auth.Identity{Email: "blocked@example.com", GroupNames: []string{"Legal Team"}}) {
+		t.Fatalf("expected denied user to be rejected")
+	}
+	if !routeAccessAllowed(route, &auth.Identity{Email: "admin@example.com", IsAdmin: true}) {
+		t.Fatalf("expected admin to bypass route restrictions")
+	}
+}
+
 func newTestServer(t *testing.T) *Server {
+	t.Helper()
+
+	return newTestServerWithRoutes(t, []config.Route{
+		{
+			ID:                     "n8n",
+			DisplayName:            "n8n MCP",
+			PathPrefix:             "/n8n",
+			Upstream:               "http://n8n-mcp:8080",
+			UpstreamMCPPath:        "/mcp",
+			NormalizedPathPrefix:   "/n8n",
+			NormalizedUpstreamPath: "/mcp",
+		},
+	})
+}
+
+func newTestServerWithRoutes(t *testing.T, routes []config.Route) *Server {
 	t.Helper()
 
 	cfg := &config.Config{
 		PublicBaseURL: "https://mcp.example.com",
-		Routes: []config.Route{
-			{
-				ID:                     "n8n",
-				DisplayName:            "n8n MCP",
-				PathPrefix:             "/n8n",
-				Upstream:               "http://n8n-mcp:8080",
-				UpstreamMCPPath:        "/mcp",
-				NormalizedPathPrefix:   "/n8n",
-				NormalizedUpstreamPath: "/mcp",
-			},
-		},
+		Routes:        routes,
 	}
 
 	manager, err := auth.NewManager(auth.Config{

@@ -13,12 +13,26 @@ services:
       MCP_GATEWAY_AUTH_MASTER_KEY: "REPLACE_WITH_32_BYTE_BASE64_OR_HEX_KEY"
       MCP_GATEWAY_ACCOUNT_TITLE: "Example MCP Gateway"
       MCP_GATEWAY_ALLOW_SELF_SIGNUP: "false"
+      MCP_GATEWAY_ACCESS_LOG: "false"
       MCP_GATEWAY_BOOTSTRAP_EMAIL: "admin@example.com"
       MCP_GATEWAY_BOOTSTRAP_PASSWORD: "REPLACE_WITH_LONG_RANDOM_PASSWORD"
       MCP_GATEWAY_ALLOWED_EMAIL_DOMAINS: "example.com"
+      # Optional: only needed when a client such as Open WebUI registers a non-HTTPS,
+      # non-loopback redirect URI, for example in a private LAN test setup.
+      # Prefer setting Open WebUI's WEBUI_URL to its public HTTPS URL instead.
+      MCP_GATEWAY_ALLOWED_REDIRECT_ORIGINS: ""
+      # Optional: enable only if the gateway should create/start/stop Docker containers.
+      # Mounting docker.sock grants this container host-level Docker control.
+      MCP_GATEWAY_DOCKER_MANAGEMENT_ENABLED: "false"
+      MCP_GATEWAY_DOCKER_HOST: "unix:///var/run/docker.sock"
+      MCP_GATEWAY_DOCKER_NETWORKS: "mcp-internal"
     volumes:
-      - ./config:/config:ro
+      - ./config:/config
       - ./data:/data
+      # Optional: native STDIO MCP executables made available to the gateway.
+      # - ./tools:/tools:ro
+      # Required only when MCP_GATEWAY_DOCKER_MANAGEMENT_ENABLED=true:
+      # - /var/run/docker.sock:/var/run/docker.sock
     networks:
       - reverse-proxy
       - mcp-internal

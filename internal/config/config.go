@@ -19,6 +19,7 @@ const (
 	defaultListenAddr          = ":8080"
 	defaultRoutesPath          = "/config/routes.yaml"
 	defaultAuthStorePath       = "/data/auth-store.enc"
+	defaultDockerHost          = "unix:///var/run/docker.sock"
 	defaultAccessTokenTTL      = time.Hour
 	defaultRefreshTokenTTL     = 30 * 24 * time.Hour
 	defaultAuthorizationTTL    = 10 * time.Minute
@@ -34,37 +35,77 @@ type Config struct {
 	RoutesPath          string
 	AccountPortalTitle  string
 	AllowSelfSignup     bool
+	AccessLog           bool
 	BootstrapEmail      string
 	BootstrapPassword   string
 	AllowedEmails       []string
 	AllowedEmailDomains []string
 	Auth                AuthConfig
+	DockerManagement    DockerManagementConfig
 	Routes              []Route
 }
 
 type AuthConfig struct {
-	StorePath            string
-	MasterKey            []byte
-	AccessTokenTTL       time.Duration
-	RefreshTokenTTL      time.Duration
-	AuthorizationCodeTTL time.Duration
-	SessionTTL           time.Duration
+	StorePath              string
+	MasterKey              []byte
+	AccessTokenTTL         time.Duration
+	RefreshTokenTTL        time.Duration
+	AuthorizationCodeTTL   time.Duration
+	SessionTTL             time.Duration
+	AllowedRedirectOrigins []string
+}
+
+type DockerManagementConfig struct {
+	Enabled         bool
+	Host            string
+	DefaultNetworks []string
+	RestartPolicy   string
 }
 
 type Route struct {
 	ID                     string            `yaml:"id"`
 	DisplayName            string            `yaml:"display_name"`
+	Transport              string            `yaml:"transport,omitempty"`
 	PathPrefix             string            `yaml:"path_prefix"`
-	Upstream               string            `yaml:"upstream"`
-	UpstreamMCPPath        string            `yaml:"upstream_mcp_path"`
+	Upstream               string            `yaml:"upstream,omitempty"`
+	UpstreamMCPPath        string            `yaml:"upstream_mcp_path,omitempty"`
 	ScopesSupported        []string          `yaml:"scopes_supported"`
 	PassAuthorization      bool              `yaml:"pass_authorization_header"`
 	ForwardHeaders         map[string]string `yaml:"forward_headers"`
 	UpstreamEnvironment    map[string]string `yaml:"upstream_environment"`
+	Access                 RouteAccess       `yaml:"access"`
+	Deployment             *RouteDeployment  `yaml:"deployment,omitempty"`
+	Stdio                  *RouteStdio       `yaml:"stdio,omitempty"`
 	ResourceDocumentation  string            `yaml:"resource_documentation"`
 	Notes                  string            `yaml:"notes"`
 	NormalizedPathPrefix   string            `yaml:"-"`
 	NormalizedUpstreamPath string            `yaml:"-"`
+}
+
+type RouteDeployment struct {
+	Type          string   `yaml:"type"`
+	Managed       bool     `yaml:"managed"`
+	Image         string   `yaml:"image"`
+	ContainerName string   `yaml:"container_name"`
+	InternalPort  int      `yaml:"internal_port"`
+	Networks      []string `yaml:"networks,omitempty"`
+	RestartPolicy string   `yaml:"restart_policy,omitempty"`
+}
+
+type RouteStdio struct {
+	Command    string            `yaml:"command"`
+	Args       []string          `yaml:"args,omitempty"`
+	Env        map[string]string `yaml:"env,omitempty"`
+	WorkingDir string            `yaml:"working_dir,omitempty"`
+}
+
+type RouteAccess struct {
+	Visibility    string   `yaml:"visibility"`
+	Mode          string   `yaml:"mode"`
+	AllowedUsers  []string `yaml:"allowed_users,omitempty"`
+	AllowedGroups []string `yaml:"allowed_groups,omitempty"`
+	DeniedUsers   []string `yaml:"denied_users,omitempty"`
+	DeniedGroups  []string `yaml:"denied_groups,omitempty"`
 }
 
 type routesFile struct {
@@ -83,16 +124,24 @@ func Load() (*Config, error) {
 		RoutesPath:          getEnvOrDefault("MCP_GATEWAY_ROUTES_PATH", defaultRoutesPath),
 		AccountPortalTitle:  getEnvOrDefault("MCP_GATEWAY_ACCOUNT_TITLE", defaultAccountPortalTitle),
 		AllowSelfSignup:     getEnvOrDefault("MCP_GATEWAY_ALLOW_SELF_SIGNUP", "false") == "true",
+		AccessLog:           getBoolEnv("MCP_GATEWAY_ACCESS_LOG", false),
 		BootstrapEmail:      strings.TrimSpace(os.Getenv("MCP_GATEWAY_BOOTSTRAP_EMAIL")),
 		BootstrapPassword:   os.Getenv("MCP_GATEWAY_BOOTSTRAP_PASSWORD"),
 		AllowedEmails:       parseCSVEnv("MCP_GATEWAY_ALLOWED_EMAILS"),
 		AllowedEmailDomains: parseCSVEnv("MCP_GATEWAY_ALLOWED_EMAIL_DOMAINS"),
 		Auth: AuthConfig{
-			StorePath:            getEnvOrDefault("MCP_GATEWAY_AUTH_STORE_PATH", defaultAuthStorePath),
-			AccessTokenTTL:       getDurationEnv("MCP_GATEWAY_ACCESS_TOKEN_TTL", defaultAccessTokenTTL),
-			RefreshTokenTTL:      getDurationEnv("MCP_GATEWAY_REFRESH_TOKEN_TTL", defaultRefreshTokenTTL),
-			AuthorizationCodeTTL: getDurationEnv("MCP_GATEWAY_AUTHORIZATION_CODE_TTL", defaultAuthorizationTTL),
-			SessionTTL:           getDurationEnv("MCP_GATEWAY_SESSION_TTL", defaultSessionTTL),
+			StorePath:              getEnvOrDefault("MCP_GATEWAY_AUTH_STORE_PATH", defaultAuthStorePath),
+			AccessTokenTTL:         getDurationEnv("MCP_GATEWAY_ACCESS_TOKEN_TTL", defaultAccessTokenTTL),
+			RefreshTokenTTL:        getDurationEnv("MCP_GATEWAY_REFRESH_TOKEN_TTL", defaultRefreshTokenTTL),
+			AuthorizationCodeTTL:   getDurationEnv("MCP_GATEWAY_AUTHORIZATION_CODE_TTL", defaultAuthorizationTTL),
+			SessionTTL:             getDurationEnv("MCP_GATEWAY_SESSION_TTL", defaultSessionTTL),
+			AllowedRedirectOrigins: parseCSVEnv("MCP_GATEWAY_ALLOWED_REDIRECT_ORIGINS"),
+		},
+		DockerManagement: DockerManagementConfig{
+			Enabled:         getBoolEnv("MCP_GATEWAY_DOCKER_MANAGEMENT_ENABLED", false),
+			Host:            getEnvOrDefault("MCP_GATEWAY_DOCKER_HOST", defaultDockerHost),
+			DefaultNetworks: parseCSVEnv("MCP_GATEWAY_DOCKER_NETWORKS"),
+			RestartPolicy:   getEnvOrDefault("MCP_GATEWAY_DOCKER_RESTART_POLICY", "unless-stopped"),
 		},
 	}
 
@@ -105,6 +154,11 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	cfg.Auth.MasterKey = masterKey
+	allowedRedirectOrigins, err := normalizeURLOrigins(cfg.Auth.AllowedRedirectOrigins)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Auth.AllowedRedirectOrigins = allowedRedirectOrigins
 
 	routes, err := LoadRoutesFile(cfg.RoutesPath)
 	if err != nil {
@@ -125,6 +179,10 @@ func (r Route) ProtectedResourceMetadataPath() string {
 
 func (r Route) PublicInfoPath() string {
 	return r.NormalizedPathPrefix
+}
+
+func (r Route) PublicDocsPath() string {
+	return path.Join(r.NormalizedPathPrefix, "docs")
 }
 
 func (r Route) ResourceURL(publicBaseURL string) string {
@@ -163,31 +221,13 @@ func LoadRoutesFile(routesPath string) ([]Route, error) {
 		}
 	}
 
-	var parsed routesFile
-	if len(bytes.TrimSpace(routesPayload)) != 0 {
-		if err := yaml.Unmarshal(routesPayload, &parsed); err != nil {
-			return nil, fmt.Errorf("failed to parse routes config: %w", err)
-		}
-	}
-
-	if parsed.Routes == nil {
-		parsed.Routes = []Route{}
-	}
-	if err := ValidateRoutes(parsed.Routes); err != nil {
-		return nil, err
-	}
-	return cloneRoutes(parsed.Routes), nil
+	return ParseRoutesPayload(routesPayload)
 }
 
 func SaveRoutesFile(routesPath string, routes []Route) error {
-	cloned := cloneRoutes(routes)
-	if err := ValidateRoutes(cloned); err != nil {
-		return err
-	}
-
-	payload, err := yaml.Marshal(routesFile{Routes: cloned})
+	payload, err := MarshalRoutesPayload(routes)
 	if err != nil {
-		return fmt.Errorf("failed to encode routes config: %w", err)
+		return err
 	}
 
 	if err := os.MkdirAll(filepath.Dir(routesPath), 0o755); err != nil {
@@ -202,6 +242,36 @@ func SaveRoutesFile(routesPath string, routes []Route) error {
 		return fmt.Errorf("failed to replace routes config: %w", err)
 	}
 	return nil
+}
+
+func ParseRoutesPayload(payload []byte) ([]Route, error) {
+	var parsed routesFile
+	if len(bytes.TrimSpace(payload)) != 0 {
+		if err := yaml.Unmarshal(payload, &parsed); err != nil {
+			return nil, fmt.Errorf("failed to parse routes config: %w", err)
+		}
+	}
+
+	if parsed.Routes == nil {
+		parsed.Routes = []Route{}
+	}
+	if err := ValidateRoutes(parsed.Routes); err != nil {
+		return nil, err
+	}
+	return cloneRoutes(parsed.Routes), nil
+}
+
+func MarshalRoutesPayload(routes []Route) ([]byte, error) {
+	cloned := cloneRoutes(routes)
+	if err := ValidateRoutes(cloned); err != nil {
+		return nil, err
+	}
+
+	payload, err := yaml.Marshal(routesFile{Routes: cloned})
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode routes config: %w", err)
+	}
+	return payload, nil
 }
 
 func ValidateRoutes(routes []Route) error {
@@ -238,6 +308,18 @@ func normalizeRoute(route *Route) error {
 		route.DisplayName = route.ID
 	}
 
+	route.Transport = strings.ToLower(strings.TrimSpace(route.Transport))
+	if route.Transport == "" {
+		if route.Stdio != nil {
+			route.Transport = "stdio"
+		} else {
+			route.Transport = "http"
+		}
+	}
+	if route.Transport != "http" && route.Transport != "stdio" {
+		return fmt.Errorf("route %q transport must be http or stdio", route.ID)
+	}
+
 	pathPrefix := strings.TrimSpace(route.PathPrefix)
 	if pathPrefix == "" {
 		pathPrefix = "/" + route.ID
@@ -256,13 +338,6 @@ func normalizeRoute(route *Route) error {
 	}
 	route.NormalizedPathPrefix = pathPrefix
 
-	upstreamURL, err := url.Parse(strings.TrimSpace(route.Upstream))
-	if err != nil || upstreamURL.Scheme == "" || upstreamURL.Host == "" {
-		return fmt.Errorf("route %q has invalid upstream URL", route.ID)
-	}
-
-	route.Upstream = upstreamURL.String()
-
 	upstreamPath := strings.TrimSpace(route.UpstreamMCPPath)
 	if upstreamPath == "" {
 		upstreamPath = "/mcp"
@@ -273,6 +348,26 @@ func normalizeRoute(route *Route) error {
 	route.NormalizedUpstreamPath = path.Clean(upstreamPath)
 	if route.NormalizedUpstreamPath == "." {
 		route.NormalizedUpstreamPath = "/"
+	}
+
+	switch route.Transport {
+	case "http":
+		upstreamURL, err := url.Parse(strings.TrimSpace(route.Upstream))
+		if err != nil || upstreamURL.Scheme == "" || upstreamURL.Host == "" {
+			return fmt.Errorf("route %q has invalid upstream URL", route.ID)
+		}
+		route.Upstream = upstreamURL.String()
+		route.Stdio = nil
+	case "stdio":
+		route.Upstream = strings.TrimSpace(route.Upstream)
+		if route.Stdio == nil {
+			return fmt.Errorf("route %q stdio config is required", route.ID)
+		}
+		stdio, err := normalizeRouteStdio(*route.Stdio)
+		if err != nil {
+			return fmt.Errorf("route %q stdio config is invalid: %w", route.ID, err)
+		}
+		route.Stdio = &stdio
 	}
 
 	if route.ResourceDocumentation != "" {
@@ -302,9 +397,144 @@ func normalizeRoute(route *Route) error {
 		upstreamEnvironment[envName] = strings.TrimSpace(value)
 	}
 	route.UpstreamEnvironment = upstreamEnvironment
+	route.Access = normalizeRouteAccess(route.Access)
+	if route.Access.Visibility != "public" && route.Access.Visibility != "private" {
+		return fmt.Errorf("route %q access visibility must be public or private", route.ID)
+	}
+	switch route.Access.Mode {
+	case "public", "restricted", "admin":
+	default:
+		return fmt.Errorf("route %q access mode must be public, restricted or admin", route.ID)
+	}
+	if route.Deployment != nil {
+		deployment, err := normalizeRouteDeployment(*route.Deployment)
+		if err != nil {
+			return fmt.Errorf("route %q deployment is invalid: %w", route.ID, err)
+		}
+		route.Deployment = &deployment
+	}
 	route.Notes = strings.TrimSpace(route.Notes)
 
 	return nil
+}
+
+func normalizeRouteAccess(access RouteAccess) RouteAccess {
+	visibility := strings.ToLower(strings.TrimSpace(access.Visibility))
+	if visibility == "" {
+		visibility = "public"
+	}
+	mode := strings.ToLower(strings.TrimSpace(access.Mode))
+	if mode == "" {
+		mode = "public"
+	}
+
+	return RouteAccess{
+		Visibility:    visibility,
+		Mode:          mode,
+		AllowedUsers:  normalizeStringList(access.AllowedUsers, true),
+		AllowedGroups: normalizeStringList(access.AllowedGroups, false),
+		DeniedUsers:   normalizeStringList(access.DeniedUsers, true),
+		DeniedGroups:  normalizeStringList(access.DeniedGroups, false),
+	}
+}
+
+func (a RouteAccess) IsPrivate() bool {
+	return strings.EqualFold(strings.TrimSpace(a.Visibility), "private")
+}
+
+func (a RouteAccess) EffectiveMode() string {
+	mode := strings.ToLower(strings.TrimSpace(a.Mode))
+	if mode == "" {
+		return "public"
+	}
+	return mode
+}
+
+func normalizeRouteDeployment(deployment RouteDeployment) (RouteDeployment, error) {
+	deployment.Type = strings.ToLower(strings.TrimSpace(deployment.Type))
+	if deployment.Type == "" {
+		deployment.Type = "docker"
+	}
+	if deployment.Type != "docker" {
+		return RouteDeployment{}, fmt.Errorf("type must be docker")
+	}
+	deployment.Image = strings.TrimSpace(deployment.Image)
+	deployment.ContainerName = strings.TrimSpace(deployment.ContainerName)
+	deployment.Networks = normalizeStringList(deployment.Networks, false)
+	deployment.RestartPolicy = strings.TrimSpace(deployment.RestartPolicy)
+	if deployment.Managed {
+		if deployment.Image == "" {
+			return RouteDeployment{}, fmt.Errorf("image is required")
+		}
+		if deployment.ContainerName == "" {
+			return RouteDeployment{}, fmt.Errorf("container_name is required")
+		}
+		if deployment.InternalPort <= 0 || deployment.InternalPort > 65535 {
+			return RouteDeployment{}, fmt.Errorf("internal_port must be between 1 and 65535")
+		}
+	}
+	return deployment, nil
+}
+
+func normalizeRouteStdio(stdio RouteStdio) (RouteStdio, error) {
+	stdio.Command = strings.TrimSpace(stdio.Command)
+	if stdio.Command == "" {
+		return RouteStdio{}, fmt.Errorf("command is required")
+	}
+	stdio.WorkingDir = strings.TrimSpace(stdio.WorkingDir)
+	if stdio.WorkingDir != "" && !filepath.IsAbs(stdio.WorkingDir) {
+		return RouteStdio{}, fmt.Errorf("working_dir must be an absolute path")
+	}
+
+	args := make([]string, 0, len(stdio.Args))
+	for _, raw := range stdio.Args {
+		arg := strings.TrimSpace(raw)
+		if arg != "" {
+			args = append(args, arg)
+		}
+	}
+	stdio.Args = args
+
+	env := make(map[string]string, len(stdio.Env))
+	for key, value := range stdio.Env {
+		envName := strings.TrimSpace(key)
+		if envName == "" {
+			return RouteStdio{}, fmt.Errorf("env contains an empty key")
+		}
+		env[envName] = strings.TrimSpace(value)
+	}
+	if len(env) == 0 {
+		env = nil
+	}
+	stdio.Env = env
+	return stdio, nil
+}
+
+func normalizeStringList(values []string, lower bool) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, raw := range values {
+		value := strings.TrimSpace(raw)
+		if lower {
+			value = strings.ToLower(value)
+		}
+		if value == "" {
+			continue
+		}
+		key := strings.ToLower(value)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, value)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func cloneRoutes(routes []Route) []Route {
@@ -329,6 +559,53 @@ func cloneRoutes(routes []Route) []Route {
 			for key, value := range routes[i].UpstreamEnvironment {
 				cloned[i].UpstreamEnvironment[key] = value
 			}
+		}
+		cloned[i].Access = cloneRouteAccess(routes[i].Access)
+		if routes[i].Deployment != nil {
+			deployment := cloneRouteDeployment(*routes[i].Deployment)
+			cloned[i].Deployment = &deployment
+		}
+		if routes[i].Stdio != nil {
+			stdio := cloneRouteStdio(*routes[i].Stdio)
+			cloned[i].Stdio = &stdio
+		}
+	}
+	return cloned
+}
+
+func cloneRouteAccess(access RouteAccess) RouteAccess {
+	return RouteAccess{
+		Visibility:    access.Visibility,
+		Mode:          access.Mode,
+		AllowedUsers:  append([]string(nil), access.AllowedUsers...),
+		AllowedGroups: append([]string(nil), access.AllowedGroups...),
+		DeniedUsers:   append([]string(nil), access.DeniedUsers...),
+		DeniedGroups:  append([]string(nil), access.DeniedGroups...),
+	}
+}
+
+func cloneRouteDeployment(deployment RouteDeployment) RouteDeployment {
+	return RouteDeployment{
+		Type:          deployment.Type,
+		Managed:       deployment.Managed,
+		Image:         deployment.Image,
+		ContainerName: deployment.ContainerName,
+		InternalPort:  deployment.InternalPort,
+		Networks:      append([]string(nil), deployment.Networks...),
+		RestartPolicy: deployment.RestartPolicy,
+	}
+}
+
+func cloneRouteStdio(stdio RouteStdio) RouteStdio {
+	cloned := RouteStdio{
+		Command:    stdio.Command,
+		Args:       append([]string(nil), stdio.Args...),
+		WorkingDir: stdio.WorkingDir,
+	}
+	if stdio.Env != nil {
+		cloned.Env = make(map[string]string, len(stdio.Env))
+		for key, value := range stdio.Env {
+			cloned.Env[key] = value
 		}
 	}
 	return cloned
@@ -361,6 +638,7 @@ func validateReservedPathPrefix(prefix string) error {
 		"/admin",
 		"/account",
 		"/authorize",
+		"/docs",
 		"/healthz",
 		"/register",
 		"/token",
@@ -396,6 +674,37 @@ func normalizePublicBaseURL(raw string) (string, error) {
 	return strings.TrimRight(value, "/"), nil
 }
 
+func normalizeURLOrigins(values []string) ([]string, error) {
+	out := make([]string, 0, len(values))
+	seen := map[string]bool{}
+	for _, raw := range values {
+		value := strings.TrimSpace(raw)
+		if value == "" {
+			continue
+		}
+		parsed, err := url.Parse(value)
+		if err != nil {
+			return nil, fmt.Errorf("redirect origin %q is invalid: %w", value, err)
+		}
+		if parsed.Scheme == "" || parsed.Host == "" {
+			return nil, fmt.Errorf("redirect origin %q must include scheme and host", value)
+		}
+		if parsed.Scheme != "http" && parsed.Scheme != "https" {
+			return nil, fmt.Errorf("redirect origin %q must use http or https", value)
+		}
+		parsed.Path = ""
+		parsed.RawQuery = ""
+		parsed.Fragment = ""
+		origin := strings.TrimRight(parsed.String(), "/")
+		if seen[origin] {
+			continue
+		}
+		seen[origin] = true
+		out = append(out, origin)
+	}
+	return out, nil
+}
+
 func getEnvOrDefault(key, fallback string) string {
 	value := strings.TrimSpace(os.Getenv(key))
 	if value == "" {
@@ -416,6 +725,14 @@ func getDurationEnv(key string, fallback time.Duration) time.Duration {
 	}
 
 	return parsed
+}
+
+func getBoolEnv(key string, fallback bool) bool {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+	if raw == "" {
+		return fallback
+	}
+	return raw == "1" || raw == "true" || raw == "yes" || raw == "on"
 }
 
 func parseCSVEnv(key string) []string {

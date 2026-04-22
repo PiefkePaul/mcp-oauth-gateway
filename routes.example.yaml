@@ -6,6 +6,9 @@ routes:
     upstream_mcp_path: /mcp
     scopes_supported:
       - mcp
+    access:
+      visibility: public
+      mode: public
     forward_headers:
       Authorization: "Bearer REPLACE_WITH_INTERNAL_N8N_AUTH_TOKEN"
 
@@ -16,6 +19,18 @@ routes:
     upstream_mcp_path: /mcp
     scopes_supported:
       - mcp
+    access:
+      visibility: private
+      mode: admin
+    deployment:
+      type: docker
+      managed: true
+      image: your-dockerhub-user/portainer-mcp-http:latest
+      container_name: portainer-mcp
+      internal_port: 8080
+      networks:
+        - mcp-internal
+      restart_policy: unless-stopped
 
   - id: camoufox
     display_name: Camoufox MCP
@@ -24,5 +39,27 @@ routes:
     upstream_mcp_path: /mcp
     scopes_supported:
       - mcp
+    access:
+      visibility: public
+      mode: restricted
+      allowed_groups:
+        - Browser Team
     forward_headers:
       Authorization: "Bearer REPLACE_WITH_INTERNAL_CAMOUFOX_AUTH_TOKEN"
+
+  - id: local-stdio
+    display_name: Local STDIO MCP
+    transport: stdio
+    path_prefix: /local-stdio
+    scopes_supported:
+      - mcp
+    access:
+      visibility: private
+      mode: admin
+    stdio:
+      command: /tools/example-mcp
+      args:
+        - --stdio
+      env:
+        EXAMPLE_SECRET: REPLACE_WITH_SECRET
+      working_dir: /tools

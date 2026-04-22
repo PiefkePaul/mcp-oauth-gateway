@@ -17,11 +17,12 @@ import (
 )
 
 type Server struct {
-	cfg         *config.Config
-	authManager *auth.Manager
-	mu          sync.RWMutex
-	routes      []config.Route
-	runtime     map[string]routeRuntime
+	cfg           *config.Config
+	authManager   *auth.Manager
+	dockerManager *dockerManager
+	mu            sync.RWMutex
+	routes        []config.Route
+	runtime       map[string]routeRuntime
 }
 
 func New(cfg *config.Config, authManager *auth.Manager) (*Server, error) {
@@ -37,28 +38,37 @@ func New(cfg *config.Config, authManager *auth.Manager) (*Server, error) {
 		authManager: authManager,
 		runtime:     make(map[string]routeRuntime, len(cfg.Routes)),
 	}
+	if cfg.DockerManagement.Enabled {
+		dockerManager, err := newDockerManager(cfg.DockerManagement)
+		if err != nil {
+			return nil, err
+		}
+		server.dockerManager = dockerManager
+	}
 	if err := server.replaceRoutes(cfg.Routes); err != nil {
 		return nil, err
 	}
+	authManager.SetResourceAccessChecker(server.authorizeResourceAccess)
 
 	return server, nil
 }
 
 func Run(cfg *config.Config) error {
 	authManager, err := auth.NewManager(auth.Config{
-		StorePath:            cfg.Auth.StorePath,
-		MasterKey:            cfg.Auth.MasterKey,
-		AccessTokenTTL:       cfg.Auth.AccessTokenTTL,
-		RefreshTokenTTL:      cfg.Auth.RefreshTokenTTL,
-		AuthorizationCodeTTL: cfg.Auth.AuthorizationCodeTTL,
-		SessionTTL:           cfg.Auth.SessionTTL,
-		PublicBaseURL:        cfg.PublicBaseURL,
-		PortalTitle:          cfg.AccountPortalTitle,
-		AllowSelfSignup:      cfg.AllowSelfSignup,
-		BootstrapEmail:       cfg.BootstrapEmail,
-		BootstrapPassword:    cfg.BootstrapPassword,
-		AllowedEmails:        cfg.AllowedEmails,
-		AllowedEmailDomains:  cfg.AllowedEmailDomains,
+		StorePath:              cfg.Auth.StorePath,
+		MasterKey:              cfg.Auth.MasterKey,
+		AccessTokenTTL:         cfg.Auth.AccessTokenTTL,
+		RefreshTokenTTL:        cfg.Auth.RefreshTokenTTL,
+		AuthorizationCodeTTL:   cfg.Auth.AuthorizationCodeTTL,
+		SessionTTL:             cfg.Auth.SessionTTL,
+		PublicBaseURL:          cfg.PublicBaseURL,
+		PortalTitle:            cfg.AccountPortalTitle,
+		AllowSelfSignup:        cfg.AllowSelfSignup,
+		BootstrapEmail:         cfg.BootstrapEmail,
+		BootstrapPassword:      cfg.BootstrapPassword,
+		AllowedEmails:          cfg.AllowedEmails,
+		AllowedEmailDomains:    cfg.AllowedEmailDomains,
+		AllowedRedirectOrigins: cfg.Auth.AllowedRedirectOrigins,
 	})
 	if err != nil {
 		return err
@@ -68,10 +78,14 @@ func Run(cfg *config.Config) error {
 	if err != nil {
 		return err
 	}
+	var httpHandler http.Handler = handler
+	if cfg.AccessLog {
+		httpHandler = accessLogMiddleware(httpHandler)
+	}
 
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           handler,
+		Handler:           httpHandler,
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}
@@ -94,8 +108,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "/healthz":
 		s.handleHealthz(w, r)
 		return
+	case "/docs":
+		s.handleDocsIndex(w, r)
+		return
 	case "/.well-known/oauth-authorization-server":
 		s.authManager.HandleAuthorizationServerMetadata(w, r)
+		return
+	case "/.well-known/oauth-protected-resource":
+		s.handleGatewayProtectedResourceMetadata(w, r)
 		return
 	case "/.well-known/openid-configuration":
 		s.authManager.HandleOpenIDConfiguration(w, r)
@@ -111,6 +131,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	case "/account":
 		s.authManager.HandleAccount(w, r)
+		return
+	case "/account/password":
+		s.authManager.HandleAccountPassword(w, r)
+		return
+	case "/account/devices/delete":
+		s.authManager.HandleAccountDeviceDelete(w, r)
 		return
 	case "/account/login":
 		s.authManager.HandleAccountLogin(w, r)
@@ -130,6 +156,24 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "/admin/routes/delete":
 		s.handleAdminRouteDelete(w, r)
 		return
+	case "/admin/routes/export":
+		s.handleAdminRoutesExport(w, r)
+		return
+	case "/admin/routes/import":
+		s.handleAdminRoutesImport(w, r)
+		return
+	case "/admin/deployments/create":
+		s.handleAdminDeploymentCreate(w, r)
+		return
+	case "/admin/deployments/start":
+		s.handleAdminDeploymentStart(w, r)
+		return
+	case "/admin/deployments/stop":
+		s.handleAdminDeploymentStop(w, r)
+		return
+	case "/admin/deployments/remove":
+		s.handleAdminDeploymentRemove(w, r)
+		return
 	case "/admin/users/create":
 		s.handleAdminUserCreate(w, r)
 		return
@@ -142,6 +186,33 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "/admin/users/admin":
 		s.handleAdminUserAdmin(w, r)
 		return
+	case "/admin/users/groups":
+		s.handleAdminUserGroups(w, r)
+		return
+	case "/admin/users/devices/delete":
+		s.handleAdminUserDeviceDelete(w, r)
+		return
+	case "/admin/groups/create":
+		s.handleAdminGroupCreate(w, r)
+		return
+	case "/admin/groups/delete":
+		s.handleAdminGroupDelete(w, r)
+		return
+	}
+
+	if strings.HasPrefix(r.URL.Path, "/.well-known/oauth-authorization-server/") {
+		s.authManager.HandleAuthorizationServerMetadata(w, r)
+		return
+	}
+
+	if strings.HasPrefix(r.URL.Path, "/.well-known/openid-configuration/") {
+		s.authManager.HandleOpenIDConfiguration(w, r)
+		return
+	}
+
+	if strings.HasPrefix(r.URL.Path, "/register/") {
+		s.authManager.HandleClientConfiguration(w, r)
+		return
 	}
 
 	if route, ok := s.routeByProtectedMetadataPath(r.URL.Path); ok {
@@ -149,8 +220,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if route, proxy, ok := s.routeByProxyPath(r.URL.Path); ok {
-		s.handleProxy(w, r, route, proxy)
+	if route, handler, ok := s.routeByProxyPath(r.URL.Path); ok {
+		s.handleProxy(w, r, route, handler)
+		return
+	}
+
+	if route, ok := s.routeByDocsPath(r.URL.Path); ok {
+		s.handleRouteDocs(w, r, route)
 		return
 	}
 
@@ -168,11 +244,18 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unsupported method", http.StatusMethodNotAllowed)
 		return
 	}
+	if !wantsJSON(r) {
+		s.renderPublicDashboard(w, r)
+		return
+	}
 
 	routesSnapshot := s.routesSnapshot()
 	routes := make([]map[string]any, 0, len(routesSnapshot))
 	for i := range routesSnapshot {
 		route := routesSnapshot[i]
+		if !routeVisibleInPublicCatalog(route) {
+			continue
+		}
 		payload := map[string]any{
 			"id":                              route.ID,
 			"display_name":                    route.DisplayName,
@@ -212,9 +295,11 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status": "ok",
-		"routes": len(s.cfg.Routes),
-		"time":   time.Now().UTC().Format(time.RFC3339),
+		"status":              "ok",
+		"routes":              len(s.cfg.Routes),
+		"docker_management":   s.cfg.DockerManagement.Enabled,
+		"managed_deployments": len(s.managedDeploymentRoutes()),
+		"time":                time.Now().UTC().Format(time.RFC3339),
 	})
 }
 
@@ -223,6 +308,17 @@ func (s *Server) handleRouteInfo(w http.ResponseWriter, r *http.Request, route c
 		w.Header().Set("Allow", "GET, HEAD")
 		http.Error(w, "unsupported method", http.StatusMethodNotAllowed)
 		return
+	}
+	if route.Access.IsPrivate() {
+		identity, err := s.authManager.CurrentIdentity(r)
+		if err != nil {
+			http.Redirect(w, r, "/account/login?next="+url.QueryEscape(r.URL.RequestURI()), http.StatusFound)
+			return
+		}
+		if !routeAccessAllowed(route, identity) {
+			http.Error(w, "route info access forbidden", http.StatusForbidden)
+			return
+		}
 	}
 
 	payload := map[string]any{
@@ -255,7 +351,19 @@ func (s *Server) handleProtectedResourceMetadata(w http.ResponseWriter, r *http.
 	)
 }
 
-func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, route config.Route, proxy *httputil.ReverseProxy) {
+func (s *Server) handleGatewayProtectedResourceMetadata(w http.ResponseWriter, r *http.Request) {
+	baseURL := s.baseURL(r)
+	s.authManager.WriteProtectedResourceMetadata(
+		w,
+		r,
+		baseURL,
+		s.allSupportedScopes(),
+		[]string{baseURL},
+		"",
+	)
+}
+
+func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, route config.Route, handler http.Handler) {
 	token, err := bearerToken(r.Header.Get("Authorization"))
 	if err != nil {
 		s.writeChallenge(w, r, route)
@@ -268,14 +376,21 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, route confi
 		s.writeChallenge(w, r, route)
 		return
 	}
+	if !routeAccessAllowed(route, identity) {
+		writeJSON(w, http.StatusForbidden, map[string]any{
+			"error":             "forbidden",
+			"error_description": "your account is not allowed to use this MCP server",
+		})
+		return
+	}
 
-	if proxy == nil {
-		http.Error(w, "route proxy is unavailable", http.StatusInternalServerError)
+	if handler == nil {
+		http.Error(w, "route handler is unavailable", http.StatusInternalServerError)
 		return
 	}
 
 	ctx := auth.WithIdentity(r.Context(), identity)
-	proxy.ServeHTTP(w, r.WithContext(ctx))
+	handler.ServeHTTP(w, r.WithContext(ctx))
 }
 
 func (s *Server) writeChallenge(w http.ResponseWriter, r *http.Request, route config.Route) {
@@ -302,7 +417,26 @@ func (s *Server) baseURL(r *http.Request) string {
 	return strings.TrimRight(auth.BaseURLFromRequest(r), "/")
 }
 
-func newReverseProxy(route config.Route) (*httputil.ReverseProxy, error) {
+func (s *Server) allSupportedScopes() []string {
+	seen := map[string]bool{}
+	scopes := []string{}
+	for _, route := range s.routesSnapshot() {
+		for _, scope := range route.ScopeList() {
+			scope = strings.TrimSpace(scope)
+			if scope == "" || seen[scope] {
+				continue
+			}
+			seen[scope] = true
+			scopes = append(scopes, scope)
+		}
+	}
+	if len(scopes) == 0 {
+		return []string{"mcp"}
+	}
+	return scopes
+}
+
+func newReverseProxy(route config.Route) (http.Handler, error) {
 	target, err := url.Parse(route.Upstream)
 	if err != nil {
 		return nil, fmt.Errorf("parse route %q upstream: %w", route.ID, err)
@@ -429,6 +563,55 @@ func matchesExactOrChildPath(requestPath, prefix string) bool {
 
 func allowsReadMethod(method string) bool {
 	return method == http.MethodGet || method == http.MethodHead
+}
+
+type accessLogResponseWriter struct {
+	http.ResponseWriter
+	status int
+	bytes  int
+}
+
+func (w *accessLogResponseWriter) WriteHeader(status int) {
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *accessLogResponseWriter) Write(payload []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	n, err := w.ResponseWriter.Write(payload)
+	w.bytes += n
+	return n, err
+}
+
+func accessLogMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rec := &accessLogResponseWriter{ResponseWriter: w}
+		next.ServeHTTP(rec, r)
+		if rec.status == 0 {
+			rec.status = http.StatusOK
+		}
+		log.Printf(
+			"access method=%s path=%q status=%d bytes=%d duration_ms=%d remote=%s user_agent=%q",
+			r.Method,
+			r.URL.RequestURI(),
+			rec.status,
+			rec.bytes,
+			time.Since(start).Milliseconds(),
+			r.RemoteAddr,
+			r.UserAgent(),
+		)
+	})
+}
+
+func wantsJSON(r *http.Request) bool {
+	if strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("format")), "json") {
+		return true
+	}
+	accept := strings.ToLower(r.Header.Get("Accept"))
+	return strings.Contains(accept, "application/json") && !strings.Contains(accept, "text/html")
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {

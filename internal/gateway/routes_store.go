@@ -2,14 +2,15 @@ package gateway
 
 import (
 	"fmt"
-	"net/http/httputil"
+	"net/http"
 
 	"github.com/PiefkePaul/mcp-oauth-gateway/internal/config"
 )
 
 type routeRuntime struct {
-	Route config.Route
-	Proxy *httputil.ReverseProxy
+	Route   config.Route
+	Handler http.Handler
+	Close   func() error
 }
 
 func (s *Server) replaceRoutes(routes []config.Route) error {
@@ -19,10 +20,12 @@ func (s *Server) replaceRoutes(routes []config.Route) error {
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	oldRuntimes := s.runtime
 	s.routes = cloneRoutes(routes)
 	s.runtime = runtimes
 	s.cfg.Routes = cloneRoutes(routes)
+	s.mu.Unlock()
+	closeRouteRuntimes(oldRuntimes)
 	return nil
 }
 
@@ -44,7 +47,7 @@ func (s *Server) routeByID(routeID string) (config.Route, bool) {
 	return config.Route{}, false
 }
 
-func (s *Server) routeByProxyPath(requestPath string) (config.Route, *httputil.ReverseProxy, bool) {
+func (s *Server) routeByProxyPath(requestPath string) (config.Route, http.Handler, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -54,7 +57,7 @@ func (s *Server) routeByProxyPath(requestPath string) (config.Route, *httputil.R
 			if !ok {
 				return config.Route{}, nil, false
 			}
-			return runtime.Route, runtime.Proxy, true
+			return runtime.Route, runtime.Handler, true
 		}
 	}
 	return config.Route{}, nil, false
@@ -66,6 +69,18 @@ func (s *Server) routeByInfoPath(requestPath string) (config.Route, bool) {
 
 	for _, route := range s.routes {
 		if requestPath == route.PublicInfoPath() {
+			return route, true
+		}
+	}
+	return config.Route{}, false
+}
+
+func (s *Server) routeByDocsPath(requestPath string) (config.Route, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	for _, route := range s.routes {
+		if requestPath == route.PublicDocsPath() {
 			return route, true
 		}
 	}
@@ -108,6 +123,33 @@ func (s *Server) upsertRoute(originalID string, route config.Route) error {
 	return s.persistRoutesLocked(nextRoutes)
 }
 
+func (s *Server) validateUpsertRoute(originalID string, route config.Route) error {
+	if err := config.NormalizeRoute(&route); err != nil {
+		return err
+	}
+
+	s.mu.RLock()
+	nextRoutes := cloneRoutes(s.routes)
+	s.mu.RUnlock()
+
+	replaced := false
+	for i := range nextRoutes {
+		if nextRoutes[i].ID == originalID && originalID != "" {
+			nextRoutes[i] = route
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		nextRoutes = append(nextRoutes, route)
+	}
+	if err := config.ValidateRoutes(nextRoutes); err != nil {
+		return err
+	}
+	_, err := buildRouteRuntime(nextRoutes)
+	return err
+}
+
 func (s *Server) deleteRoute(routeID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -128,6 +170,12 @@ func (s *Server) deleteRoute(routeID string) error {
 	return s.persistRoutesLocked(nextRoutes)
 }
 
+func (s *Server) replacePersistedRoutes(routes []config.Route) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.persistRoutesLocked(routes)
+}
+
 func (s *Server) persistRoutesLocked(routes []config.Route) error {
 	cloned := cloneRoutes(routes)
 	if err := config.ValidateRoutes(cloned); err != nil {
@@ -143,25 +191,50 @@ func (s *Server) persistRoutesLocked(routes []config.Route) error {
 		return err
 	}
 
+	oldRuntimes := s.runtime
 	s.routes = cloned
 	s.runtime = runtimes
 	s.cfg.Routes = cloneRoutes(cloned)
+	closeRouteRuntimes(oldRuntimes)
 	return nil
 }
 
 func buildRouteRuntime(routes []config.Route) (map[string]routeRuntime, error) {
 	runtimes := make(map[string]routeRuntime, len(routes))
 	for _, route := range cloneRoutes(routes) {
-		proxy, err := newReverseProxy(route)
+		var (
+			handler http.Handler
+			closeFn func() error
+			err     error
+		)
+		switch route.Transport {
+		case "stdio":
+			stdioHandler, stdioClose, stdioErr := newStdioBridge(route)
+			handler = stdioHandler
+			closeFn = stdioClose
+			err = stdioErr
+		default:
+			handler, err = newReverseProxy(route)
+		}
 		if err != nil {
+			closeRouteRuntimes(runtimes)
 			return nil, err
 		}
 		runtimes[route.ID] = routeRuntime{
-			Route: route,
-			Proxy: proxy,
+			Route:   route,
+			Handler: handler,
+			Close:   closeFn,
 		}
 	}
 	return runtimes, nil
+}
+
+func closeRouteRuntimes(runtimes map[string]routeRuntime) {
+	for _, runtime := range runtimes {
+		if runtime.Close != nil {
+			_ = runtime.Close()
+		}
+	}
 }
 
 func cloneRoutes(routes []config.Route) []config.Route {
@@ -185,6 +258,38 @@ func cloneRoutes(routes []config.Route) []config.Route {
 			cloned[i].UpstreamEnvironment = make(map[string]string, len(routes[i].UpstreamEnvironment))
 			for key, value := range routes[i].UpstreamEnvironment {
 				cloned[i].UpstreamEnvironment[key] = value
+			}
+		}
+		cloned[i].Access = config.RouteAccess{
+			Visibility:    routes[i].Access.Visibility,
+			Mode:          routes[i].Access.Mode,
+			AllowedUsers:  append([]string(nil), routes[i].Access.AllowedUsers...),
+			AllowedGroups: append([]string(nil), routes[i].Access.AllowedGroups...),
+			DeniedUsers:   append([]string(nil), routes[i].Access.DeniedUsers...),
+			DeniedGroups:  append([]string(nil), routes[i].Access.DeniedGroups...),
+		}
+		if routes[i].Deployment != nil {
+			cloned[i].Deployment = &config.RouteDeployment{
+				Type:          routes[i].Deployment.Type,
+				Managed:       routes[i].Deployment.Managed,
+				Image:         routes[i].Deployment.Image,
+				ContainerName: routes[i].Deployment.ContainerName,
+				InternalPort:  routes[i].Deployment.InternalPort,
+				Networks:      append([]string(nil), routes[i].Deployment.Networks...),
+				RestartPolicy: routes[i].Deployment.RestartPolicy,
+			}
+		}
+		if routes[i].Stdio != nil {
+			cloned[i].Stdio = &config.RouteStdio{
+				Command:    routes[i].Stdio.Command,
+				Args:       append([]string(nil), routes[i].Stdio.Args...),
+				WorkingDir: routes[i].Stdio.WorkingDir,
+			}
+			if routes[i].Stdio.Env != nil {
+				cloned[i].Stdio.Env = make(map[string]string, len(routes[i].Stdio.Env))
+				for key, value := range routes[i].Stdio.Env {
+					cloned[i].Stdio.Env[key] = value
+				}
 			}
 		}
 	}

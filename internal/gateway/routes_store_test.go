@@ -70,6 +70,33 @@ routes:
 	}
 }
 
+func TestNextRouteIDUsesSlugAndDeduplicates(t *testing.T) {
+	routesPath := filepath.Join(t.TempDir(), "routes.yaml")
+	if err := os.WriteFile(routesPath, []byte(`
+routes:
+  - id: german-legal
+    display_name: German Legal
+    path_prefix: /german-legal
+    upstream: http://legal-mcp:8000
+    upstream_mcp_path: /mcp
+`), 0o644); err != nil {
+		t.Fatalf("write routes file: %v", err)
+	}
+
+	routes, err := config.LoadRoutesFile(routesPath)
+	if err != nil {
+		t.Fatalf("load routes: %v", err)
+	}
+	server := newMutableTestServerWithRoutes(t, routesPath, routes)
+
+	if got, want := server.nextRouteID("German Legal", "", ""), "german-legal-2"; got != want {
+		t.Fatalf("expected %q, got %q", want, got)
+	}
+	if got, want := server.nextRouteID("", "/Camoufox MCP", ""), "camoufox-mcp"; got != want {
+		t.Fatalf("expected %q, got %q", want, got)
+	}
+}
+
 func newMutableTestServer(t *testing.T, routesPath string) *Server {
 	t.Helper()
 	return newMutableTestServerWithRoutes(t, routesPath, []config.Route{})

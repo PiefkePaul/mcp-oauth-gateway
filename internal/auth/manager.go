@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"html/template"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -39,33 +40,39 @@ var (
 )
 
 type Config struct {
-	StorePath            string
-	MasterKey            []byte
-	AccessTokenTTL       time.Duration
-	RefreshTokenTTL      time.Duration
-	AuthorizationCodeTTL time.Duration
-	SessionTTL           time.Duration
-	PublicBaseURL        string
-	PortalTitle          string
-	AllowSelfSignup      bool
-	BootstrapEmail       string
-	BootstrapPassword    string
-	AllowedEmails        []string
-	AllowedEmailDomains  []string
+	StorePath              string
+	MasterKey              []byte
+	AccessTokenTTL         time.Duration
+	RefreshTokenTTL        time.Duration
+	AuthorizationCodeTTL   time.Duration
+	SessionTTL             time.Duration
+	PublicBaseURL          string
+	PortalTitle            string
+	AllowSelfSignup        bool
+	BootstrapEmail         string
+	BootstrapPassword      string
+	AllowedEmails          []string
+	AllowedEmailDomains    []string
+	AllowedRedirectOrigins []string
 }
 
 type Manager struct {
 	cfg Config
 
-	mu   sync.Mutex
-	data *storeData
+	mu                    sync.Mutex
+	data                  *storeData
+	resourceAccessChecker ResourceAccessChecker
 }
 
 type Identity struct {
-	UserID  string
-	Email   string
-	IsAdmin bool
+	UserID     string
+	Email      string
+	IsAdmin    bool
+	GroupIDs   []string
+	GroupNames []string
 }
+
+type ResourceAccessChecker func(identity *Identity, resource string) error
 
 type contextKey string
 
@@ -73,6 +80,7 @@ const identityContextKey contextKey = "mcp_gateway_identity"
 
 type storeData struct {
 	Users         map[string]*userRecord         `json:"users"`
+	Groups        map[string]*groupRecord        `json:"groups"`
 	EmailIndex    map[string]string              `json:"email_index"`
 	Sessions      map[string]*sessionRecord      `json:"sessions"`
 	Clients       map[string]*clientRecord       `json:"clients"`
@@ -88,12 +96,20 @@ type encryptedStoreFile struct {
 }
 
 type userRecord struct {
-	ID           string `json:"id"`
-	Email        string `json:"email"`
-	PasswordHash string `json:"password_hash"`
-	IsAdmin      bool   `json:"is_admin"`
-	CreatedAt    int64  `json:"created_at"`
-	UpdatedAt    int64  `json:"updated_at"`
+	ID           string   `json:"id"`
+	Email        string   `json:"email"`
+	PasswordHash string   `json:"password_hash"`
+	IsAdmin      bool     `json:"is_admin"`
+	GroupIDs     []string `json:"group_ids,omitempty"`
+	CreatedAt    int64    `json:"created_at"`
+	UpdatedAt    int64    `json:"updated_at"`
+}
+
+type groupRecord struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	CreatedAt int64  `json:"created_at"`
+	UpdatedAt int64  `json:"updated_at"`
 }
 
 type sessionRecord struct {
@@ -104,12 +120,43 @@ type sessionRecord struct {
 
 type clientRecord struct {
 	ID                      string   `json:"id"`
+	Secret                  string   `json:"secret,omitempty"`
+	RegistrationAccessToken string   `json:"registration_access_token,omitempty"`
 	Name                    string   `json:"name"`
 	RedirectURIs            []string `json:"redirect_uris"`
 	GrantTypes              []string `json:"grant_types"`
 	ResponseTypes           []string `json:"response_types"`
 	TokenEndpointAuthMethod string   `json:"token_endpoint_auth_method"`
+	Scope                   string   `json:"scope,omitempty"`
+	ClientURI               string   `json:"client_uri,omitempty"`
+	LogoURI                 string   `json:"logo_uri,omitempty"`
+	TOSURI                  string   `json:"tos_uri,omitempty"`
+	PolicyURI               string   `json:"policy_uri,omitempty"`
+	JwksURI                 string   `json:"jwks_uri,omitempty"`
+	Contacts                []string `json:"contacts,omitempty"`
+	SoftwareID              string   `json:"software_id,omitempty"`
+	SoftwareVersion         string   `json:"software_version,omitempty"`
 	CreatedAt               int64    `json:"created_at"`
+	UpdatedAt               int64    `json:"updated_at,omitempty"`
+}
+
+type clientMetadataRequest struct {
+	ClientID                string   `json:"client_id"`
+	ClientSecret            string   `json:"client_secret"`
+	ClientName              string   `json:"client_name"`
+	RedirectURIs            []string `json:"redirect_uris"`
+	GrantTypes              []string `json:"grant_types"`
+	ResponseTypes           []string `json:"response_types"`
+	TokenEndpointAuthMethod string   `json:"token_endpoint_auth_method"`
+	Scope                   string   `json:"scope"`
+	ClientURI               string   `json:"client_uri"`
+	LogoURI                 string   `json:"logo_uri"`
+	TOSURI                  string   `json:"tos_uri"`
+	PolicyURI               string   `json:"policy_uri"`
+	JwksURI                 string   `json:"jwks_uri"`
+	Contacts                []string `json:"contacts"`
+	SoftwareID              string   `json:"software_id"`
+	SoftwareVersion         string   `json:"software_version"`
 }
 
 type authCodeRecord struct {
@@ -168,6 +215,7 @@ func NewManager(cfg Config) (*Manager, error) {
 		cfg: cfg,
 		data: &storeData{
 			Users:         make(map[string]*userRecord),
+			Groups:        make(map[string]*groupRecord),
 			EmailIndex:    make(map[string]string),
 			Sessions:      make(map[string]*sessionRecord),
 			Clients:       make(map[string]*clientRecord),
@@ -194,6 +242,12 @@ func (m *Manager) ChallengeHeader(resourceMetadataURL string, scope string) stri
 	return fmt.Sprintf(`Bearer realm="mcp-oauth-gateway", resource_metadata="%s", scope="%s"`, resourceMetadataURL, scope)
 }
 
+func (m *Manager) SetResourceAccessChecker(checker ResourceAccessChecker) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.resourceAccessChecker = checker
+}
+
 func (m *Manager) HandleAuthorizationServerMetadata(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", http.MethodGet)
@@ -210,7 +264,7 @@ func (m *Manager) HandleAuthorizationServerMetadata(w http.ResponseWriter, r *ht
 		"registration_endpoint_auth_methods_supported": []string{"none"},
 		"response_types_supported":                     []string{"code"},
 		"grant_types_supported":                        []string{"authorization_code", "refresh_token"},
-		"token_endpoint_auth_methods_supported":        []string{"none"},
+		"token_endpoint_auth_methods_supported":        []string{"none", "client_secret_post", "client_secret_basic"},
 		"code_challenge_methods_supported":             []string{"S256"},
 		"scopes_supported":                             []string{"mcp"},
 		"subject_types_supported":                      []string{"public"},
@@ -251,26 +305,74 @@ func (m *Manager) HandleClientRegistration(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "unsupported method", http.StatusMethodNotAllowed)
 		return
 	}
+	setNoStoreHeaders(w)
 
-	var payload struct {
-		ClientName              string   `json:"client_name"`
-		RedirectURIs            []string `json:"redirect_uris"`
-		GrantTypes              []string `json:"grant_types"`
-		ResponseTypes           []string `json:"response_types"`
-		TokenEndpointAuthMethod string   `json:"token_endpoint_auth_method"`
-	}
+	var payload clientMetadataRequest
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_client_metadata", "invalid JSON payload")
 		return
 	}
 
-	client, err := m.registerClient(payload.ClientName, payload.RedirectURIs, payload.GrantTypes, payload.ResponseTypes, payload.TokenEndpointAuthMethod)
+	client, err := m.registerClientFromMetadata(payload)
 	if err != nil {
+		log.Printf("oauth client registration failed name=%q auth_method=%q err=%v", payload.ClientName, payload.TokenEndpointAuthMethod, err)
 		writeOAuthError(w, http.StatusBadRequest, "invalid_client_metadata", err.Error())
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, map[string]any{
+	log.Printf("oauth client registered client_id=%s name=%q auth_method=%s redirect_uris=%d", client.ID, client.Name, client.TokenEndpointAuthMethod, len(client.RedirectURIs))
+	writeJSON(w, http.StatusCreated, m.clientInformationResponse(r, client))
+}
+
+func (m *Manager) HandleClientConfiguration(w http.ResponseWriter, r *http.Request) {
+	clientID := strings.Trim(strings.TrimPrefix(r.URL.Path, "/register/"), "/")
+	if clientID == "" || strings.Contains(clientID, "/") {
+		http.NotFound(w, r)
+		return
+	}
+
+	setNoStoreHeaders(w)
+	switch r.Method {
+	case http.MethodGet:
+		client, err := m.clientForRegistrationAccess(clientID, r.Header.Get("Authorization"))
+		if err != nil {
+			writeRegistrationAccessError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, m.clientInformationResponse(r, client))
+	case http.MethodPut:
+		var payload clientMetadataRequest
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			writeOAuthError(w, http.StatusBadRequest, "invalid_client_metadata", "invalid JSON payload")
+			return
+		}
+		client, err := m.updateClientRegistration(clientID, r.Header.Get("Authorization"), payload)
+		if err != nil {
+			switch {
+			case errors.Is(err, ErrInvalidClient), errors.Is(err, ErrInvalidToken):
+				writeRegistrationAccessError(w, err)
+			default:
+				writeOAuthError(w, http.StatusBadRequest, "invalid_client_metadata", err.Error())
+			}
+			return
+		}
+		writeJSON(w, http.StatusOK, m.clientInformationResponse(r, client))
+	case http.MethodDelete:
+		if err := m.deleteClientRegistration(clientID, r.Header.Get("Authorization")); err != nil {
+			writeRegistrationAccessError(w, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		w.Header().Set("Allow", "GET, PUT, DELETE")
+		http.Error(w, "unsupported method", http.StatusMethodNotAllowed)
+	}
+}
+
+func (m *Manager) clientInformationResponse(r *http.Request, client *clientRecord) map[string]any {
+	response := map[string]any{
+		"registration_access_token":  client.RegistrationAccessToken,
+		"registration_client_uri":    m.baseURL(r) + "/register/" + url.PathEscape(client.ID),
 		"client_id":                  client.ID,
 		"client_name":                client.Name,
 		"redirect_uris":              client.RedirectURIs,
@@ -278,7 +380,39 @@ func (m *Manager) HandleClientRegistration(w http.ResponseWriter, r *http.Reques
 		"response_types":             client.ResponseTypes,
 		"token_endpoint_auth_method": client.TokenEndpointAuthMethod,
 		"client_id_issued_at":        client.CreatedAt,
-	})
+	}
+	if client.TokenEndpointAuthMethod != "none" {
+		response["client_secret"] = client.Secret
+		response["client_secret_expires_at"] = 0
+	}
+	if strings.TrimSpace(client.Scope) != "" {
+		response["scope"] = client.Scope
+	}
+	if strings.TrimSpace(client.ClientURI) != "" {
+		response["client_uri"] = client.ClientURI
+	}
+	if strings.TrimSpace(client.LogoURI) != "" {
+		response["logo_uri"] = client.LogoURI
+	}
+	if strings.TrimSpace(client.TOSURI) != "" {
+		response["tos_uri"] = client.TOSURI
+	}
+	if strings.TrimSpace(client.PolicyURI) != "" {
+		response["policy_uri"] = client.PolicyURI
+	}
+	if strings.TrimSpace(client.JwksURI) != "" {
+		response["jwks_uri"] = client.JwksURI
+	}
+	if len(client.Contacts) > 0 {
+		response["contacts"] = client.Contacts
+	}
+	if strings.TrimSpace(client.SoftwareID) != "" {
+		response["software_id"] = client.SoftwareID
+	}
+	if strings.TrimSpace(client.SoftwareVersion) != "" {
+		response["software_version"] = client.SoftwareVersion
+	}
+	return response
 }
 
 func (m *Manager) HandleAuthorize(w http.ResponseWriter, r *http.Request) {
@@ -455,11 +589,79 @@ func (m *Manager) HandleAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	m.renderAccount(w, r, identity, strings.TrimSpace(r.URL.Query().Get("notice")), strings.TrimSpace(r.URL.Query().Get("error")))
+}
+
+func (m *Manager) HandleAccountPassword(w http.ResponseWriter, r *http.Request) {
+	identity, err := m.identityFromSession(r)
+	if err != nil {
+		http.Redirect(w, r, "/account/login?next="+url.QueryEscape("/account"), http.StatusFound)
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "unsupported method", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "invalid form", http.StatusBadRequest)
+		return
+	}
+	if !validateCSRFCookie(r) {
+		http.Error(w, "invalid CSRF token", http.StatusBadRequest)
+		return
+	}
+
+	newPassword := r.FormValue("new_password")
+	if newPassword != r.FormValue("confirm_password") {
+		m.renderAccount(w, r, identity, "", "New password confirmation does not match")
+		return
+	}
+	if err := m.changeUserPassword(identity.UserID, r.FormValue("current_password"), newPassword); err != nil {
+		m.renderAccount(w, r, identity, "", err.Error())
+		return
+	}
+
+	http.Redirect(w, r, "/account?notice="+url.QueryEscape("Password updated"), http.StatusFound)
+}
+
+func (m *Manager) HandleAccountDeviceDelete(w http.ResponseWriter, r *http.Request) {
+	identity, err := m.identityFromSession(r)
+	if err != nil {
+		http.Redirect(w, r, "/account/login?next="+url.QueryEscape("/account"), http.StatusFound)
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "unsupported method", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "invalid form", http.StatusBadRequest)
+		return
+	}
+	if !validateCSRFCookie(r) {
+		http.Error(w, "invalid CSRF token", http.StatusBadRequest)
+		return
+	}
+
+	if err := m.RevokeUserDevice(identity.UserID, r.FormValue("device_id")); err != nil {
+		http.Redirect(w, r, "/account?error="+url.QueryEscape(err.Error()), http.StatusFound)
+		return
+	}
+	http.Redirect(w, r, "/account?notice="+url.QueryEscape("Device access revoked"), http.StatusFound)
+}
+
+func (m *Manager) renderAccount(w http.ResponseWriter, r *http.Request, identity *Identity, notice, errText string) {
 	renderHTML(w, accountTemplate, map[string]any{
-		"CSRFToken": ensureCSRFCookie(w, r),
-		"Email":     identity.Email,
-		"IsAdmin":   identity.IsAdmin,
-		"Title":     m.cfg.PortalTitle,
+		"CSRFToken":  ensureCSRFCookie(w, r),
+		"Email":      identity.Email,
+		"IsAdmin":    identity.IsAdmin,
+		"GroupNames": identity.GroupNames,
+		"Devices":    m.ListUserDevices(identity.UserID),
+		"Notice":     notice,
+		"Error":      errText,
+		"Title":      m.cfg.PortalTitle,
 	})
 }
 
@@ -478,7 +680,7 @@ func (m *Manager) ValidateAccessToken(token, resource string) (*Identity, error)
 		_ = m.saveLocked()
 		return nil, ErrTokenExpired
 	}
-	if normalizeResource(record.Resource) != normalizeResource(resource) {
+	if record.Resource != "" && normalizeResource(record.Resource) != normalizeResource(resource) && !m.isGatewayWideResource(record.Resource) {
 		return nil, ErrInvalidToken
 	}
 
@@ -487,11 +689,7 @@ func (m *Manager) ValidateAccessToken(token, resource string) (*Identity, error)
 		return nil, ErrInvalidToken
 	}
 
-	return &Identity{
-		UserID:  user.ID,
-		Email:   user.Email,
-		IsAdmin: user.IsAdmin,
-	}, nil
+	return m.identityForUserLocked(user), nil
 }
 
 func WithIdentity(ctx context.Context, identity *Identity) context.Context {
@@ -533,6 +731,11 @@ func (m *Manager) baseURL(r *http.Request) string {
 	return BaseURLFromRequest(r)
 }
 
+func (m *Manager) isGatewayWideResource(resource string) bool {
+	baseURL := strings.TrimSpace(m.cfg.PublicBaseURL)
+	return baseURL != "" && normalizeResource(resource) == normalizeResource(baseURL)
+}
+
 func (m *Manager) load() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -572,6 +775,9 @@ func (m *Manager) load() error {
 	if data.Users == nil {
 		data.Users = make(map[string]*userRecord)
 	}
+	if data.Groups == nil {
+		data.Groups = make(map[string]*groupRecord)
+	}
 	if data.EmailIndex == nil {
 		data.EmailIndex = make(map[string]string)
 	}
@@ -590,9 +796,27 @@ func (m *Manager) load() error {
 	if data.RefreshTokens == nil {
 		data.RefreshTokens = make(map[string]*refreshTokenRecord)
 	}
+	for _, user := range data.Users {
+		user.GroupIDs = filterExistingGroupIDs(user.GroupIDs, data.Groups)
+	}
+	now := time.Now()
+	storeChanged := false
+	for _, client := range data.Clients {
+		if client.RegistrationAccessToken == "" {
+			client.RegistrationAccessToken = randomToken(48)
+			storeChanged = true
+		}
+		if client.UpdatedAt == 0 {
+			client.UpdatedAt = client.CreatedAt
+			storeChanged = true
+		}
+	}
 
 	m.data = &data
-	m.cleanupLocked(time.Now())
+	m.cleanupLocked(now)
+	if storeChanged {
+		return m.saveLocked()
+	}
 	return nil
 }
 
@@ -658,41 +882,28 @@ func (m *Manager) cleanupLocked(now time.Time) {
 }
 
 func (m *Manager) registerClient(name string, redirectURIs, grantTypes, responseTypes []string, authMethod string) (*clientRecord, error) {
-	if strings.TrimSpace(name) == "" {
-		name = "MCP Client"
-	}
-	if len(redirectURIs) == 0 {
-		return nil, fmt.Errorf("redirect_uris must not be empty")
-	}
-	for _, redirectURI := range redirectURIs {
-		if err := validateRedirectURI(redirectURI); err != nil {
-			return nil, err
-		}
-	}
+	return m.registerClientFromMetadata(clientMetadataRequest{
+		ClientName:              name,
+		RedirectURIs:            redirectURIs,
+		GrantTypes:              grantTypes,
+		ResponseTypes:           responseTypes,
+		TokenEndpointAuthMethod: authMethod,
+	})
+}
 
-	if len(grantTypes) == 0 {
-		grantTypes = []string{"authorization_code", "refresh_token"}
-	}
-	if len(responseTypes) == 0 {
-		responseTypes = []string{"code"}
-	}
-	if authMethod == "" {
-		authMethod = "none"
-	}
-	if authMethod != "none" {
-		return nil, fmt.Errorf("only token_endpoint_auth_method=none is supported")
+func (m *Manager) registerClientFromMetadata(payload clientMetadataRequest) (*clientRecord, error) {
+	metadata, err := m.normalizeClientMetadata(payload)
+	if err != nil {
+		return nil, err
 	}
 
 	now := time.Now()
-	client := &clientRecord{
-		ID:                      randomToken(24),
-		Name:                    name,
-		RedirectURIs:            dedupeStrings(redirectURIs),
-		GrantTypes:              dedupeStrings(grantTypes),
-		ResponseTypes:           dedupeStrings(responseTypes),
-		TokenEndpointAuthMethod: authMethod,
-		CreatedAt:               now.Unix(),
-	}
+	client := metadata
+	client.ID = randomToken(24)
+	client.Secret = clientSecretForAuthMethod(client.TokenEndpointAuthMethod)
+	client.RegistrationAccessToken = randomToken(48)
+	client.CreatedAt = now.Unix()
+	client.UpdatedAt = now.Unix()
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -702,6 +913,233 @@ func (m *Manager) registerClient(name string, redirectURIs, grantTypes, response
 		return nil, err
 	}
 	return client, nil
+}
+
+func (m *Manager) normalizeClientMetadata(payload clientMetadataRequest) (*clientRecord, error) {
+	name := strings.TrimSpace(payload.ClientName)
+	if strings.TrimSpace(name) == "" {
+		name = "MCP Client"
+	}
+	redirectURIs := dedupeStrings(payload.RedirectURIs)
+	if len(redirectURIs) == 0 {
+		return nil, fmt.Errorf("redirect_uris must not be empty")
+	}
+	for _, redirectURI := range redirectURIs {
+		if err := m.validateRedirectURI(redirectURI); err != nil {
+			return nil, err
+		}
+	}
+
+	grantTypes := dedupeStrings(payload.GrantTypes)
+	if len(grantTypes) == 0 {
+		grantTypes = []string{"authorization_code", "refresh_token"}
+	}
+	if err := validateSupportedGrantTypes(grantTypes); err != nil {
+		return nil, err
+	}
+
+	responseTypes := dedupeStrings(payload.ResponseTypes)
+	if len(responseTypes) == 0 {
+		responseTypes = []string{"code"}
+	}
+	if err := validateSupportedResponseTypes(responseTypes); err != nil {
+		return nil, err
+	}
+	if slices.Contains(grantTypes, "authorization_code") != slices.Contains(responseTypes, "code") {
+		return nil, fmt.Errorf("grant_types and response_types are inconsistent")
+	}
+
+	authMethod := strings.TrimSpace(payload.TokenEndpointAuthMethod)
+	if authMethod == "" {
+		authMethod = "none"
+	}
+	if !supportedTokenEndpointAuthMethod(authMethod) {
+		return nil, fmt.Errorf("token_endpoint_auth_method must be one of: none, client_secret_post, client_secret_basic")
+	}
+
+	client := &clientRecord{
+		Name:                    name,
+		RedirectURIs:            redirectURIs,
+		GrantTypes:              grantTypes,
+		ResponseTypes:           responseTypes,
+		TokenEndpointAuthMethod: authMethod,
+		Scope:                   strings.TrimSpace(payload.Scope),
+		ClientURI:               strings.TrimSpace(payload.ClientURI),
+		LogoURI:                 strings.TrimSpace(payload.LogoURI),
+		TOSURI:                  strings.TrimSpace(payload.TOSURI),
+		PolicyURI:               strings.TrimSpace(payload.PolicyURI),
+		JwksURI:                 strings.TrimSpace(payload.JwksURI),
+		Contacts:                dedupeStrings(payload.Contacts),
+		SoftwareID:              strings.TrimSpace(payload.SoftwareID),
+		SoftwareVersion:         strings.TrimSpace(payload.SoftwareVersion),
+	}
+	if client.Scope == "" {
+		client.Scope = "mcp"
+	}
+	for _, rawURI := range []string{client.ClientURI, client.LogoURI, client.TOSURI, client.PolicyURI, client.JwksURI} {
+		if rawURI == "" {
+			continue
+		}
+		if err := validateAbsoluteResource(rawURI); err != nil {
+			return nil, fmt.Errorf("metadata URI must be absolute: %s", rawURI)
+		}
+	}
+	return client, nil
+}
+
+func (m *Manager) clientForRegistrationAccess(clientID, authorizationHeader string) (*clientRecord, error) {
+	token, err := registrationAccessTokenFromHeader(authorizationHeader)
+	if err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.cleanupLocked(time.Now())
+
+	client, ok := m.data.Clients[clientID]
+	if !ok {
+		return nil, ErrInvalidClient
+	}
+	if client.RegistrationAccessToken == "" || !subtleConstantTimeEqual(client.RegistrationAccessToken, token) {
+		return nil, ErrInvalidToken
+	}
+	return client, nil
+}
+
+func (m *Manager) updateClientRegistration(clientID, authorizationHeader string, payload clientMetadataRequest) (*clientRecord, error) {
+	token, err := registrationAccessTokenFromHeader(authorizationHeader)
+	if err != nil {
+		return nil, err
+	}
+	metadata, err := m.normalizeClientMetadata(payload)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(payload.ClientID) != clientID {
+		return nil, fmt.Errorf("client_id must match the client configuration endpoint")
+	}
+
+	now := time.Now()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.cleanupLocked(now)
+
+	client, ok := m.data.Clients[clientID]
+	if !ok {
+		return nil, ErrInvalidClient
+	}
+	if client.RegistrationAccessToken == "" || !subtleConstantTimeEqual(client.RegistrationAccessToken, token) {
+		return nil, ErrInvalidToken
+	}
+	if client.Secret != "" && strings.TrimSpace(payload.ClientSecret) != "" && !subtleConstantTimeEqual(client.Secret, payload.ClientSecret) {
+		return nil, ErrInvalidClient
+	}
+
+	secret := client.Secret
+	if client.TokenEndpointAuthMethod != metadata.TokenEndpointAuthMethod {
+		secret = clientSecretForAuthMethod(metadata.TokenEndpointAuthMethod)
+	}
+	client.Secret = secret
+	client.Name = metadata.Name
+	client.RedirectURIs = metadata.RedirectURIs
+	client.GrantTypes = metadata.GrantTypes
+	client.ResponseTypes = metadata.ResponseTypes
+	client.TokenEndpointAuthMethod = metadata.TokenEndpointAuthMethod
+	client.Scope = metadata.Scope
+	client.ClientURI = metadata.ClientURI
+	client.LogoURI = metadata.LogoURI
+	client.TOSURI = metadata.TOSURI
+	client.PolicyURI = metadata.PolicyURI
+	client.JwksURI = metadata.JwksURI
+	client.Contacts = metadata.Contacts
+	client.SoftwareID = metadata.SoftwareID
+	client.SoftwareVersion = metadata.SoftwareVersion
+	client.UpdatedAt = now.Unix()
+
+	if err := m.saveLocked(); err != nil {
+		return nil, err
+	}
+	return client, nil
+}
+
+func (m *Manager) deleteClientRegistration(clientID, authorizationHeader string) error {
+	token, err := registrationAccessTokenFromHeader(authorizationHeader)
+	if err != nil {
+		return err
+	}
+
+	now := time.Now()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.cleanupLocked(now)
+
+	client, ok := m.data.Clients[clientID]
+	if !ok {
+		return ErrInvalidClient
+	}
+	if client.RegistrationAccessToken == "" || !subtleConstantTimeEqual(client.RegistrationAccessToken, token) {
+		return ErrInvalidToken
+	}
+
+	delete(m.data.Clients, clientID)
+	for code, record := range m.data.AuthCodes {
+		if record.ClientID == clientID {
+			delete(m.data.AuthCodes, code)
+		}
+	}
+	for token, record := range m.data.AccessTokens {
+		if record.ClientID == clientID {
+			delete(m.data.AccessTokens, token)
+		}
+	}
+	for token, record := range m.data.RefreshTokens {
+		if record.ClientID == clientID {
+			delete(m.data.RefreshTokens, token)
+		}
+	}
+	return m.saveLocked()
+}
+
+func supportedTokenEndpointAuthMethod(method string) bool {
+	switch strings.TrimSpace(method) {
+	case "none", "client_secret_post", "client_secret_basic":
+		return true
+	default:
+		return false
+	}
+}
+
+func validateSupportedGrantTypes(grantTypes []string) error {
+	for _, grantType := range grantTypes {
+		switch grantType {
+		case "authorization_code", "refresh_token":
+		default:
+			return fmt.Errorf("unsupported grant_type %q", grantType)
+		}
+	}
+	if !slices.Contains(grantTypes, "authorization_code") {
+		return fmt.Errorf("grant_types must include authorization_code")
+	}
+	return nil
+}
+
+func validateSupportedResponseTypes(responseTypes []string) error {
+	for _, responseType := range responseTypes {
+		if responseType != "code" {
+			return fmt.Errorf("unsupported response_type %q", responseType)
+		}
+	}
+	if !slices.Contains(responseTypes, "code") {
+		return fmt.Errorf("response_types must include code")
+	}
+	return nil
+}
+
+func clientSecretForAuthMethod(method string) string {
+	if method == "none" {
+		return ""
+	}
+	return randomToken(32)
 }
 
 func (m *Manager) handleAuthorizeGet(w http.ResponseWriter, r *http.Request) {
@@ -714,6 +1152,10 @@ func (m *Manager) handleAuthorizeGet(w http.ResponseWriter, r *http.Request) {
 	identity, _ := m.identityFromSession(r)
 	if identity == nil {
 		http.Redirect(w, r, "/account/login?next="+url.QueryEscape(r.URL.RequestURI()), http.StatusFound)
+		return
+	}
+	if err := m.checkResourceAccess(identity, params.Resource); err != nil {
+		http.Error(w, err.Error(), http.StatusForbidden)
 		return
 	}
 
@@ -772,6 +1214,15 @@ func (m *Manager) handleAuthorizePost(w http.ResponseWriter, r *http.Request) {
 		completeBrowserRedirect(w, target, "Access denied")
 		return
 	}
+	if err := m.checkResourceAccess(identity, params.Resource); err != nil {
+		target, buildErr := buildOAuthErrorRedirectURL(params.RedirectURI, "access_denied", params.State)
+		if buildErr != nil {
+			http.Error(w, "invalid redirect_uri", http.StatusBadRequest)
+			return
+		}
+		completeBrowserRedirect(w, target, "Access denied")
+		return
+	}
 
 	code, err := m.createAuthorizationCode(identity.UserID, params)
 	if err != nil {
@@ -805,9 +1256,6 @@ func (m *Manager) parseAuthorizeRequest(values url.Values) (*authorizeParams, *c
 	if params.ResponseType != "code" {
 		return nil, nil, fmt.Errorf("response_type must be code")
 	}
-	if params.Resource == "" {
-		return nil, nil, fmt.Errorf("resource is required")
-	}
 	if params.CodeChallenge == "" || params.CodeChallengeMethod != "S256" {
 		return nil, nil, fmt.Errorf("PKCE with code_challenge_method=S256 is required")
 	}
@@ -816,11 +1264,16 @@ func (m *Manager) parseAuthorizeRequest(values url.Values) (*authorizeParams, *c
 	if err != nil {
 		return nil, nil, err
 	}
+	if !slices.Contains(client.GrantTypes, "authorization_code") || !slices.Contains(client.ResponseTypes, "code") {
+		return nil, nil, fmt.Errorf("client is not registered for authorization_code")
+	}
 	if !slices.Contains(client.RedirectURIs, params.RedirectURI) {
 		return nil, nil, fmt.Errorf("redirect_uri is not registered for this client")
 	}
-	if err := validateAbsoluteResource(params.Resource); err != nil {
-		return nil, nil, err
+	if params.Resource != "" {
+		if err := validateAbsoluteResource(params.Resource); err != nil {
+			return nil, nil, err
+		}
 	}
 	if params.Scope == "" {
 		params.Scope = "mcp"
@@ -863,7 +1316,11 @@ func (m *Manager) createAuthorizationCode(userID string, params *authorizeParams
 }
 
 func (m *Manager) handleAuthorizationCodeExchange(w http.ResponseWriter, r *http.Request) {
-	clientID := strings.TrimSpace(r.FormValue("client_id"))
+	clientID, clientSecret, clientAuthMethod, err := tokenRequestClientCredentials(r)
+	if err != nil {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
 	code := strings.TrimSpace(r.FormValue("code"))
 	redirectURI := strings.TrimSpace(r.FormValue("redirect_uri"))
 	codeVerifier := strings.TrimSpace(r.FormValue("code_verifier"))
@@ -874,11 +1331,11 @@ func (m *Manager) handleAuthorizationCodeExchange(w http.ResponseWriter, r *http
 		return
 	}
 
-	response, err := m.exchangeAuthorizationCode(clientID, code, redirectURI, codeVerifier, resource)
+	response, err := m.exchangeAuthorizationCode(clientID, clientSecret, clientAuthMethod, code, redirectURI, codeVerifier, resource)
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrInvalidClient):
-			writeOAuthError(w, http.StatusUnauthorized, "invalid_client", err.Error())
+			writeInvalidClientError(w, r, err.Error())
 		case errors.Is(err, ErrInvalidGrant), errors.Is(err, ErrTokenExpired):
 			writeOAuthError(w, http.StatusBadRequest, "invalid_grant", err.Error())
 		default:
@@ -890,7 +1347,7 @@ func (m *Manager) handleAuthorizationCodeExchange(w http.ResponseWriter, r *http
 	writeJSON(w, http.StatusOK, response)
 }
 
-func (m *Manager) exchangeAuthorizationCode(clientID, code, redirectURI, codeVerifier, resource string) (*tokenResponse, error) {
+func (m *Manager) exchangeAuthorizationCode(clientID, clientSecret, clientAuthMethod, code, redirectURI, codeVerifier, resource string) (*tokenResponse, error) {
 	now := time.Now()
 
 	m.mu.Lock()
@@ -900,6 +1357,12 @@ func (m *Manager) exchangeAuthorizationCode(clientID, code, redirectURI, codeVer
 	client, ok := m.data.Clients[clientID]
 	if !ok {
 		return nil, ErrInvalidClient
+	}
+	if !clientSecretValid(client, clientSecret, clientAuthMethod) {
+		return nil, ErrInvalidClient
+	}
+	if !slices.Contains(client.GrantTypes, "authorization_code") {
+		return nil, ErrInvalidGrant
 	}
 	record, ok := m.data.AuthCodes[code]
 	if !ok {
@@ -929,7 +1392,11 @@ func (m *Manager) exchangeAuthorizationCode(clientID, code, redirectURI, codeVer
 }
 
 func (m *Manager) handleRefreshTokenExchange(w http.ResponseWriter, r *http.Request) {
-	clientID := strings.TrimSpace(r.FormValue("client_id"))
+	clientID, clientSecret, clientAuthMethod, err := tokenRequestClientCredentials(r)
+	if err != nil {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
 	refreshToken := strings.TrimSpace(r.FormValue("refresh_token"))
 	resource := strings.TrimSpace(r.FormValue("resource"))
 
@@ -938,11 +1405,11 @@ func (m *Manager) handleRefreshTokenExchange(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	response, err := m.refreshToken(clientID, refreshToken, resource)
+	response, err := m.refreshToken(clientID, clientSecret, clientAuthMethod, refreshToken, resource)
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrInvalidClient):
-			writeOAuthError(w, http.StatusUnauthorized, "invalid_client", err.Error())
+			writeInvalidClientError(w, r, err.Error())
 		case errors.Is(err, ErrInvalidGrant), errors.Is(err, ErrTokenExpired):
 			writeOAuthError(w, http.StatusBadRequest, "invalid_grant", err.Error())
 		default:
@@ -954,7 +1421,7 @@ func (m *Manager) handleRefreshTokenExchange(w http.ResponseWriter, r *http.Requ
 	writeJSON(w, http.StatusOK, response)
 }
 
-func (m *Manager) refreshToken(clientID, refreshToken, resource string) (*tokenResponse, error) {
+func (m *Manager) refreshToken(clientID, clientSecret, clientAuthMethod, refreshToken, resource string) (*tokenResponse, error) {
 	now := time.Now()
 
 	m.mu.Lock()
@@ -964,6 +1431,12 @@ func (m *Manager) refreshToken(clientID, refreshToken, resource string) (*tokenR
 	client, ok := m.data.Clients[clientID]
 	if !ok {
 		return nil, ErrInvalidClient
+	}
+	if !clientSecretValid(client, clientSecret, clientAuthMethod) {
+		return nil, ErrInvalidClient
+	}
+	if !slices.Contains(client.GrantTypes, "refresh_token") {
+		return nil, ErrInvalidGrant
 	}
 	record, ok := m.data.RefreshTokens[refreshToken]
 	if !ok {
@@ -989,9 +1462,44 @@ func (m *Manager) refreshToken(clientID, refreshToken, resource string) (*tokenR
 	return tokenSet, nil
 }
 
+func tokenRequestClientCredentials(r *http.Request) (clientID string, clientSecret string, authMethod string, err error) {
+	formClientID := strings.TrimSpace(r.FormValue("client_id"))
+	formSecret := strings.TrimSpace(r.FormValue("client_secret"))
+	basicClientID, basicSecret, hasBasic := r.BasicAuth()
+	if !hasBasic {
+		if formSecret != "" {
+			return formClientID, formSecret, "client_secret_post", nil
+		}
+		return formClientID, "", "none", nil
+	}
+
+	basicClientID = strings.TrimSpace(basicClientID)
+	if formClientID != "" && formClientID != basicClientID {
+		return "", "", "", fmt.Errorf("client_id mismatch between form body and basic auth")
+	}
+	if formSecret != "" {
+		return "", "", "", fmt.Errorf("multiple client authentication methods are not allowed")
+	}
+	return basicClientID, basicSecret, "client_secret_basic", nil
+}
+
+func clientSecretValid(client *clientRecord, providedSecret, authMethod string) bool {
+	method := strings.TrimSpace(client.TokenEndpointAuthMethod)
+	if method == "" {
+		method = "none"
+	}
+	if method == "none" {
+		return authMethod == "none" && providedSecret == ""
+	}
+	if authMethod != method {
+		return false
+	}
+	return client.Secret != "" && subtleConstantTimeEqual(client.Secret, providedSecret)
+}
+
 func (m *Manager) issueTokenSetLocked(now time.Time, userID, clientID, scope, resource string) *tokenResponse {
 	accessToken := randomToken(32)
-	refreshToken := randomToken(48)
+	refreshToken := ""
 
 	m.data.AccessTokens[accessToken] = &accessTokenRecord{
 		Token:     accessToken,
@@ -1002,14 +1510,18 @@ func (m *Manager) issueTokenSetLocked(now time.Time, userID, clientID, scope, re
 		ExpiresAt: now.Add(m.cfg.AccessTokenTTL).Unix(),
 		IssuedAt:  now.Unix(),
 	}
-	m.data.RefreshTokens[refreshToken] = &refreshTokenRecord{
-		Token:     refreshToken,
-		ClientID:  clientID,
-		UserID:    userID,
-		Scope:     scope,
-		Resource:  resource,
-		ExpiresAt: now.Add(m.cfg.RefreshTokenTTL).Unix(),
-		IssuedAt:  now.Unix(),
+
+	if client, ok := m.data.Clients[clientID]; !ok || slices.Contains(client.GrantTypes, "refresh_token") {
+		refreshToken = randomToken(48)
+		m.data.RefreshTokens[refreshToken] = &refreshTokenRecord{
+			Token:     refreshToken,
+			ClientID:  clientID,
+			UserID:    userID,
+			Scope:     scope,
+			Resource:  resource,
+			ExpiresAt: now.Add(m.cfg.RefreshTokenTTL).Unix(),
+			IssuedAt:  now.Unix(),
+		}
 	}
 
 	return &tokenResponse{
@@ -1119,6 +1631,36 @@ func (m *Manager) authenticateUser(email, password string) (*userRecord, error) 
 	return user, nil
 }
 
+func (m *Manager) changeUserPassword(userID, currentPassword, newPassword string) error {
+	if strings.TrimSpace(currentPassword) == "" {
+		return fmt.Errorf("current password is required")
+	}
+	if len(newPassword) < 10 {
+		return fmt.Errorf("new password must be at least 10 characters long")
+	}
+
+	hash, err := bcrypt.GenerateFromPassword([]byte(newPassword), bcrypt.DefaultCost)
+	if err != nil {
+		return fmt.Errorf("failed to hash password: %w", err)
+	}
+
+	now := time.Now()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.cleanupLocked(now)
+
+	user, ok := m.data.Users[userID]
+	if !ok {
+		return ErrNotAuthenticated
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(currentPassword)); err != nil {
+		return fmt.Errorf("current password is incorrect")
+	}
+	user.PasswordHash = string(hash)
+	user.UpdatedAt = now.Unix()
+	return m.saveLocked()
+}
+
 func (m *Manager) startSession(w http.ResponseWriter, r *http.Request, userID string) error {
 	now := time.Now()
 	session := &sessionRecord{
@@ -1178,14 +1720,34 @@ func (m *Manager) identityFromSession(r *http.Request) (*Identity, error) {
 	if !ok {
 		return nil, ErrNotAuthenticated
 	}
-	return &Identity{
-		UserID:  user.ID,
-		Email:   user.Email,
-		IsAdmin: user.IsAdmin,
-	}, nil
+	return m.identityForUserLocked(user), nil
 }
 
-func validateRedirectURI(raw string) error {
+func (m *Manager) identityForUserLocked(user *userRecord) *Identity {
+	groupIDs := filterExistingGroupIDs(user.GroupIDs, m.data.Groups)
+	return &Identity{
+		UserID:     user.ID,
+		Email:      user.Email,
+		IsAdmin:    user.IsAdmin,
+		GroupIDs:   groupIDs,
+		GroupNames: m.groupNamesLocked(groupIDs),
+	}
+}
+
+func (m *Manager) checkResourceAccess(identity *Identity, resource string) error {
+	if strings.TrimSpace(resource) == "" {
+		return nil
+	}
+	m.mu.Lock()
+	checker := m.resourceAccessChecker
+	m.mu.Unlock()
+	if checker == nil {
+		return nil
+	}
+	return checker(identity, resource)
+}
+
+func (m *Manager) validateRedirectURI(raw string) error {
 	parsed, err := url.Parse(raw)
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
 		return fmt.Errorf("invalid redirect_uri: %s", raw)
@@ -1196,7 +1758,23 @@ func validateRedirectURI(raw string) error {
 	if parsed.Scheme == "http" && (parsed.Hostname() == "localhost" || parsed.Hostname() == "127.0.0.1") {
 		return nil
 	}
+	if parsed.Scheme == "http" && m.redirectOriginAllowed(parsed) {
+		return nil
+	}
 	return fmt.Errorf("redirect_uri must use https or localhost http")
+}
+
+func (m *Manager) redirectOriginAllowed(parsed *url.URL) bool {
+	if parsed == nil {
+		return false
+	}
+	origin := parsed.Scheme + "://" + parsed.Host
+	for _, allowed := range m.cfg.AllowedRedirectOrigins {
+		if strings.EqualFold(strings.TrimRight(allowed, "/"), strings.TrimRight(origin, "/")) {
+			return true
+		}
+	}
+	return false
 }
 
 func validateAbsoluteResource(raw string) error {
@@ -1378,6 +1956,30 @@ func writeOAuthError(w http.ResponseWriter, status int, errCode, description str
 	})
 }
 
+func writeInvalidClientError(w http.ResponseWriter, r *http.Request, description string) {
+	if strings.HasPrefix(strings.TrimSpace(r.Header.Get("Authorization")), "Basic ") {
+		w.Header().Set("WWW-Authenticate", `Basic realm="mcp-oauth-gateway"`)
+	}
+	writeOAuthError(w, http.StatusUnauthorized, "invalid_client", description)
+}
+
+func registrationAccessTokenFromHeader(header string) (string, error) {
+	header = strings.TrimSpace(header)
+	if header == "" {
+		return "", ErrInvalidToken
+	}
+	parts := strings.Fields(header)
+	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") || strings.TrimSpace(parts[1]) == "" {
+		return "", ErrInvalidToken
+	}
+	return parts[1], nil
+}
+
+func writeRegistrationAccessError(w http.ResponseWriter, err error) {
+	w.Header().Set("WWW-Authenticate", `Bearer realm="mcp-oauth-gateway", error="invalid_token"`)
+	writeOAuthError(w, http.StatusUnauthorized, "invalid_token", "invalid registration access token")
+}
+
 func writeJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -1428,6 +2030,7 @@ const layoutTemplate = `
     :root { color-scheme: light; font-family: ui-sans-serif, system-ui, sans-serif; }
     body { margin: 2rem auto; max-width: 44rem; padding: 0 1rem; line-height: 1.5; color: #122033; }
     h1 { font-size: 1.8rem; margin-bottom: 0.5rem; }
+    h2 { font-size: 1.15rem; margin-top: 1.25rem; }
     .card { border: 1px solid #d3dae6; border-radius: 16px; padding: 1.25rem; box-shadow: 0 10px 25px rgba(18,32,51,0.06); }
     .muted { color: #596579; }
     .error { color: #8f1d1d; margin-bottom: 1rem; }
@@ -1444,6 +2047,7 @@ const layoutTemplate = `
     a { color: #173b67; }
     form { margin: 0; }
     code { background: #f2f5f9; padding: 0.1rem 0.35rem; border-radius: 6px; }
+    hr { border: 0; border-top: 1px solid #d3dae6; margin: 1.25rem 0; }
   </style>
 </head>
 <body>
@@ -1493,12 +2097,48 @@ const loginTemplate = `
 const accountTemplate = `
 {{define "body"}}
 <h1>{{.Title}} Account</h1>
-<p>Signed in as <strong>{{.Email}}</strong>.</p>
-<p class="muted">This account can authorize MCP clients against the shared gateway for multiple upstream MCP servers.</p>
-{{if .IsAdmin}}<p class="muted"><a href="/admin">Open the admin dashboard</a></p>{{end}}
+<p>Angemeldet als <strong>{{.Email}}</strong>.</p>
+<p class="muted">Hier verwaltest du deine eigenen Gateway-Einstellungen.</p>
+{{if .Notice}}<p class="success">{{.Notice}}</p>{{end}}
+{{if .Error}}<p class="error">{{.Error}}</p>{{end}}
+<p>Rolle: {{if .IsAdmin}}<strong>Admin</strong>{{else}}Nutzer{{end}}</p>
+<p class="muted">Gruppen: {{if .GroupNames}}{{range $idx, $name := .GroupNames}}{{if $idx}}, {{end}}{{$name}}{{end}}{{else}}keine{{end}}</p>
+{{if .IsAdmin}}<p class="muted"><a href="/admin">Admin-Dashboard oeffnen</a></p>{{end}}
+<hr>
+<h2>Registrierte Clients / Geraete</h2>
+<p class="muted">Hier siehst du Clients, fuer die du per OAuth Zugriff freigegeben hast. Entfernen widerruft bestehende Tokens.</p>
+{{if .Devices}}
+  {{range .Devices}}
+    <div class="card" style="margin-top:.85rem;">
+      <strong>{{.ClientName}}</strong>
+      <p class="muted">Resource: <code>{{if .Resource}}{{.Resource}}{{else}}gatewayweit{{end}}</code></p>
+      <p class="muted">Zuletzt verwendet: {{.LastUsedAt.Format "2006-01-02 15:04"}} | Refresh gueltig bis: {{.RefreshExpiresAt.Format "2006-01-02 15:04"}}</p>
+      <form method="post" action="/account/devices/delete" style="margin-top:.8rem;">
+        <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+        <input type="hidden" name="device_id" value="{{.ID}}">
+        <button type="submit">Zugriff widerrufen</button>
+      </form>
+    </div>
+  {{end}}
+{{else}}
+  <p class="muted">Noch keine OAuth-Clients fuer deinen Account autorisiert.</p>
+{{end}}
+<hr>
+<h2>Passwort aendern</h2>
+<form method="post" action="/account/password">
+  <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+  <label for="current_password">Aktuelles Passwort</label>
+  <input id="current_password" name="current_password" type="password" required autocomplete="current-password">
+  <label for="new_password">Neues Passwort</label>
+  <input id="new_password" name="new_password" type="password" minlength="10" required autocomplete="new-password">
+  <label for="confirm_password">Neues Passwort bestaetigen</label>
+  <input id="confirm_password" name="confirm_password" type="password" minlength="10" required autocomplete="new-password">
+  <button type="submit">Passwort speichern</button>
+</form>
+<hr>
 <form method="post" action="/account/logout">
   <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
-  <button type="submit">Sign out</button>
+  <button type="submit">Abmelden</button>
 </form>
 {{end}}
 `
