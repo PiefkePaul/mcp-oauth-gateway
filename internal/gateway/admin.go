@@ -2290,6 +2290,7 @@ const adminDashboardTemplate = `
                   <span>Transport: <code>{{.Transport}}</code></span>
                   <span>MCP: <code>{{.PublicMCPURL}}</code></span>
                   <span>Docs: <code>{{.PublicMCPURL}}</code> -> <code>{{.PathPrefix}}/docs</code></span>
+                  <span>OpenAPI Adapter: <code>{{.PathPrefix}}/openapi.json</code></span>
                   <span>Upstream: <code>{{.Upstream}}</code>{{if eq .Transport "http"}}<code>{{.UpstreamMCPPath}}</code>{{end}}</span>
                   <span>Headers: {{.ForwardHeadersCount}} | Env: {{.UpstreamEnvironmentCount}} | Pass Auth: {{if .PassAuthorization}}yes{{else}}no{{end}}</span>
                   {{if .MCPHTTPSessionMode}}<span>Session: <code>{{.MCPHTTPSessionMode}}</code></span>{{end}}

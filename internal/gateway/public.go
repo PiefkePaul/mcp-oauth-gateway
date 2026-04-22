@@ -29,6 +29,7 @@ type publicRouteView struct {
 	DisplayName     string
 	Description     string
 	MCPURL          string
+	OpenAPIURL      string
 	DocsURL         string
 	InfoURL         string
 	MetadataURL     string
@@ -137,6 +138,7 @@ func publicRouteFromConfig(s *Server, route config.Route) publicRouteView {
 		DisplayName:     route.DisplayName,
 		Description:     route.Notes,
 		MCPURL:          s.absoluteURL(route.PublicMCPPath()),
+		OpenAPIURL:      s.absoluteURL(route.PublicOpenAPISpecPath()),
 		DocsURL:         s.absoluteURL(route.PublicDocsPath()),
 		InfoURL:         s.absoluteURL(route.PublicInfoPath()),
 		MetadataURL:     s.absoluteURL(route.ProtectedResourceMetadataPath()),
@@ -316,6 +318,7 @@ const publicDashboardTemplate = `
           {{if .Description}}<p>{{.Description}}</p>{{end}}
           <div class="meta">
             <span>MCP URL: <code>{{.MCPURL}}</code></span>
+            <span>OpenAPI Adapter: <code>{{.OpenAPIURL}}</code></span>
             <span>Scopes: <code>{{.Scopes}}</code></span>
             {{if .SessionMode}}<span>Session Mode: <code>{{.SessionMode}}</code></span>{{end}}
           </div>
@@ -366,6 +369,7 @@ const docsIndexTemplate = `
         <h3>{{.DisplayName}}</h3>
         <div class="meta">
           <span>Remote MCP URL: <code>{{.MCPURL}}</code></span>
+          <span>OpenAPI Spec: <code>{{.OpenAPIURL}}</code></span>
           <span>Protected Resource Metadata: <code>{{.MetadataURL}}</code></span>
           <span>Route Info JSON: <code>{{.InfoURL}}</code></span>
         </div>
@@ -402,6 +406,10 @@ const routeDocsTemplate = `
     <div class="copybox">
       <strong>Remote MCP Server URL</strong>
       <code>{{.Route.MCPURL}}</code>
+    </div>
+    <div class="copybox">
+      <strong>OpenAPI Adapter URL</strong>
+      <code>{{.Route.OpenAPIURL}}</code>
     </div>
     <div class="copybox">
       <strong>Authentifizierung</strong>

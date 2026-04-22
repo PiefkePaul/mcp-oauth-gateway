@@ -259,6 +259,14 @@ func (r Route) PublicDocsPath() string {
 	return path.Join(r.NormalizedPathPrefix, "docs")
 }
 
+func (r Route) PublicOpenAPISpecPath() string {
+	return path.Join(r.NormalizedPathPrefix, "openapi.json")
+}
+
+func (r Route) PublicOpenAPIToolPathPrefix() string {
+	return path.Join(r.NormalizedPathPrefix, "openapi", "tools")
+}
+
 func (r Route) ResourceURL(publicBaseURL string) string {
 	return strings.TrimRight(publicBaseURL, "/") + r.PublicMCPPath()
 }

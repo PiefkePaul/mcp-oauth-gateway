@@ -18,6 +18,7 @@ Beispiel:
 Wichtig:
 
 - Die oeffentliche MCP-URL ist `https://mcp.example.com/<route>/mcp`
+- Fuer Clients ohne MCP-Unterstuetzung gibt es pro Route einen OpenAPI-Adapter unter `https://mcp.example.com/<route>/openapi.json`
 - Nicht nur `https://mcp.example.com/<route>`
 - Die zugehoerige Protected-Resource-Metadata liegt unter:
 - `https://mcp.example.com/.well-known/oauth-protected-resource/<route>/mcp`
@@ -48,6 +49,7 @@ Wichtig:
 - Optionaler STDIO-Installer fuer Uploads, HTTPS-Downloads und GitHub-Releases mit verschluesselten Env-Secrets
 - Optionaler, abgesicherter Artefakt-Build: Upload oder HTTPS/GitHub-Release-Download mit SHA-256-Pruefung und generiertem Dockerfile
 - OpenAPI-3.x-Routen, die Operationen aus einer OpenAPI-Spec als MCP-Tools bereitstellen
+- MCP-zu-OpenAPI-Adapter pro Route, damit MCP-Tools auch als OpenAPI-Operationen nutzbar sind
 - Verwaltete Docker-Deployments im Dashboard anlegen, starten, stoppen und entfernen
 - Verschluesselter Auth-Store auf Volume
 - Reverse-Proxy mit Header-Injektion pro Route
@@ -221,6 +223,17 @@ Hinweise:
 - OpenAPI-Routen nutzen weiterhin den Gateway-OAuth-Schutz. Das bedeutet: Clients sehen nur den MCP-Endpunkt des Gateways, nicht direkt deine Ziel-API.
 - Offizielle Referenz: [OpenAPI Specification](https://spec.openapis.org/oas/latest.html).
 
+### MCP zu OpenAPI
+
+Jede MCP-Route stellt zusaetzlich eine generierte OpenAPI-3.1-Spezifikation bereit:
+
+- `GET /<route>/openapi.json` listet alle aktuell per `tools/list` gefundenen MCP-Tools als OpenAPI-Operationen.
+- `POST /<route>/openapi/tools/<operationId>` ruft das zugehoerige MCP-Tool per `tools/call` auf.
+- Tool-Calls sind mit derselben OAuth-/Bearer-Policy wie `/<route>/mcp` geschuetzt.
+- Public-Routen veroeffentlichen die Spec im Katalog. Private oder restricted Routen geben die Spec nur fuer eingeloggte und berechtigte Nutzer aus.
+
+Damit koennen Clients, die MCP noch nicht sauber aufrufen, aber OpenAPI importieren koennen, dieselben Gateway-Routen verwenden.
+
 ## Dashboard
 
 Nach dem Login mit dem Bootstrap-Admin erreichst du das Dashboard unter:
@@ -286,6 +299,7 @@ Der Gateway zeigt unter `https://mcp.example.com/` alle Routen, die nicht als pr
 - Gateway-Dokumentation: `https://mcp.example.com/docs`
 - Route-Dokumentation: `https://mcp.example.com/<route>/docs`
 - Remote MCP URL fuer Clients: `https://mcp.example.com/<route>/mcp`
+- OpenAPI Adapter URL: `https://mcp.example.com/<route>/openapi.json`
 
 Private Routen erscheinen nicht im Katalog. Ihre Docs-Seite ist nur fuer angemeldete Nutzer mit passender Berechtigung sichtbar.
 

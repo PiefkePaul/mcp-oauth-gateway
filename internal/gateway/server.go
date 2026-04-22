@@ -235,6 +235,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if route, handler, ok := s.routeByOpenAPISpecPath(r.URL.Path); ok {
+		s.handleRouteOpenAPISpec(w, r, route, handler)
+		return
+	}
+
+	if route, handler, operationID, ok := s.routeByOpenAPIToolPath(r.URL.Path); ok {
+		s.handleRouteOpenAPIToolCall(w, r, route, handler, operationID)
+		return
+	}
+
 	if route, ok := s.routeByDocsPath(r.URL.Path); ok {
 		s.handleRouteDocs(w, r, route)
 		return
@@ -271,6 +281,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 			"display_name":                    route.DisplayName,
 			"route_info_url":                  s.absoluteURL(route.PublicInfoPath()),
 			"mcp_url":                         s.absoluteURL(route.PublicMCPPath()),
+			"openapi_spec_url":                s.absoluteURL(route.PublicOpenAPISpecPath()),
 			"protected_resource_metadata_url": s.absoluteURL(route.ProtectedResourceMetadataPath()),
 			"scopes_supported":                route.ScopeList(),
 			"upstream":                        route.Upstream,
@@ -336,6 +347,7 @@ func (s *Server) handleRouteInfo(w http.ResponseWriter, r *http.Request, route c
 		"display_name":                    route.DisplayName,
 		"path_prefix":                     route.NormalizedPathPrefix,
 		"mcp_url":                         s.absoluteURL(route.PublicMCPPath()),
+		"openapi_spec_url":                s.absoluteURL(route.PublicOpenAPISpecPath()),
 		"protected_resource_metadata_url": s.absoluteURL(route.ProtectedResourceMetadataPath()),
 		"authorization_server_url":        s.absoluteURL("/.well-known/oauth-authorization-server"),
 		"account_portal_url":              s.absoluteURL("/account"),
@@ -374,23 +386,8 @@ func (s *Server) handleGatewayProtectedResourceMetadata(w http.ResponseWriter, r
 }
 
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, route config.Route, handler http.Handler) {
-	token, err := bearerToken(r.Header.Get("Authorization"))
-	if err != nil {
-		s.writeChallenge(w, r, route)
-		return
-	}
-
-	resourceURL := s.absoluteURL(route.PublicMCPPath())
-	identity, err := s.authManager.ValidateAccessToken(token, resourceURL)
-	if err != nil {
-		s.writeChallenge(w, r, route)
-		return
-	}
-	if !routeAccessAllowed(route, identity) {
-		writeJSON(w, http.StatusForbidden, map[string]any{
-			"error":             "forbidden",
-			"error_description": "your account is not allowed to use this MCP server",
-		})
+	identity, ok := s.authenticateRouteBearer(w, r, route)
+	if !ok {
 		return
 	}
 

@@ -3,6 +3,7 @@ package gateway
 import (
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/PiefkePaul/mcp-oauth-gateway/internal/config"
 )
@@ -85,6 +86,44 @@ func (s *Server) routeByDocsPath(requestPath string) (config.Route, bool) {
 		}
 	}
 	return config.Route{}, false
+}
+
+func (s *Server) routeByOpenAPISpecPath(requestPath string) (config.Route, http.Handler, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	for _, route := range s.routes {
+		if requestPath == route.PublicOpenAPISpecPath() {
+			runtime, ok := s.runtime[route.ID]
+			if !ok {
+				return config.Route{}, nil, false
+			}
+			return runtime.Route, runtime.Handler, true
+		}
+	}
+	return config.Route{}, nil, false
+}
+
+func (s *Server) routeByOpenAPIToolPath(requestPath string) (config.Route, http.Handler, string, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	for _, route := range s.routes {
+		prefix := route.PublicOpenAPIToolPathPrefix()
+		if !matchesExactOrChildPath(requestPath, prefix) || requestPath == prefix {
+			continue
+		}
+		runtime, ok := s.runtime[route.ID]
+		if !ok {
+			return config.Route{}, nil, "", false
+		}
+		operationID := strings.TrimPrefix(requestPath, prefix+"/")
+		if operationID == "" || strings.Contains(operationID, "/") {
+			return config.Route{}, nil, "", false
+		}
+		return runtime.Route, runtime.Handler, operationID, true
+	}
+	return config.Route{}, nil, "", false
 }
 
 func (s *Server) routeByProtectedMetadataPath(requestPath string) (config.Route, bool) {
