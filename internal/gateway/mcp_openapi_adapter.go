@@ -365,7 +365,7 @@ func (c *mcpRouteCaller) sendRaw(ctx context.Context, payload any) (int, http.He
 	}
 
 	req := httptest.NewRequest(http.MethodPost, c.route.PublicMCPPath(), bytes.NewReader(raw)).WithContext(ctx)
-	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("MCP-Protocol-Version", "2025-06-18")
 	if c.sessionID != "" {
