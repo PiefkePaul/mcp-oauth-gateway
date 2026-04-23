@@ -1270,20 +1270,19 @@ func clientSecretForAuthMethod(method string) string {
 }
 
 func (m *Manager) handleAuthorizeGet(w http.ResponseWriter, r *http.Request) {
-	identity, _ := m.identityFromSession(r)
-	if identity == nil {
-		// Some clients, including Open WebUI, preflight the authorization URL
-		// server-side without a user session. Redirect to the local login page
-		// before strict request validation so the preflight can verify that the
-		// client is usable. Codes are still issued only after login and full PKCE
-		// validation below.
-		http.Redirect(w, r, "/account/login?next="+url.QueryEscape(r.URL.RequestURI()), http.StatusFound)
+	params, client, err := m.parseAuthorizeRequest(r.URL.Query())
+	if err != nil {
+		writeAuthorizationRequestError(w, err)
 		return
 	}
 
-	params, client, err := m.parseAuthorizeRequest(r.URL.Query())
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	identity, _ := m.identityFromSession(r)
+	if identity == nil {
+		// Some clients, including Open WebUI, preflight the authorization URL
+		// server-side without a user session. We still validate the OAuth request
+		// first so stale client registrations return invalid_client and trigger
+		// Open WebUI's re-registration path.
+		http.Redirect(w, r, "/account/login?next="+url.QueryEscape(r.URL.RequestURI()), http.StatusFound)
 		return
 	}
 
@@ -1334,7 +1333,7 @@ func (m *Manager) handleAuthorizePost(w http.ResponseWriter, r *http.Request) {
 
 	params, _, err := m.parseAuthorizeRequest(values)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeAuthorizationRequestError(w, err)
 		return
 	}
 
@@ -2099,6 +2098,15 @@ func writeInvalidClientError(w http.ResponseWriter, r *http.Request, description
 		w.Header().Set("WWW-Authenticate", `Basic realm="mcp-oauth-gateway"`)
 	}
 	writeOAuthError(w, http.StatusUnauthorized, "invalid_client", description)
+}
+
+func writeAuthorizationRequestError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, ErrInvalidClient):
+		writeOAuthError(w, http.StatusBadRequest, "invalid_client", "invalid client")
+	default:
+		http.Error(w, err.Error(), http.StatusBadRequest)
+	}
 }
 
 func registrationAccessTokenFromHeader(header string) (string, error) {

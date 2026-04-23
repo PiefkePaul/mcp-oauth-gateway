@@ -116,6 +116,61 @@ done`
 	}
 }
 
+func TestMCPRouteOpenAPISpecEndpointAcceptsBearerForRestrictedRoute(t *testing.T) {
+	script := `while IFS= read -r line; do
+case "$line" in
+  *'"method":"initialize"'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"test","version":"1"}}}' ;;
+  *'"method":"notifications/initialized"'*) ;;
+  *'"method":"tools/list"'*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"restricted-tool","inputSchema":{"type":"object"}}]}}' ;;
+esac
+done`
+	route := config.Route{
+		ID:          "legal",
+		DisplayName: "Legal MCP",
+		Transport:   "stdio",
+		PathPrefix:  "/legal",
+		Access: config.RouteAccess{
+			Visibility:   "private",
+			Mode:         "restricted",
+			AllowedUsers: []string{"user@example.com"},
+		},
+		Stdio: &config.RouteStdio{
+			Command: "/bin/sh",
+			Args:    []string{"-c", script},
+		},
+	}
+	if err := config.NormalizeRoute(&route); err != nil {
+		t.Fatalf("normalize route: %v", err)
+	}
+	server := newTestServerWithRoutes(t, []config.Route{route})
+	user, err := server.authManager.CreateUser("user@example.com", "super-secret-password", false)
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	token, _, err := server.authManager.CreatePersonalAccessToken(user.ID, "Open WebUI", 0)
+	if err != nil {
+		t.Fatalf("create bearer token: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "https://mcp.example.com/legal/openapi.json", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"/openapi/tools/restricted_tool"`) {
+		t.Fatalf("expected restricted OpenAPI tool path, got %s", rec.Body.String())
+	}
+
+	unauthorizedReq := httptest.NewRequest(http.MethodGet, "https://mcp.example.com/legal/openapi.json", nil)
+	unauthorizedRec := httptest.NewRecorder()
+	server.ServeHTTP(unauthorizedRec, unauthorizedReq)
+	if unauthorizedRec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without bearer token, got %d: %s", unauthorizedRec.Code, unauthorizedRec.Body.String())
+	}
+}
+
 func sortedMCPToolNames(tools []mcpToolDefinition) []string {
 	names := make([]string, 0, len(tools))
 	for _, tool := range tools {

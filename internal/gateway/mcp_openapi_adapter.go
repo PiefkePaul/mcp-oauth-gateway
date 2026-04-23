@@ -40,12 +40,23 @@ func (s *Server) handleRouteOpenAPISpec(w http.ResponseWriter, r *http.Request, 
 	}
 
 	identity, _ := s.authManager.CurrentIdentity(r)
+	if identity == nil {
+		if token, err := bearerToken(r.Header.Get("Authorization")); err == nil {
+			resourceURL := s.absoluteURL(route.PublicMCPPath())
+			if tokenIdentity, err := s.authManager.ValidateAccessToken(token, resourceURL); err == nil {
+				identity = tokenIdentity
+			} else if route.Access.IsPrivate() || route.Access.EffectiveMode() != "public" {
+				s.writeChallenge(w, r, route)
+				return
+			}
+		}
+	}
 	if identity != nil && !routeAccessAllowed(route, identity) {
 		http.Error(w, "you are not allowed to view this MCP OpenAPI spec", http.StatusForbidden)
 		return
 	}
 	if identity == nil && (route.Access.IsPrivate() || route.Access.EffectiveMode() != "public") {
-		http.Redirect(w, r, "/account/login?next="+r.URL.EscapedPath(), http.StatusFound)
+		s.writeChallenge(w, r, route)
 		return
 	}
 

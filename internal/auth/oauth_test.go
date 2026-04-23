@@ -169,7 +169,7 @@ func TestAuthorizeAllowsClientsWithoutResourceParameter(t *testing.T) {
 	}
 }
 
-func TestAuthorizePreflightRedirectsUnauthenticatedBeforeStrictPKCEValidation(t *testing.T) {
+func TestAuthorizePreflightRedirectsUnauthenticatedAfterOAuthValidation(t *testing.T) {
 	manager := newTestManager(t, "admin@example.com", "super-secret-password")
 
 	client, err := manager.registerClient(
@@ -183,7 +183,16 @@ func TestAuthorizePreflightRedirectsUnauthenticatedBeforeStrictPKCEValidation(t 
 		t.Fatalf("register client: %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "https://mcp.example.com/authorize?client_id="+url.QueryEscape(client.ID)+"&redirect_uri="+url.QueryEscape("https://chat.example.com/oauth/clients/mcp:legal/callback")+"&response_type=code&scope=mcp", nil)
+	values := url.Values{
+		"client_id":             {client.ID},
+		"redirect_uri":          {"https://chat.example.com/oauth/clients/mcp:legal/callback"},
+		"response_type":         {"code"},
+		"scope":                 {"mcp"},
+		"state":                 {"state-value"},
+		"code_challenge":        {"abcdefghijklmnopqrstuvwxyz0123456789abcdef"},
+		"code_challenge_method": {"S256"},
+	}
+	req := httptest.NewRequest(http.MethodGet, "https://mcp.example.com/authorize?"+values.Encode(), nil)
 	rec := httptest.NewRecorder()
 
 	manager.HandleAuthorize(rec, req)
@@ -193,6 +202,31 @@ func TestAuthorizePreflightRedirectsUnauthenticatedBeforeStrictPKCEValidation(t 
 	}
 	if location := rec.Header().Get("Location"); !strings.HasPrefix(location, "/account/login?next=") {
 		t.Fatalf("expected login redirect, got %q", location)
+	}
+}
+
+func TestAuthorizePreflightReportsInvalidClientBeforeLoginRedirect(t *testing.T) {
+	manager := newTestManager(t, "admin@example.com", "super-secret-password")
+
+	values := url.Values{
+		"client_id":             {"stale-open-webui-client"},
+		"redirect_uri":          {"https://chat.example.com/oauth/clients/mcp:legal/callback"},
+		"response_type":         {"code"},
+		"scope":                 {"mcp"},
+		"state":                 {"state-value"},
+		"code_challenge":        {"abcdefghijklmnopqrstuvwxyz0123456789abcdef"},
+		"code_challenge_method": {"S256"},
+	}
+	req := httptest.NewRequest(http.MethodGet, "https://mcp.example.com/authorize?"+values.Encode(), nil)
+	rec := httptest.NewRecorder()
+
+	manager.HandleAuthorize(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected invalid client response, got %d with body %q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"invalid_client"`) {
+		t.Fatalf("expected invalid_client response, got %q", rec.Body.String())
 	}
 }
 
