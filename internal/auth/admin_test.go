@@ -221,6 +221,46 @@ func TestRouteEnvSecretsAreEncryptedAndResolvable(t *testing.T) {
 	}
 }
 
+func TestRouteUpstreamBearerSecretsResolveGlobalAndPerUser(t *testing.T) {
+	manager := newTestManager(t, "admin@example.com", "super-secret-password")
+	admin := manager.ListUsers()[0]
+	user, err := manager.CreateUser("user@example.com", "super-secret-password", false)
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+
+	if err := manager.SetRouteUpstreamBearer("n8n", "global-token"); err != nil {
+		t.Fatalf("set global bearer: %v", err)
+	}
+	if err := manager.SetRouteUserUpstreamBearer("n8n", user.ID, "user-token"); err != nil {
+		t.Fatalf("set user bearer: %v", err)
+	}
+
+	if token, ok := manager.ResolveRouteUpstreamBearer("n8n", &Identity{UserID: user.ID, Email: user.Email}); !ok || token != "user-token" {
+		t.Fatalf("expected user bearer, got %q ok=%v", token, ok)
+	}
+	if token, ok := manager.ResolveRouteUpstreamBearer("n8n", &Identity{UserID: admin.ID, Email: admin.Email}); !ok || token != "global-token" {
+		t.Fatalf("expected global bearer, got %q ok=%v", token, ok)
+	}
+	globalConfigured, userConfigured := manager.RouteUpstreamBearerConfigured("n8n")
+	if !globalConfigured || !userConfigured[user.ID] {
+		t.Fatalf("expected configured flags, global=%v users=%#v", globalConfigured, userConfigured)
+	}
+
+	if err := manager.SetRouteUserUpstreamBearer("n8n", user.ID, ""); err != nil {
+		t.Fatalf("clear user bearer: %v", err)
+	}
+	if token, ok := manager.ResolveRouteUpstreamBearer("n8n", &Identity{UserID: user.ID, Email: user.Email}); !ok || token != "global-token" {
+		t.Fatalf("expected fallback global bearer, got %q ok=%v", token, ok)
+	}
+	if err := manager.SetRouteUpstreamBearer("n8n", ""); err != nil {
+		t.Fatalf("clear global bearer: %v", err)
+	}
+	if token, ok := manager.ResolveRouteUpstreamBearer("n8n", &Identity{UserID: user.ID, Email: user.Email}); ok || token != "" {
+		t.Fatalf("expected no bearer, got %q ok=%v", token, ok)
+	}
+}
+
 func newTestManager(t *testing.T, bootstrapEmail, bootstrapPassword string) *Manager {
 	t.Helper()
 

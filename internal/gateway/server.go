@@ -449,7 +449,7 @@ func (s *Server) allSupportedScopes() []string {
 	return scopes
 }
 
-func newReverseProxy(route config.Route) (http.Handler, error) {
+func (s *Server) newReverseProxy(route config.Route) (http.Handler, error) {
 	target, err := url.Parse(route.Upstream)
 	if err != nil {
 		return nil, fmt.Errorf("parse route %q upstream: %w", route.ID, err)
@@ -492,6 +492,9 @@ func newReverseProxy(route config.Route) (http.Handler, error) {
 					}
 					pr.Out.Header.Set(headerName, value)
 				}
+			}
+			if upstreamBearer, ok := s.authManager.ResolveRouteUpstreamBearer(route.ID, identity); ok {
+				pr.Out.Header.Set("Authorization", "Bearer "+upstreamBearer)
 			}
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {

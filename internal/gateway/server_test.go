@@ -95,6 +95,97 @@ func TestProxyChallengesWithoutBearerToken(t *testing.T) {
 	}
 }
 
+func TestProxySetsConfiguredUpstreamBearer(t *testing.T) {
+	seenAuthorization := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenAuthorization <- r.Header.Get("Authorization")
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	}))
+	defer upstream.Close()
+
+	route := config.Route{
+		ID:              "n8n",
+		DisplayName:     "n8n MCP",
+		PathPrefix:      "/n8n",
+		Upstream:        upstream.URL,
+		UpstreamMCPPath: "/mcp",
+	}
+	if err := config.NormalizeRoute(&route); err != nil {
+		t.Fatalf("normalize route: %v", err)
+	}
+	handler := newTestServerWithRoutes(t, []config.Route{route})
+	user, err := handler.authManager.CreateUser("user@example.com", "super-secret-password", false)
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	gatewayToken, _, err := handler.authManager.CreatePersonalAccessToken(user.ID, "test", time.Hour)
+	if err != nil {
+		t.Fatalf("create gateway token: %v", err)
+	}
+	if err := handler.authManager.SetRouteUpstreamBearer("n8n", "n8n-internal-token"); err != nil {
+		t.Fatalf("set upstream bearer: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "https://mcp.example.com/n8n/mcp", strings.NewReader(`{}`))
+	req.Header.Set("Authorization", "Bearer "+gatewayToken)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := <-seenAuthorization; got != "Bearer n8n-internal-token" {
+		t.Fatalf("expected upstream bearer, got %q", got)
+	}
+}
+
+func TestProxyPrefersUserSpecificUpstreamBearer(t *testing.T) {
+	seenAuthorization := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenAuthorization <- r.Header.Get("Authorization")
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	}))
+	defer upstream.Close()
+
+	route := config.Route{
+		ID:              "n8n",
+		DisplayName:     "n8n MCP",
+		PathPrefix:      "/n8n",
+		Upstream:        upstream.URL,
+		UpstreamMCPPath: "/mcp",
+	}
+	if err := config.NormalizeRoute(&route); err != nil {
+		t.Fatalf("normalize route: %v", err)
+	}
+	handler := newTestServerWithRoutes(t, []config.Route{route})
+	user, err := handler.authManager.CreateUser("user@example.com", "super-secret-password", false)
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	gatewayToken, _, err := handler.authManager.CreatePersonalAccessToken(user.ID, "test", time.Hour)
+	if err != nil {
+		t.Fatalf("create gateway token: %v", err)
+	}
+	if err := handler.authManager.SetRouteUpstreamBearer("n8n", "global-token"); err != nil {
+		t.Fatalf("set global bearer: %v", err)
+	}
+	if err := handler.authManager.SetRouteUserUpstreamBearer("n8n", user.ID, "user-token"); err != nil {
+		t.Fatalf("set user bearer: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "https://mcp.example.com/n8n/mcp", strings.NewReader(`{}`))
+	req.Header.Set("Authorization", "Bearer "+gatewayToken)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := <-seenAuthorization; got != "Bearer user-token" {
+		t.Fatalf("expected user-specific upstream bearer, got %q", got)
+	}
+}
+
 func TestRouteInfo(t *testing.T) {
 	handler := newTestServer(t)
 

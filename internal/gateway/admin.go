@@ -65,6 +65,8 @@ type dashboardRouteView struct {
 	PassAuthorization        bool
 	ForwardHeadersCount      int
 	UpstreamEnvironmentCount int
+	UpstreamBearerConfigured bool
+	UserUpstreamBearerCount  int
 }
 
 type dashboardDeploymentView struct {
@@ -180,35 +182,39 @@ type stdioInstallFormData struct {
 }
 
 type routeFormData struct {
-	OriginalID            string
-	ID                    string
-	DisplayName           string
-	Transport             string
-	PathPrefix            string
-	Upstream              string
-	UpstreamMCPPath       string
-	ScopesSupported       string
-	PassAuthorization     bool
-	ResourceDocumentation string
-	MCPHTTPSessionMode    string
-	AccessVisibility      string
-	AccessMode            string
-	AllowedUsers          []string
-	AllowedGroups         []string
-	DeniedUsers           []string
-	DeniedGroups          []string
-	ForwardHeaders        string
-	UpstreamEnvironment   string
-	StdioCommand          string
-	StdioArgs             string
-	StdioEnv              string
-	StdioWorkingDir       string
-	OpenAPISpecPath       string
-	OpenAPISpecURL        string
-	OpenAPIBaseURL        string
-	OpenAPIHeaders        string
-	OpenAPITimeoutSeconds string
-	Notes                 string
+	OriginalID                   string
+	ID                           string
+	DisplayName                  string
+	Transport                    string
+	PathPrefix                   string
+	Upstream                     string
+	UpstreamMCPPath              string
+	ScopesSupported              string
+	PassAuthorization            bool
+	ResourceDocumentation        string
+	MCPHTTPSessionMode           string
+	AccessVisibility             string
+	AccessMode                   string
+	AllowedUsers                 []string
+	AllowedGroups                []string
+	DeniedUsers                  []string
+	DeniedGroups                 []string
+	ForwardHeaders               string
+	UpstreamEnvironment          string
+	UpstreamBearerToken          string
+	ClearUpstreamBearer          bool
+	UpstreamBearerConfigured     bool
+	UserUpstreamBearerConfigured map[string]bool
+	StdioCommand                 string
+	StdioArgs                    string
+	StdioEnv                     string
+	StdioWorkingDir              string
+	OpenAPISpecPath              string
+	OpenAPISpecURL               string
+	OpenAPIBaseURL               string
+	OpenAPIHeaders               string
+	OpenAPITimeoutSeconds        string
+	Notes                        string
 }
 
 func (s *Server) handleAdminDashboard(w http.ResponseWriter, r *http.Request) {
@@ -287,8 +293,58 @@ func (s *Server) handleAdminRouteSave(w http.ResponseWriter, r *http.Request) {
 		s.renderAdminDashboard(w, r, identity, formData, "", err.Error(), http.StatusBadRequest)
 		return
 	}
+	if err := s.authManager.RenameRouteSecrets(formData.OriginalID, route.ID); err != nil {
+		s.renderAdminDashboard(w, r, identity, formData, "", err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := s.saveRouteUpstreamBearerForm(r, route.ID); err != nil {
+		s.renderAdminDashboard(w, r, identity, formData, "", err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	http.Redirect(w, r, adminRedirectURL(route.ID, "Route saved successfully", ""), http.StatusFound)
+}
+
+func (s *Server) saveRouteUpstreamBearerForm(r *http.Request, routeID string) error {
+	token := strings.TrimSpace(r.FormValue("upstream_bearer_token"))
+	clearGlobal := formCheckbox(r, "clear_upstream_bearer")
+	if token != "" {
+		if err := s.authManager.SetRouteUpstreamBearer(routeID, token); err != nil {
+			return err
+		}
+	} else if clearGlobal {
+		if err := s.authManager.SetRouteUpstreamBearer(routeID, ""); err != nil {
+			return err
+		}
+	}
+
+	clearUsers := map[string]bool{}
+	for _, userID := range r.Form["clear_user_upstream_bearer"] {
+		clearUsers[strings.TrimSpace(userID)] = true
+	}
+	userIDs := r.Form["upstream_bearer_user_id"]
+	userTokens := r.Form["upstream_bearer_user_token"]
+	for idx, userID := range userIDs {
+		userID = strings.TrimSpace(userID)
+		if userID == "" {
+			continue
+		}
+		token := ""
+		if idx < len(userTokens) {
+			token = strings.TrimSpace(userTokens[idx])
+		}
+		switch {
+		case token != "":
+			if err := s.authManager.SetRouteUserUpstreamBearer(routeID, userID, token); err != nil {
+				return err
+			}
+		case clearUsers[userID]:
+			if err := s.authManager.SetRouteUserUpstreamBearer(routeID, userID, ""); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (s *Server) storeOpenAPISpecUpload(r *http.Request, routeID string) (string, error) {
@@ -1002,6 +1058,7 @@ func (s *Server) requireAdmin(w http.ResponseWriter, r *http.Request) (*auth.Ide
 func (s *Server) renderAdminDashboard(w http.ResponseWriter, r *http.Request, identity *auth.Identity, selected routeFormData, notice, errText string, status int) {
 	csrfToken := s.authManager.EnsureCSRFToken(w, r)
 	routes := s.routesSnapshot()
+	s.decorateRouteSecretFormData(&selected)
 	slices.SortFunc(routes, func(a, b config.Route) int {
 		switch {
 		case a.NormalizedPathPrefix < b.NormalizedPathPrefix:
@@ -1044,6 +1101,7 @@ func (s *Server) renderAdminDashboard(w http.ResponseWriter, r *http.Request, id
 
 	routeViews := make([]dashboardRouteView, 0, len(routes))
 	for _, route := range routes {
+		globalBearer, userBearers := s.authManager.RouteUpstreamBearerConfigured(route.ID)
 		routeViews = append(routeViews, dashboardRouteView{
 			ID:                       route.ID,
 			DisplayName:              route.DisplayName,
@@ -1059,6 +1117,8 @@ func (s *Server) renderAdminDashboard(w http.ResponseWriter, r *http.Request, id
 			PassAuthorization:        route.PassAuthorization,
 			ForwardHeadersCount:      len(route.ForwardHeaders),
 			UpstreamEnvironmentCount: countNonSessionEnv(route.UpstreamEnvironment),
+			UpstreamBearerConfigured: globalBearer,
+			UserUpstreamBearerCount:  len(userBearers),
 		})
 	}
 	deploymentViews, dockerErr := s.dashboardDeploymentViews(r.Context(), routes)
@@ -1148,6 +1208,22 @@ func (s *Server) dashboardSelectedUser(r *http.Request) *dashboardUserDetailView
 	}
 }
 
+func (s *Server) decorateRouteSecretFormData(form *routeFormData) {
+	if form == nil {
+		return
+	}
+	routeID := strings.TrimSpace(form.OriginalID)
+	if routeID == "" {
+		routeID = strings.TrimSpace(form.ID)
+	}
+	if routeID == "" {
+		return
+	}
+	globalBearer, userBearers := s.authManager.RouteUpstreamBearerConfigured(routeID)
+	form.UpstreamBearerConfigured = globalBearer
+	form.UserUpstreamBearerConfigured = userBearers
+}
+
 func parseRouteForm(r *http.Request) (routeFormData, config.Route, error) {
 	formData := routeFormData{
 		OriginalID:            strings.TrimSpace(r.FormValue("original_id")),
@@ -1169,6 +1245,8 @@ func parseRouteForm(r *http.Request) (routeFormData, config.Route, error) {
 		DeniedGroups:          valuesFromSelection(r.Form["denied_groups"]),
 		ForwardHeaders:        normalizeMultiline(r.FormValue("forward_headers")),
 		UpstreamEnvironment:   normalizeMultiline(r.FormValue("upstream_environment")),
+		UpstreamBearerToken:   strings.TrimSpace(r.FormValue("upstream_bearer_token")),
+		ClearUpstreamBearer:   formCheckbox(r, "clear_upstream_bearer"),
 		StdioCommand:          strings.TrimSpace(r.FormValue("stdio_command")),
 		StdioArgs:             normalizeMultiline(r.FormValue("stdio_args")),
 		StdioEnv:              normalizeMultiline(r.FormValue("stdio_env")),
@@ -1955,10 +2033,18 @@ func accessDecision(form routeFormData, subjectType, value string) string {
 	return ""
 }
 
+func upstreamBearerConfigured(form routeFormData, userID string) bool {
+	if len(form.UserUpstreamBearerConfigured) == 0 {
+		return false
+	}
+	return form.UserUpstreamBearerConfigured[userID]
+}
+
 func renderAdminHTML(w http.ResponseWriter, status int, data dashboardData) {
 	t := template.Must(template.New("admin").Funcs(template.FuncMap{
-		"accessDecision": accessDecision,
-		"has":            hasString,
+		"accessDecision":           accessDecision,
+		"has":                      hasString,
+		"upstreamBearerConfigured": upstreamBearerConfigured,
 	}).Parse(adminDashboardTemplate))
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
@@ -2293,6 +2379,7 @@ const adminDashboardTemplate = `
                   <span>OpenAPI Adapter: <code>{{.PathPrefix}}/openapi.json</code></span>
                   <span>Upstream: <code>{{.Upstream}}</code>{{if eq .Transport "http"}}<code>{{.UpstreamMCPPath}}</code>{{end}}</span>
                   <span>Headers: {{.ForwardHeadersCount}} | Env: {{.UpstreamEnvironmentCount}} | Pass Auth: {{if .PassAuthorization}}yes{{else}}no{{end}}</span>
+                  <span>Upstream Bearer: {{if .UpstreamBearerConfigured}}global{{else}}none{{end}}{{if .UserUpstreamBearerCount}} + {{.UserUpstreamBearerCount}} user{{end}}</span>
                   {{if .MCPHTTPSessionMode}}<span>Session: <code>{{.MCPHTTPSessionMode}}</code></span>{{end}}
                 </div>
                 <div class="route-actions">
@@ -2481,6 +2568,49 @@ const adminDashboardTemplate = `
                     <label for="pass_authorization_header" style="margin:0;">Inbound Authorization an Upstream weiterreichen</label>
                     <p class="helper">Aus lassen, wenn der Gateway interne Header wie <code>Authorization: Bearer ...</code> setzen soll.</p>
                   </div>
+                </div>
+                <div class="full">
+                  <details>
+                    <summary>Upstream Bearer Auth</summary>
+                    <p class="helper">Fuer MCP-Server wie n8n-mcp, die zusaetzlich zum Gateway-OAuth noch einen internen Bearer erwarten. Werte werden verschluesselt im Auth-Store gespeichert und nicht nach <code>routes.yaml</code> exportiert.</p>
+                    <div class="field-grid" style="margin-top:.9rem;">
+                      <div class="full">
+                        <label for="upstream_bearer_token">Globaler Upstream Bearer</label>
+                        <input id="upstream_bearer_token" name="upstream_bearer_token" type="password" placeholder="{{if .SelectedRoute.UpstreamBearerConfigured}}Token ist gesetzt; leer lassen zum Beibehalten{{else}}n8n AUTH_TOKEN oder anderer Upstream-Bearer{{end}}">
+                        <p class="helper">{{if .SelectedRoute.UpstreamBearerConfigured}}Aktuell ist ein globaler Upstream-Bearer gesetzt.{{else}}Kein globaler Upstream-Bearer gesetzt.{{end}} Nutzer-spezifische Tokens haben Vorrang.</p>
+                      </div>
+                      <div class="full checkbox">
+                        <input id="clear_upstream_bearer" name="clear_upstream_bearer" type="checkbox">
+                        <div>
+                          <label for="clear_upstream_bearer" style="margin:0;">Globalen Upstream Bearer loeschen</label>
+                          <p class="helper">Nur aktivieren, wenn der gespeicherte globale Bearer entfernt werden soll.</p>
+                        </div>
+                      </div>
+                      <div class="full">
+                        <table class="access-table">
+                          <thead>
+                            <tr><th>Nutzer</th><th>Status</th><th>Neuer Bearer</th><th>Loeschen</th></tr>
+                          </thead>
+                          <tbody>
+                            {{range .Users}}
+                              {{$hasBearer := upstreamBearerConfigured $.SelectedRoute .ID}}
+                              <tr>
+                                <td>{{.Email}}</td>
+                                <td>{{if $hasBearer}}gesetzt{{else}}default/global{{end}}</td>
+                                <td>
+                                  <input type="hidden" name="upstream_bearer_user_id" value="{{.ID}}">
+                                  <input name="upstream_bearer_user_token" type="password" placeholder="{{if $hasBearer}}Leer lassen zum Beibehalten{{else}}Optionaler Nutzer-Bearer{{end}}">
+                                </td>
+                                <td style="text-align:center;">
+                                  <input name="clear_user_upstream_bearer" type="checkbox" value="{{.ID}}" {{if not $hasBearer}}disabled{{end}}>
+                                </td>
+                              </tr>
+                            {{end}}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  </details>
                 </div>
                 <div class="full">
                   <label for="forward_headers">Forward Headers</label>

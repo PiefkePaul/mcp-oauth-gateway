@@ -259,7 +259,7 @@ func (s *Server) buildRouteRuntime(routes []config.Route) (map[string]routeRunti
 		case "openapi":
 			handler, err = newOpenAPIBridge(route)
 		default:
-			handler, err = newReverseProxy(route)
+			handler, err = s.newReverseProxy(route)
 		}
 		if err != nil {
 			closeRouteRuntimes(runtimes)

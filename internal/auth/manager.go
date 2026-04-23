@@ -207,8 +207,10 @@ type personalTokenRecord struct {
 }
 
 type routeSecretRecord struct {
-	Env       map[string]string `json:"env,omitempty"`
-	UpdatedAt int64             `json:"updated_at"`
+	Env                 map[string]string `json:"env,omitempty"`
+	UpstreamBearer      string            `json:"upstream_bearer,omitempty"`
+	UserUpstreamBearers map[string]string `json:"user_upstream_bearers,omitempty"`
+	UpdatedAt           int64             `json:"updated_at"`
 }
 
 type tokenResponse struct {

@@ -87,13 +87,17 @@ func (m *Manager) SetRouteEnvSecrets(routeID string, values map[string]string) e
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if len(normalized) == 0 {
-		delete(m.data.RouteSecrets, routeID)
+		record := m.data.RouteSecrets[routeID]
+		if record != nil {
+			record.Env = nil
+			record.UpdatedAt = time.Now().Unix()
+			m.deleteEmptyRouteSecretLocked(routeID)
+		}
 		return m.saveLocked()
 	}
-	m.data.RouteSecrets[routeID] = &routeSecretRecord{
-		Env:       normalized,
-		UpdatedAt: time.Now().Unix(),
-	}
+	record := m.ensureRouteSecretLocked(routeID)
+	record.Env = normalized
+	record.UpdatedAt = time.Now().Unix()
 	return m.saveLocked()
 }
 
@@ -154,6 +158,157 @@ func (m *Manager) DeleteRouteSecrets(routeID string) error {
 	}
 	delete(m.data.RouteSecrets, routeID)
 	return m.saveLocked()
+}
+
+func (m *Manager) RenameRouteSecrets(oldRouteID, newRouteID string) error {
+	oldRouteID = strings.TrimSpace(oldRouteID)
+	newRouteID = strings.TrimSpace(newRouteID)
+	if oldRouteID == "" || newRouteID == "" || oldRouteID == newRouteID {
+		return nil
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	oldRecord := m.data.RouteSecrets[oldRouteID]
+	if oldRecord == nil {
+		return nil
+	}
+	newRecord := m.data.RouteSecrets[newRouteID]
+	if newRecord == nil {
+		m.data.RouteSecrets[newRouteID] = oldRecord
+		delete(m.data.RouteSecrets, oldRouteID)
+		return m.saveLocked()
+	}
+	if newRecord.Env == nil {
+		newRecord.Env = map[string]string{}
+	}
+	for key, value := range oldRecord.Env {
+		if _, exists := newRecord.Env[key]; !exists {
+			newRecord.Env[key] = value
+		}
+	}
+	if strings.TrimSpace(newRecord.UpstreamBearer) == "" {
+		newRecord.UpstreamBearer = oldRecord.UpstreamBearer
+	}
+	if newRecord.UserUpstreamBearers == nil {
+		newRecord.UserUpstreamBearers = map[string]string{}
+	}
+	for userID, value := range oldRecord.UserUpstreamBearers {
+		if _, exists := newRecord.UserUpstreamBearers[userID]; !exists {
+			newRecord.UserUpstreamBearers[userID] = value
+		}
+	}
+	newRecord.UpdatedAt = time.Now().Unix()
+	delete(m.data.RouteSecrets, oldRouteID)
+	m.deleteEmptyRouteSecretLocked(newRouteID)
+	return m.saveLocked()
+}
+
+func (m *Manager) SetRouteUpstreamBearer(routeID, token string) error {
+	routeID = strings.TrimSpace(routeID)
+	if routeID == "" {
+		return fmt.Errorf("route id is required")
+	}
+	token = strings.TrimSpace(token)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	record := m.ensureRouteSecretLocked(routeID)
+	record.UpstreamBearer = token
+	record.UpdatedAt = time.Now().Unix()
+	m.deleteEmptyRouteSecretLocked(routeID)
+	return m.saveLocked()
+}
+
+func (m *Manager) SetRouteUserUpstreamBearer(routeID, userID, token string) error {
+	routeID = strings.TrimSpace(routeID)
+	userID = strings.TrimSpace(userID)
+	if routeID == "" {
+		return fmt.Errorf("route id is required")
+	}
+	if userID == "" {
+		return fmt.Errorf("user id is required")
+	}
+	token = strings.TrimSpace(token)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.data.Users[userID]; !ok {
+		return fmt.Errorf("user not found")
+	}
+	record := m.ensureRouteSecretLocked(routeID)
+	if token == "" {
+		delete(record.UserUpstreamBearers, userID)
+	} else {
+		if record.UserUpstreamBearers == nil {
+			record.UserUpstreamBearers = map[string]string{}
+		}
+		record.UserUpstreamBearers[userID] = token
+	}
+	record.UpdatedAt = time.Now().Unix()
+	m.deleteEmptyRouteSecretLocked(routeID)
+	return m.saveLocked()
+}
+
+func (m *Manager) RouteUpstreamBearerConfigured(routeID string) (bool, map[string]bool) {
+	routeID = strings.TrimSpace(routeID)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	record := m.data.RouteSecrets[routeID]
+	if record == nil {
+		return false, nil
+	}
+	userConfigured := make(map[string]bool, len(record.UserUpstreamBearers))
+	for userID, token := range record.UserUpstreamBearers {
+		if strings.TrimSpace(token) != "" {
+			userConfigured[userID] = true
+		}
+	}
+	return strings.TrimSpace(record.UpstreamBearer) != "", userConfigured
+}
+
+func (m *Manager) ResolveRouteUpstreamBearer(routeID string, identity *Identity) (string, bool) {
+	routeID = strings.TrimSpace(routeID)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	record := m.data.RouteSecrets[routeID]
+	if record == nil {
+		return "", false
+	}
+	if identity != nil {
+		if token := strings.TrimSpace(record.UserUpstreamBearers[identity.UserID]); token != "" {
+			return token, true
+		}
+	}
+	if token := strings.TrimSpace(record.UpstreamBearer); token != "" {
+		return token, true
+	}
+	return "", false
+}
+
+func (m *Manager) ensureRouteSecretLocked(routeID string) *routeSecretRecord {
+	record := m.data.RouteSecrets[routeID]
+	if record == nil {
+		record = &routeSecretRecord{}
+		m.data.RouteSecrets[routeID] = record
+	}
+	if record.Env == nil {
+		record.Env = map[string]string{}
+	}
+	if record.UserUpstreamBearers == nil {
+		record.UserUpstreamBearers = map[string]string{}
+	}
+	return record
+}
+
+func (m *Manager) deleteEmptyRouteSecretLocked(routeID string) {
+	record := m.data.RouteSecrets[routeID]
+	if record == nil {
+		return
+	}
+	if len(record.Env) == 0 && strings.TrimSpace(record.UpstreamBearer) == "" && len(record.UserUpstreamBearers) == 0 {
+		delete(m.data.RouteSecrets, routeID)
+	}
 }
 
 func parseRouteEnvSecretRef(ref string) (routeID, name string, ok bool) {
@@ -376,6 +531,10 @@ func (m *Manager) DeleteUser(userID string) error {
 		if record.UserID == userID {
 			delete(m.data.PersonalTokens, tokenID)
 		}
+	}
+	for routeID, record := range m.data.RouteSecrets {
+		delete(record.UserUpstreamBearers, userID)
+		m.deleteEmptyRouteSecretLocked(routeID)
 	}
 	return m.saveLocked()
 }

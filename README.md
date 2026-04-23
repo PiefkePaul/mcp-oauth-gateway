@@ -254,6 +254,7 @@ Dort kannst du:
 - Routen als public oder private markieren
 - Routen auf alle angemeldeten Nutzer, bestimmte Nutzer/Gruppen oder nur Admins beschraenken
 - Gruppen anlegen und Nutzern zuweisen
+- interne Upstream-Bearer fuer MCP-Server wie n8n-mcp verschluesselt hinterlegen, global pro Route oder nutzerspezifisch
 - Deployment-Metadaten wie `MCP_HTTP_SESSION_MODE` oder interne `AUTH_TOKEN`-Werte fuer Upstreams dokumentieren
 - Benutzer anlegen, loeschen und Admin-Rechte vergeben
 - `routes.yaml` importieren und exportieren
@@ -262,7 +263,17 @@ Wichtig:
 
 - Das Dashboard aendert die Gateway-Routen live und schreibt sie nach `routes.yaml` zurueck.
 - Upstream-Umgebungsvariablen werden bei HTTP-Routen als Deployment-Metadaten gespeichert. Bei manuell gepflegten STDIO-Routen werden `stdio.env`-Werte an den gestarteten Prozess uebergeben; vom Installer erfasste Env-Secrets werden verschluesselt gespeichert und per `stdio.env_secret_refs` referenziert.
-- Full Export kann interne Tokens in `forward_headers`, `upstream_environment` oder manuellem `stdio.env` enthalten. Installer-Secrets bleiben im verschluesselten Auth-Store und werden nicht als Klartext exportiert.
+- Full Export kann interne Tokens in `forward_headers`, `upstream_environment` oder manuellem `stdio.env` enthalten. Installer-Secrets und Upstream-Bearer aus dem Dashboard bleiben im verschluesselten Auth-Store und werden nicht als Klartext exportiert.
+
+### Upstream Bearer Auth
+
+Wenn ein MCP-Upstream selbst einen Bearer erwartet, z.B. `ghcr.io/czlonkowski/n8n-mcp` mit `AUTH_TOKEN`, speichere diesen im Dashboard in der Route unter `Erweiterte Einstellungen -> Upstream Bearer Auth`. Der Gateway nutzt weiterhin OAuth fuer externe Clients, ersetzt aber beim Request zum Upstream den Header:
+
+```http
+Authorization: Bearer <interner-upstream-token>
+```
+
+Nutzerspezifische Upstream-Bearer haben Vorrang vor dem globalen Route-Bearer. So kann ein gemeinsamer Gateway-OAuth vor mehreren MCPs liegen, waehrend einzelne Upstreams weiterhin ihre eigenen Secrets behalten.
 
 ## Open WebUI Hinweise
 
