@@ -60,7 +60,7 @@ func (s *Server) handleRouteOpenAPISpec(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	caller := newMCPRouteCaller(route, handler, identity, "")
+	caller := newMCPRouteCaller(route, handler, identity, r.Header.Get("Authorization"))
 	defer caller.close(r.Context())
 
 	tools, err := caller.listTools(r.Context())
@@ -326,6 +326,11 @@ func (c *mcpRouteCaller) sendRequest(ctx context.Context, method string, params 
 		return nil, fmt.Errorf("MCP HTTP status %d: %s", status, strings.TrimSpace(string(body)))
 	}
 
+	responseBody, err := decodeMCPHTTPResponseBody(headers, body)
+	if err != nil {
+		return nil, err
+	}
+
 	var response struct {
 		Result json.RawMessage `json:"result"`
 		Error  *struct {
@@ -333,7 +338,7 @@ func (c *mcpRouteCaller) sendRequest(ctx context.Context, method string, params 
 			Message string `json:"message"`
 		} `json:"error"`
 	}
-	if err := json.Unmarshal(body, &response); err != nil {
+	if err := json.Unmarshal(responseBody, &response); err != nil {
 		return nil, fmt.Errorf("decode MCP JSON-RPC response: %w", err)
 	}
 	if response.Error != nil {
@@ -346,6 +351,46 @@ func (c *mcpRouteCaller) sendRequest(ctx context.Context, method string, params 
 		c.sessionID = sessionID
 	}
 	return response.Result, nil
+}
+
+func decodeMCPHTTPResponseBody(headers http.Header, body []byte) ([]byte, error) {
+	trimmed := bytes.TrimSpace(body)
+	contentType := strings.ToLower(headers.Get("Content-Type"))
+	if !strings.Contains(contentType, "text/event-stream") && !bytes.HasPrefix(trimmed, []byte("event:")) && !bytes.HasPrefix(trimmed, []byte("data:")) {
+		return trimmed, nil
+	}
+	payload, err := firstJSONDataFromSSE(trimmed)
+	if err != nil {
+		return nil, err
+	}
+	return payload, nil
+}
+
+func firstJSONDataFromSSE(body []byte) ([]byte, error) {
+	events := strings.Split(strings.ReplaceAll(string(body), "\r\n", "\n"), "\n\n")
+	for _, event := range events {
+		var dataLines []string
+		for _, line := range strings.Split(event, "\n") {
+			line = strings.TrimRight(line, "\r")
+			if !strings.HasPrefix(line, "data:") {
+				continue
+			}
+			data := strings.TrimPrefix(line, "data:")
+			data = strings.TrimPrefix(data, " ")
+			dataLines = append(dataLines, data)
+		}
+		if len(dataLines) == 0 {
+			continue
+		}
+		payload := strings.TrimSpace(strings.Join(dataLines, "\n"))
+		if payload == "" || payload == "[DONE]" {
+			continue
+		}
+		if strings.HasPrefix(payload, "{") || strings.HasPrefix(payload, "[") {
+			return []byte(payload), nil
+		}
+	}
+	return nil, fmt.Errorf("MCP SSE response did not contain JSON data")
 }
 
 func (c *mcpRouteCaller) sendNotification(ctx context.Context, method string, params any) error {

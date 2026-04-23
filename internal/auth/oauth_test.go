@@ -205,11 +205,11 @@ func TestAuthorizePreflightRedirectsUnauthenticatedAfterOAuthValidation(t *testi
 	}
 }
 
-func TestAuthorizePreflightReportsInvalidClientBeforeLoginRedirect(t *testing.T) {
+func TestAuthorizePreflightLazilyAcceptsUnregisteredOpenWebUIClient(t *testing.T) {
 	manager := newTestManager(t, "admin@example.com", "super-secret-password")
 
 	values := url.Values{
-		"client_id":             {"stale-open-webui-client"},
+		"client_id":             {"Hhds3gZ089JVr1z3tLlNJEmyCmf0rPTK"},
 		"redirect_uri":          {"https://chat.example.com/oauth/clients/mcp:legal/callback"},
 		"response_type":         {"code"},
 		"scope":                 {"mcp"},
@@ -222,11 +222,63 @@ func TestAuthorizePreflightReportsInvalidClientBeforeLoginRedirect(t *testing.T)
 
 	manager.HandleAuthorize(rec, req)
 
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("expected invalid client response, got %d with body %q", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusFound {
+		t.Fatalf("expected login redirect for lazily accepted client, got %d with body %q", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), `"invalid_client"`) {
-		t.Fatalf("expected invalid_client response, got %q", rec.Body.String())
+
+	client, err := manager.lookupClient("Hhds3gZ089JVr1z3tLlNJEmyCmf0rPTK")
+	if err != nil {
+		t.Fatalf("expected lazy client to be stored: %v", err)
+	}
+	if !client.AdoptSecretOnTokenExchange {
+		t.Fatalf("expected lazy client to adopt secret on token exchange")
+	}
+}
+
+func TestLazyAuthorizeClientAdoptsSecretDuringCodeExchange(t *testing.T) {
+	manager := newTestManager(t, "admin@example.com", "super-secret-password")
+	clientID := "Hhds3gZ089JVr1z3tLlNJEmyCmf0rPTK"
+	redirectURI := "https://chat.example.com/oauth/clients/mcp:legal/callback"
+	verifier := "abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz"
+	sum := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
+
+	params, client, err := manager.parseAuthorizeRequest(url.Values{
+		"client_id":             {clientID},
+		"redirect_uri":          {redirectURI},
+		"response_type":         {"code"},
+		"scope":                 {"mcp"},
+		"state":                 {"state-value"},
+		"code_challenge":        {challenge},
+		"code_challenge_method": {"S256"},
+	})
+	if err != nil {
+		t.Fatalf("parse authorize request: %v", err)
+	}
+	if client.ID != clientID || !client.AdoptSecretOnTokenExchange {
+		t.Fatalf("expected lazy client, got %#v", client)
+	}
+
+	userID := manager.ListUsers()[0].ID
+	code, err := manager.createAuthorizationCode(userID, params)
+	if err != nil {
+		t.Fatalf("create authorization code: %v", err)
+	}
+
+	tokenSet, err := manager.exchangeAuthorizationCode(clientID, "openwebui-stored-secret", "client_secret_post", code, redirectURI, verifier, "")
+	if err != nil {
+		t.Fatalf("exchange authorization code: %v", err)
+	}
+	if tokenSet.AccessToken == "" || tokenSet.RefreshToken == "" {
+		t.Fatalf("expected token set, got %#v", tokenSet)
+	}
+
+	storedClient, err := manager.lookupClient(clientID)
+	if err != nil {
+		t.Fatalf("lookup client: %v", err)
+	}
+	if storedClient.AdoptSecretOnTokenExchange || storedClient.Secret != "openwebui-stored-secret" {
+		t.Fatalf("expected client secret to be bound, got %#v", storedClient)
 	}
 }
 

@@ -270,8 +270,14 @@ Fuer OpenAPI-Tool-Server in Open WebUI ist die URL meistens die Route-Basis, nic
 
 - OpenAPI Base URL: `https://mcp.example.com/<route>`
 - Vom Gateway bereitgestellte Spec: `https://mcp.example.com/<route>/openapi.json`
+- OpenAPI Auth fuer geschuetzte Routen: `Bearer` waehlen und im Gateway unter `/account` einen `OpenAPI / Bearer Token` erzeugen. Die Open-WebUI-Option `auth` leitet den OAuth-Token des Open-WebUI-Systembenutzers weiter und ist kein Gateway-Token.
 
-Die Open-WebUI-Auth-Option "auth" leitet den OAuth-Zugriffstoken des Open-WebUI-Systembenutzers weiter. Das ist nicht automatisch ein Gateway-Token. Fuer geschuetzte Gateway-Routen brauchst du entweder den MCP-OAuth-Flow oder einen Gateway-Bearer-Token, sobald der Client nur OpenAPI/Bearer statt MCP-OAuth spricht.
+Fuer MCP Streamable HTTP in Open WebUI:
+
+- Type: `MCP (Streamable HTTP)`
+- Server URL: `https://mcp.example.com/<route>/mcp`
+- Auth: `OAuth 2.1`
+- `Register Client` ausfuehren, speichern, danach das Tool im Chat manuell aktivieren und den Browser-Flow abschliessen.
 
 Open WebUI speichert nach `Register Client` die OAuth-Client-Informationen in seiner eigenen Tool-Server-Konfiguration. Wenn du die MCP-URL oder die Gateway-Domain aenderst, reicht es nicht immer, nur das URL-Feld anzupassen. Registriere den Client erneut und speichere die Verbindung danach erneut.
 

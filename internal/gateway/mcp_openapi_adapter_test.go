@@ -2,6 +2,8 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sort"
@@ -168,6 +170,40 @@ done`
 	server.ServeHTTP(unauthorizedRec, unauthorizedReq)
 	if unauthorizedRec.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 without bearer token, got %d: %s", unauthorizedRec.Code, unauthorizedRec.Body.String())
+	}
+}
+
+func TestMCPRouteCallerDecodesSSEResponses(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			ID     int    `json:"id"`
+			Method string `json:"method"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		switch request.Method {
+		case "initialize":
+			fmt.Fprintf(w, "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"serverInfo\":{\"name\":\"sse\",\"version\":\"1\"}}}\n\n", request.ID)
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
+		case "tools/list":
+			fmt.Fprintf(w, "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"tools\":[{\"name\":\"sse-tool\",\"inputSchema\":{\"type\":\"object\"}}]}}\n\n", request.ID)
+		default:
+			t.Fatalf("unexpected method %q", request.Method)
+		}
+	})
+	route := config.Route{ID: "sse", PathPrefix: "/sse", NormalizedPathPrefix: "/sse"}
+	caller := newMCPRouteCaller(route, handler, nil, "")
+	defer caller.close(context.Background())
+
+	tools, err := caller.listTools(context.Background())
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+	if got := strings.Join(sortedMCPToolNames(tools), ","); got != "sse-tool" {
+		t.Fatalf("unexpected tools: %s", got)
 	}
 }
 

@@ -121,25 +121,26 @@ type sessionRecord struct {
 }
 
 type clientRecord struct {
-	ID                      string   `json:"id"`
-	Secret                  string   `json:"secret,omitempty"`
-	RegistrationAccessToken string   `json:"registration_access_token,omitempty"`
-	Name                    string   `json:"name"`
-	RedirectURIs            []string `json:"redirect_uris"`
-	GrantTypes              []string `json:"grant_types"`
-	ResponseTypes           []string `json:"response_types"`
-	TokenEndpointAuthMethod string   `json:"token_endpoint_auth_method"`
-	Scope                   string   `json:"scope,omitempty"`
-	ClientURI               string   `json:"client_uri,omitempty"`
-	LogoURI                 string   `json:"logo_uri,omitempty"`
-	TOSURI                  string   `json:"tos_uri,omitempty"`
-	PolicyURI               string   `json:"policy_uri,omitempty"`
-	JwksURI                 string   `json:"jwks_uri,omitempty"`
-	Contacts                []string `json:"contacts,omitempty"`
-	SoftwareID              string   `json:"software_id,omitempty"`
-	SoftwareVersion         string   `json:"software_version,omitempty"`
-	CreatedAt               int64    `json:"created_at"`
-	UpdatedAt               int64    `json:"updated_at,omitempty"`
+	ID                         string   `json:"id"`
+	Secret                     string   `json:"secret,omitempty"`
+	AdoptSecretOnTokenExchange bool     `json:"adopt_secret_on_token_exchange,omitempty"`
+	RegistrationAccessToken    string   `json:"registration_access_token,omitempty"`
+	Name                       string   `json:"name"`
+	RedirectURIs               []string `json:"redirect_uris"`
+	GrantTypes                 []string `json:"grant_types"`
+	ResponseTypes              []string `json:"response_types"`
+	TokenEndpointAuthMethod    string   `json:"token_endpoint_auth_method"`
+	Scope                      string   `json:"scope,omitempty"`
+	ClientURI                  string   `json:"client_uri,omitempty"`
+	LogoURI                    string   `json:"logo_uri,omitempty"`
+	TOSURI                     string   `json:"tos_uri,omitempty"`
+	PolicyURI                  string   `json:"policy_uri,omitempty"`
+	JwksURI                    string   `json:"jwks_uri,omitempty"`
+	Contacts                   []string `json:"contacts,omitempty"`
+	SoftwareID                 string   `json:"software_id,omitempty"`
+	SoftwareVersion            string   `json:"software_version,omitempty"`
+	CreatedAt                  int64    `json:"created_at"`
+	UpdatedAt                  int64    `json:"updated_at,omitempty"`
 }
 
 type clientMetadataRequest struct {
@@ -1269,6 +1270,17 @@ func clientSecretForAuthMethod(method string) string {
 	return randomToken(32)
 }
 
+func validateClientIDForLazyRegistration(clientID string) error {
+	clientID = strings.TrimSpace(clientID)
+	if len(clientID) < 8 || len(clientID) > 200 {
+		return ErrInvalidClient
+	}
+	if strings.ContainsAny(clientID, "/\\\x00\r\n\t ") {
+		return ErrInvalidClient
+	}
+	return nil
+}
+
 func (m *Manager) handleAuthorizeGet(w http.ResponseWriter, r *http.Request) {
 	params, client, err := m.parseAuthorizeRequest(r.URL.Query())
 	if err != nil {
@@ -1391,8 +1403,13 @@ func (m *Manager) parseAuthorizeRequest(values url.Values) (*authorizeParams, *c
 	if params.CodeChallenge == "" || params.CodeChallengeMethod != "S256" {
 		return nil, nil, fmt.Errorf("PKCE with code_challenge_method=S256 is required")
 	}
+	if params.Resource != "" {
+		if err := validateAbsoluteResource(params.Resource); err != nil {
+			return nil, nil, err
+		}
+	}
 
-	client, err := m.lookupClient(params.ClientID)
+	client, err := m.clientForAuthorizeRequest(params)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1402,16 +1419,22 @@ func (m *Manager) parseAuthorizeRequest(values url.Values) (*authorizeParams, *c
 	if !slices.Contains(client.RedirectURIs, params.RedirectURI) {
 		return nil, nil, fmt.Errorf("redirect_uri is not registered for this client")
 	}
-	if params.Resource != "" {
-		if err := validateAbsoluteResource(params.Resource); err != nil {
-			return nil, nil, err
-		}
-	}
 	if params.Scope == "" {
 		params.Scope = "mcp"
 	}
 
 	return params, client, nil
+}
+
+func (m *Manager) clientForAuthorizeRequest(params *authorizeParams) (*clientRecord, error) {
+	client, err := m.lookupClient(params.ClientID)
+	if err == nil {
+		return client, nil
+	}
+	if !errors.Is(err, ErrInvalidClient) {
+		return nil, err
+	}
+	return m.registerLazyAuthorizeClient(params)
 }
 
 func (m *Manager) lookupClient(clientID string) (*clientRecord, error) {
@@ -1423,6 +1446,43 @@ func (m *Manager) lookupClient(clientID string) (*clientRecord, error) {
 	if !ok {
 		return nil, ErrInvalidClient
 	}
+	return client, nil
+}
+
+func (m *Manager) registerLazyAuthorizeClient(params *authorizeParams) (*clientRecord, error) {
+	if err := validateClientIDForLazyRegistration(params.ClientID); err != nil {
+		return nil, err
+	}
+	if err := m.validateRedirectURI(params.RedirectURI); err != nil {
+		return nil, err
+	}
+
+	now := time.Now()
+	client := &clientRecord{
+		ID:                         params.ClientID,
+		Name:                       "MCP Client",
+		RedirectURIs:               []string{params.RedirectURI},
+		GrantTypes:                 []string{"authorization_code", "refresh_token"},
+		ResponseTypes:              []string{"code"},
+		TokenEndpointAuthMethod:    "client_secret_post",
+		Scope:                      defaultIfEmptyString(params.Scope, "mcp"),
+		AdoptSecretOnTokenExchange: true,
+		RegistrationAccessToken:    randomToken(48),
+		CreatedAt:                  now.Unix(),
+		UpdatedAt:                  now.Unix(),
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.cleanupLocked(now)
+	if existing, ok := m.data.Clients[params.ClientID]; ok {
+		return existing, nil
+	}
+	m.data.Clients[client.ID] = client
+	if err := m.saveLocked(); err != nil {
+		return nil, err
+	}
+	log.Printf("oauth lazy client accepted client_id=%s redirect_uri=%q auth_method=%s", client.ID, params.RedirectURI, client.TokenEndpointAuthMethod)
 	return client, nil
 }
 
@@ -1489,6 +1549,12 @@ func (m *Manager) exchangeAuthorizationCode(clientID, clientSecret, clientAuthMe
 	client, ok := m.data.Clients[clientID]
 	if !ok {
 		return nil, ErrInvalidClient
+	}
+	if client.AdoptSecretOnTokenExchange && client.Secret == "" && clientSecret != "" && clientAuthMethod == client.TokenEndpointAuthMethod {
+		client.Secret = clientSecret
+		client.AdoptSecretOnTokenExchange = false
+		client.UpdatedAt = now.Unix()
+		log.Printf("oauth lazy client secret bound client_id=%s auth_method=%s", client.ID, client.TokenEndpointAuthMethod)
 	}
 	if !clientSecretValid(client, clientSecret, clientAuthMethod) {
 		return nil, ErrInvalidClient
@@ -1991,6 +2057,13 @@ func randomToken(numBytes int) string {
 func hashPersonalAccessToken(token string) string {
 	sum := sha256.Sum256([]byte(strings.TrimSpace(token)))
 	return base64.RawURLEncoding.EncodeToString(sum[:])
+}
+
+func defaultIfEmptyString(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return strings.TrimSpace(value)
 }
 
 func normalizeEmail(email string) string {
