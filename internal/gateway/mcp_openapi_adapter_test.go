@@ -107,6 +107,13 @@ done`
 	if !strings.Contains(rec.Body.String(), `"/openapi/tools/hello"`) {
 		t.Fatalf("expected OpenAPI tool path, got %s", rec.Body.String())
 	}
+
+	openWebUIReq := httptest.NewRequest(http.MethodGet, "https://mcp.example.com/hello/openapi.json/openapi.json", nil)
+	openWebUIRec := httptest.NewRecorder()
+	server.ServeHTTP(openWebUIRec, openWebUIReq)
+	if openWebUIRec.Code != http.StatusOK {
+		t.Fatalf("expected Open WebUI compatibility path to return 200, got %d: %s", openWebUIRec.Code, openWebUIRec.Body.String())
+	}
 }
 
 func sortedMCPToolNames(tools []mcpToolDefinition) []string {

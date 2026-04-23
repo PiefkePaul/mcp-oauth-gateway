@@ -79,15 +79,16 @@ type contextKey string
 const identityContextKey contextKey = "mcp_gateway_identity"
 
 type storeData struct {
-	Users         map[string]*userRecord         `json:"users"`
-	Groups        map[string]*groupRecord        `json:"groups"`
-	EmailIndex    map[string]string              `json:"email_index"`
-	Sessions      map[string]*sessionRecord      `json:"sessions"`
-	Clients       map[string]*clientRecord       `json:"clients"`
-	AuthCodes     map[string]*authCodeRecord     `json:"auth_codes"`
-	AccessTokens  map[string]*accessTokenRecord  `json:"access_tokens"`
-	RefreshTokens map[string]*refreshTokenRecord `json:"refresh_tokens"`
-	RouteSecrets  map[string]*routeSecretRecord  `json:"route_secrets,omitempty"`
+	Users          map[string]*userRecord          `json:"users"`
+	Groups         map[string]*groupRecord         `json:"groups"`
+	EmailIndex     map[string]string               `json:"email_index"`
+	Sessions       map[string]*sessionRecord       `json:"sessions"`
+	Clients        map[string]*clientRecord        `json:"clients"`
+	AuthCodes      map[string]*authCodeRecord      `json:"auth_codes"`
+	AccessTokens   map[string]*accessTokenRecord   `json:"access_tokens"`
+	RefreshTokens  map[string]*refreshTokenRecord  `json:"refresh_tokens"`
+	PersonalTokens map[string]*personalTokenRecord `json:"personal_tokens,omitempty"`
+	RouteSecrets   map[string]*routeSecretRecord   `json:"route_secrets,omitempty"`
 }
 
 type encryptedStoreFile struct {
@@ -192,6 +193,18 @@ type refreshTokenRecord struct {
 	IssuedAt  int64  `json:"issued_at"`
 }
 
+type personalTokenRecord struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	TokenHash  string `json:"token_hash"`
+	UserID     string `json:"user_id"`
+	Scope      string `json:"scope"`
+	Resource   string `json:"resource,omitempty"`
+	CreatedAt  int64  `json:"created_at"`
+	ExpiresAt  int64  `json:"expires_at,omitempty"`
+	LastUsedAt int64  `json:"last_used_at,omitempty"`
+}
+
 type routeSecretRecord struct {
 	Env       map[string]string `json:"env,omitempty"`
 	UpdatedAt int64             `json:"updated_at"`
@@ -220,15 +233,16 @@ func NewManager(cfg Config) (*Manager, error) {
 	manager := &Manager{
 		cfg: cfg,
 		data: &storeData{
-			Users:         make(map[string]*userRecord),
-			Groups:        make(map[string]*groupRecord),
-			EmailIndex:    make(map[string]string),
-			Sessions:      make(map[string]*sessionRecord),
-			Clients:       make(map[string]*clientRecord),
-			AuthCodes:     make(map[string]*authCodeRecord),
-			AccessTokens:  make(map[string]*accessTokenRecord),
-			RefreshTokens: make(map[string]*refreshTokenRecord),
-			RouteSecrets:  make(map[string]*routeSecretRecord),
+			Users:          make(map[string]*userRecord),
+			Groups:         make(map[string]*groupRecord),
+			EmailIndex:     make(map[string]string),
+			Sessions:       make(map[string]*sessionRecord),
+			Clients:        make(map[string]*clientRecord),
+			AuthCodes:      make(map[string]*authCodeRecord),
+			AccessTokens:   make(map[string]*accessTokenRecord),
+			RefreshTokens:  make(map[string]*refreshTokenRecord),
+			PersonalTokens: make(map[string]*personalTokenRecord),
+			RouteSecrets:   make(map[string]*routeSecretRecord),
 		},
 	}
 
@@ -659,16 +673,86 @@ func (m *Manager) HandleAccountDeviceDelete(w http.ResponseWriter, r *http.Reque
 	http.Redirect(w, r, "/account?notice="+url.QueryEscape("Device access revoked"), http.StatusFound)
 }
 
-func (m *Manager) renderAccount(w http.ResponseWriter, r *http.Request, identity *Identity, notice, errText string) {
+func (m *Manager) HandleAccountTokenCreate(w http.ResponseWriter, r *http.Request) {
+	identity, err := m.identityFromSession(r)
+	if err != nil {
+		http.Redirect(w, r, "/account/login?next="+url.QueryEscape("/account"), http.StatusFound)
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "unsupported method", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "invalid form", http.StatusBadRequest)
+		return
+	}
+	if !validateCSRFCookie(r) {
+		http.Error(w, "invalid CSRF token", http.StatusBadRequest)
+		return
+	}
+
+	days := 180
+	if rawDays := strings.TrimSpace(r.FormValue("expires_days")); rawDays != "" {
+		parsedDays, err := strconv.Atoi(rawDays)
+		if err != nil || parsedDays < 1 || parsedDays > 3650 {
+			m.renderAccount(w, r, identity, "", "Token validity must be between 1 and 3650 days", "")
+			return
+		}
+		days = parsedDays
+	}
+	rawToken, _, err := m.CreatePersonalAccessToken(identity.UserID, r.FormValue("name"), time.Duration(days)*24*time.Hour)
+	if err != nil {
+		m.renderAccount(w, r, identity, "", err.Error(), "")
+		return
+	}
+	m.renderAccount(w, r, identity, "Bearer token created. Copy it now; it will not be shown again.", "", rawToken)
+}
+
+func (m *Manager) HandleAccountTokenDelete(w http.ResponseWriter, r *http.Request) {
+	identity, err := m.identityFromSession(r)
+	if err != nil {
+		http.Redirect(w, r, "/account/login?next="+url.QueryEscape("/account"), http.StatusFound)
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "unsupported method", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "invalid form", http.StatusBadRequest)
+		return
+	}
+	if !validateCSRFCookie(r) {
+		http.Error(w, "invalid CSRF token", http.StatusBadRequest)
+		return
+	}
+
+	if err := m.RevokeUserPersonalAccessToken(identity.UserID, r.FormValue("token_id")); err != nil {
+		m.renderAccount(w, r, identity, "", err.Error(), "")
+		return
+	}
+	http.Redirect(w, r, "/account?notice="+url.QueryEscape("Bearer token revoked"), http.StatusFound)
+}
+
+func (m *Manager) renderAccount(w http.ResponseWriter, r *http.Request, identity *Identity, notice, errText string, newBearerToken ...string) {
+	token := ""
+	if len(newBearerToken) > 0 {
+		token = newBearerToken[0]
+	}
 	renderHTML(w, accountTemplate, map[string]any{
-		"CSRFToken":  ensureCSRFCookie(w, r),
-		"Email":      identity.Email,
-		"IsAdmin":    identity.IsAdmin,
-		"GroupNames": identity.GroupNames,
-		"Devices":    m.ListUserDevices(identity.UserID),
-		"Notice":     notice,
-		"Error":      errText,
-		"Title":      m.cfg.PortalTitle,
+		"CSRFToken":      ensureCSRFCookie(w, r),
+		"Email":          identity.Email,
+		"IsAdmin":        identity.IsAdmin,
+		"GroupNames":     identity.GroupNames,
+		"Devices":        m.ListUserDevices(identity.UserID),
+		"PersonalTokens": m.ListUserPersonalAccessTokens(identity.UserID),
+		"Notice":         notice,
+		"Error":          errText,
+		"NewBearerToken": token,
+		"Title":          m.cfg.PortalTitle,
 	})
 }
 
@@ -679,24 +763,49 @@ func (m *Manager) ValidateAccessToken(token, resource string) (*Identity, error)
 	m.cleanupLocked(now)
 
 	record, ok := m.data.AccessTokens[token]
-	if !ok {
-		return nil, ErrInvalidToken
-	}
-	if record.ExpiresAt <= now.Unix() {
-		delete(m.data.AccessTokens, token)
-		_ = m.saveLocked()
-		return nil, ErrTokenExpired
-	}
-	if record.Resource != "" && normalizeResource(record.Resource) != normalizeResource(resource) && !m.isGatewayWideResource(record.Resource) {
-		return nil, ErrInvalidToken
+	if ok {
+		if record.ExpiresAt <= now.Unix() {
+			delete(m.data.AccessTokens, token)
+			_ = m.saveLocked()
+			return nil, ErrTokenExpired
+		}
+		if record.Resource != "" && normalizeResource(record.Resource) != normalizeResource(resource) && !m.isGatewayWideResource(record.Resource) {
+			return nil, ErrInvalidToken
+		}
+
+		user, ok := m.data.Users[record.UserID]
+		if !ok {
+			return nil, ErrInvalidToken
+		}
+
+		return m.identityForUserLocked(user), nil
 	}
 
-	user, ok := m.data.Users[record.UserID]
-	if !ok {
-		return nil, ErrInvalidToken
+	tokenHash := hashPersonalAccessToken(token)
+	for _, personalToken := range m.data.PersonalTokens {
+		if !subtleConstantTimeEqual(personalToken.TokenHash, tokenHash) {
+			continue
+		}
+		if personalToken.ExpiresAt > 0 && personalToken.ExpiresAt <= now.Unix() {
+			delete(m.data.PersonalTokens, personalToken.ID)
+			_ = m.saveLocked()
+			return nil, ErrTokenExpired
+		}
+		if personalToken.Resource != "" && normalizeResource(personalToken.Resource) != normalizeResource(resource) && !m.isGatewayWideResource(personalToken.Resource) {
+			return nil, ErrInvalidToken
+		}
+		user, ok := m.data.Users[personalToken.UserID]
+		if !ok {
+			return nil, ErrInvalidToken
+		}
+		if now.Unix()-personalToken.LastUsedAt > 60 {
+			personalToken.LastUsedAt = now.Unix()
+			_ = m.saveLocked()
+		}
+		return m.identityForUserLocked(user), nil
 	}
 
-	return m.identityForUserLocked(user), nil
+	return nil, ErrInvalidToken
 }
 
 func WithIdentity(ctx context.Context, identity *Identity) context.Context {
@@ -803,6 +912,9 @@ func (m *Manager) load() error {
 	if data.RefreshTokens == nil {
 		data.RefreshTokens = make(map[string]*refreshTokenRecord)
 	}
+	if data.PersonalTokens == nil {
+		data.PersonalTokens = make(map[string]*personalTokenRecord)
+	}
 	if data.RouteSecrets == nil {
 		data.RouteSecrets = make(map[string]*routeSecretRecord)
 	}
@@ -887,6 +999,11 @@ func (m *Manager) cleanupLocked(now time.Time) {
 	for token, record := range m.data.RefreshTokens {
 		if record.ExpiresAt <= nowUnix {
 			delete(m.data.RefreshTokens, token)
+		}
+	}
+	for tokenID, record := range m.data.PersonalTokens {
+		if record.ExpiresAt > 0 && record.ExpiresAt <= nowUnix {
+			delete(m.data.PersonalTokens, tokenID)
 		}
 	}
 }
@@ -1153,17 +1270,23 @@ func clientSecretForAuthMethod(method string) string {
 }
 
 func (m *Manager) handleAuthorizeGet(w http.ResponseWriter, r *http.Request) {
+	identity, _ := m.identityFromSession(r)
+	if identity == nil {
+		// Some clients, including Open WebUI, preflight the authorization URL
+		// server-side without a user session. Redirect to the local login page
+		// before strict request validation so the preflight can verify that the
+		// client is usable. Codes are still issued only after login and full PKCE
+		// validation below.
+		http.Redirect(w, r, "/account/login?next="+url.QueryEscape(r.URL.RequestURI()), http.StatusFound)
+		return
+	}
+
 	params, client, err := m.parseAuthorizeRequest(r.URL.Query())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	identity, _ := m.identityFromSession(r)
-	if identity == nil {
-		http.Redirect(w, r, "/account/login?next="+url.QueryEscape(r.URL.RequestURI()), http.StatusFound)
-		return
-	}
 	if err := m.checkResourceAccess(identity, params.Resource); err != nil {
 		http.Error(w, err.Error(), http.StatusForbidden)
 		return
@@ -1866,6 +1989,11 @@ func randomToken(numBytes int) string {
 	return base64.RawURLEncoding.EncodeToString(buf)
 }
 
+func hashPersonalAccessToken(token string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(token)))
+	return base64.RawURLEncoding.EncodeToString(sum[:])
+}
+
 func normalizeEmail(email string) string {
 	return strings.ToLower(strings.TrimSpace(email))
 }
@@ -2046,7 +2174,7 @@ const layoutTemplate = `
     .error { color: #8f1d1d; margin-bottom: 1rem; }
     .success { color: #116236; margin-bottom: 1rem; }
     label { display: block; margin: 0.85rem 0 0.25rem; font-weight: 600; }
-    input[type="email"], input[type="password"], input[type="text"] {
+    input[type="email"], input[type="password"], input[type="text"], input[type="number"] {
       width: 100%; border: 1px solid #c2cbd8; border-radius: 10px; padding: 0.75rem 0.85rem; font: inherit;
       box-sizing: border-box;
     }
@@ -2132,6 +2260,38 @@ const accountTemplate = `
   {{end}}
 {{else}}
   <p class="muted">Noch keine OAuth-Clients fuer deinen Account autorisiert.</p>
+{{end}}
+<hr>
+<h2>OpenAPI / Bearer Tokens</h2>
+<p class="muted">Diese Tokens sind fuer Clients gedacht, die keinen MCP-OAuth-Flow koennen, z.B. OpenAPI-Tools in Open WebUI. Sie laufen unter deinem Gateway-Account und beachten weiterhin Allow-/Deny-Regeln.</p>
+{{if .NewBearerToken}}
+  <p class="success">Neuer Bearer Token, nur jetzt sichtbar:</p>
+  <p><code style="word-break:break-all;">{{.NewBearerToken}}</code></p>
+{{end}}
+<form method="post" action="/account/tokens/create">
+  <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+  <label for="token_name">Name</label>
+  <input id="token_name" name="name" type="text" value="Open WebUI OpenAPI">
+  <label for="expires_days">Gueltigkeit in Tagen</label>
+  <input id="expires_days" name="expires_days" type="number" min="1" max="3650" value="180">
+  <button type="submit">Bearer Token erstellen</button>
+</form>
+{{if .PersonalTokens}}
+  {{range .PersonalTokens}}
+    <div class="card" style="margin-top:.85rem;">
+      <strong>{{.Name}}</strong>
+      <p class="muted">Scope: <code>{{.Scope}}</code> | Resource: <code>{{if .Resource}}{{.Resource}}{{else}}gatewayweit{{end}}</code></p>
+      <p class="muted">Erstellt: {{.CreatedAt.Format "2006-01-02 15:04"}} | Gueltig bis: {{if .ExpiresAt.IsZero}}ohne Ablauf{{else}}{{.ExpiresAt.Format "2006-01-02 15:04"}}{{end}}</p>
+      <p class="muted">Zuletzt verwendet: {{if .LastUsedAt.IsZero}}noch nie{{else}}{{.LastUsedAt.Format "2006-01-02 15:04"}}{{end}}</p>
+      <form method="post" action="/account/tokens/delete" style="margin-top:.8rem;">
+        <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+        <input type="hidden" name="token_id" value="{{.ID}}">
+        <button type="submit">Token widerrufen</button>
+      </form>
+    </div>
+  {{end}}
+{{else}}
+  <p class="muted">Noch keine Bearer Tokens erstellt.</p>
 {{end}}
 <hr>
 <h2>Passwort aendern</h2>

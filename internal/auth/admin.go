@@ -43,6 +43,16 @@ type UserDevice struct {
 	RefreshExpiresAt time.Time
 }
 
+type PersonalAccessToken struct {
+	ID         string
+	Name       string
+	Scope      string
+	Resource   string
+	CreatedAt  time.Time
+	ExpiresAt  time.Time
+	LastUsedAt time.Time
+}
+
 func RouteEnvSecretRef(routeID, name string) string {
 	return "route:" + strings.TrimSpace(routeID) + ":env:" + strings.TrimSpace(name)
 }
@@ -362,6 +372,11 @@ func (m *Manager) DeleteUser(userID string) error {
 			delete(m.data.RefreshTokens, token)
 		}
 	}
+	for tokenID, record := range m.data.PersonalTokens {
+		if record.UserID == userID {
+			delete(m.data.PersonalTokens, tokenID)
+		}
+	}
 	return m.saveLocked()
 }
 
@@ -410,6 +425,79 @@ func (m *Manager) RevokeUserDevice(userID, deviceID string) error {
 	if !removed {
 		return fmt.Errorf("device not found")
 	}
+	return m.saveLocked()
+}
+
+func (m *Manager) CreatePersonalAccessToken(userID, name string, ttl time.Duration) (string, PersonalAccessToken, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = "OpenAPI Bearer Token"
+	}
+	if ttl < 0 {
+		return "", PersonalAccessToken{}, fmt.Errorf("ttl must not be negative")
+	}
+
+	now := time.Now()
+	rawToken := "mgw_" + randomToken(32)
+	record := &personalTokenRecord{
+		ID:        randomToken(16),
+		Name:      name,
+		TokenHash: hashPersonalAccessToken(rawToken),
+		UserID:    userID,
+		Scope:     "mcp",
+		CreatedAt: now.Unix(),
+	}
+	if ttl > 0 {
+		record.ExpiresAt = now.Add(ttl).Unix()
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.cleanupLocked(now)
+	if _, ok := m.data.Users[userID]; !ok {
+		return "", PersonalAccessToken{}, fmt.Errorf("user not found")
+	}
+	m.data.PersonalTokens[record.ID] = record
+	if err := m.saveLocked(); err != nil {
+		return "", PersonalAccessToken{}, err
+	}
+	return rawToken, personalTokenSummary(record), nil
+}
+
+func (m *Manager) ListUserPersonalAccessTokens(userID string) []PersonalAccessToken {
+	now := time.Now()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.cleanupLocked(now)
+
+	tokens := make([]PersonalAccessToken, 0)
+	for _, record := range m.data.PersonalTokens {
+		if record.UserID == userID {
+			tokens = append(tokens, personalTokenSummary(record))
+		}
+	}
+	slices.SortFunc(tokens, func(a, b PersonalAccessToken) int {
+		return b.CreatedAt.Compare(a.CreatedAt)
+	})
+	return tokens
+}
+
+func (m *Manager) RevokeUserPersonalAccessToken(userID, tokenID string) error {
+	tokenID = strings.TrimSpace(tokenID)
+	if tokenID == "" {
+		return fmt.Errorf("token_id is required")
+	}
+
+	now := time.Now()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.cleanupLocked(now)
+
+	record, ok := m.data.PersonalTokens[tokenID]
+	if !ok || record.UserID != userID {
+		return fmt.Errorf("token not found")
+	}
+	delete(m.data.PersonalTokens, tokenID)
 	return m.saveLocked()
 }
 
@@ -491,6 +579,23 @@ func (m *Manager) groupSummaryLocked(group *groupRecord) Group {
 		CreatedAt:   time.Unix(group.CreatedAt, 0),
 		UpdatedAt:   time.Unix(group.UpdatedAt, 0),
 	}
+}
+
+func personalTokenSummary(record *personalTokenRecord) PersonalAccessToken {
+	token := PersonalAccessToken{
+		ID:        record.ID,
+		Name:      record.Name,
+		Scope:     record.Scope,
+		Resource:  record.Resource,
+		CreatedAt: time.Unix(record.CreatedAt, 0),
+	}
+	if record.ExpiresAt > 0 {
+		token.ExpiresAt = time.Unix(record.ExpiresAt, 0)
+	}
+	if record.LastUsedAt > 0 {
+		token.LastUsedAt = time.Unix(record.LastUsedAt, 0)
+	}
+	return token
 }
 
 func (m *Manager) userDevicesLocked(userID string) []UserDevice {

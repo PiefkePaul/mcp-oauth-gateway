@@ -144,6 +144,45 @@ func TestUserDevicesCanBeListedAndRevoked(t *testing.T) {
 	}
 }
 
+func TestPersonalAccessTokensCanBeCreatedValidatedAndRevoked(t *testing.T) {
+	manager := newTestManager(t, "admin@example.com", "super-secret-password")
+	admin := manager.ListUsers()[0]
+
+	rawToken, summary, err := manager.CreatePersonalAccessToken(admin.ID, "Open WebUI", 24*time.Hour)
+	if err != nil {
+		t.Fatalf("create personal token: %v", err)
+	}
+	if rawToken == "" || !strings.HasPrefix(rawToken, "mgw_") {
+		t.Fatalf("expected prefixed bearer token, got %q", rawToken)
+	}
+	if summary.Name != "Open WebUI" {
+		t.Fatalf("expected token summary name, got %#v", summary)
+	}
+
+	identity, err := manager.ValidateAccessToken(rawToken, "https://mcp.example.com/legal/mcp")
+	if err != nil {
+		t.Fatalf("validate personal token: %v", err)
+	}
+	if identity.Email != "admin@example.com" {
+		t.Fatalf("unexpected identity: %#v", identity)
+	}
+
+	tokens := manager.ListUserPersonalAccessTokens(admin.ID)
+	if len(tokens) != 1 {
+		t.Fatalf("expected token to be listed, got %#v", tokens)
+	}
+	if tokens[0].LastUsedAt.IsZero() {
+		t.Fatalf("expected last used timestamp to be recorded")
+	}
+
+	if err := manager.RevokeUserPersonalAccessToken(admin.ID, summary.ID); err != nil {
+		t.Fatalf("revoke personal token: %v", err)
+	}
+	if _, err := manager.ValidateAccessToken(rawToken, "https://mcp.example.com/legal/mcp"); err == nil {
+		t.Fatalf("expected revoked personal token to fail")
+	}
+}
+
 func TestRouteEnvSecretsAreEncryptedAndResolvable(t *testing.T) {
 	manager := newTestManager(t, "admin@example.com", "super-secret-password")
 	secret := " feedfacecafebeef "

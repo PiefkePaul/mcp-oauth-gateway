@@ -231,6 +231,7 @@ Jede MCP-Route stellt zusaetzlich eine generierte OpenAPI-3.1-Spezifikation bere
 - `POST /<route>/openapi/tools/<operationId>` ruft das zugehoerige MCP-Tool per `tools/call` auf.
 - Tool-Calls sind mit derselben OAuth-/Bearer-Policy wie `/<route>/mcp` geschuetzt.
 - Public-Routen veroeffentlichen die Spec im Katalog. Private oder restricted Routen geben die Spec nur fuer eingeloggte und berechtigte Nutzer aus.
+- Open WebUI haengt beim Verbindungstest teils selbst `/openapi.json` an. Trage dort bevorzugt die Route-Basis ein, z.B. `https://mcp.example.com/legal`; der Gateway akzeptiert zur Kompatibilitaet aber auch `/<route>/openapi.json/openapi.json`.
 
 Damit koennen Clients, die MCP noch nicht sauber aufrufen, aber OpenAPI importieren koennen, dieselben Gateway-Routen verwenden.
 
@@ -264,6 +265,13 @@ Wichtig:
 - Full Export kann interne Tokens in `forward_headers`, `upstream_environment` oder manuellem `stdio.env` enthalten. Installer-Secrets bleiben im verschluesselten Auth-Store und werden nicht als Klartext exportiert.
 
 ## Open WebUI Hinweise
+
+Fuer OpenAPI-Tool-Server in Open WebUI ist die URL meistens die Route-Basis, nicht die Spec-Datei:
+
+- OpenAPI Base URL: `https://mcp.example.com/<route>`
+- Vom Gateway bereitgestellte Spec: `https://mcp.example.com/<route>/openapi.json`
+
+Die Open-WebUI-Auth-Option "auth" leitet den OAuth-Zugriffstoken des Open-WebUI-Systembenutzers weiter. Das ist nicht automatisch ein Gateway-Token. Fuer geschuetzte Gateway-Routen brauchst du entweder den MCP-OAuth-Flow oder einen Gateway-Bearer-Token, sobald der Client nur OpenAPI/Bearer statt MCP-OAuth spricht.
 
 Open WebUI speichert nach `Register Client` die OAuth-Client-Informationen in seiner eigenen Tool-Server-Konfiguration. Wenn du die MCP-URL oder die Gateway-Domain aenderst, reicht es nicht immer, nur das URL-Feld anzupassen. Registriere den Client erneut und speichere die Verbindung danach erneut.
 

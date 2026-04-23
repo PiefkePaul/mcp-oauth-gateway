@@ -142,6 +142,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "/account/devices/delete":
 		s.authManager.HandleAccountDeviceDelete(w, r)
 		return
+	case "/account/tokens/create":
+		s.authManager.HandleAccountTokenCreate(w, r)
+		return
+	case "/account/tokens/delete":
+		s.authManager.HandleAccountTokenDelete(w, r)
+		return
 	case "/account/login":
 		s.authManager.HandleAccountLogin(w, r)
 		return

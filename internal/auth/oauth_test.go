@@ -169,6 +169,70 @@ func TestAuthorizeAllowsClientsWithoutResourceParameter(t *testing.T) {
 	}
 }
 
+func TestAuthorizePreflightRedirectsUnauthenticatedBeforeStrictPKCEValidation(t *testing.T) {
+	manager := newTestManager(t, "admin@example.com", "super-secret-password")
+
+	client, err := manager.registerClient(
+		"Open WebUI",
+		[]string{"https://chat.example.com/oauth/clients/mcp:legal/callback"},
+		nil,
+		nil,
+		"client_secret_post",
+	)
+	if err != nil {
+		t.Fatalf("register client: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "https://mcp.example.com/authorize?client_id="+url.QueryEscape(client.ID)+"&redirect_uri="+url.QueryEscape("https://chat.example.com/oauth/clients/mcp:legal/callback")+"&response_type=code&scope=mcp", nil)
+	rec := httptest.NewRecorder()
+
+	manager.HandleAuthorize(rec, req)
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("expected unauthenticated preflight redirect, got %d with body %q", rec.Code, rec.Body.String())
+	}
+	if location := rec.Header().Get("Location"); !strings.HasPrefix(location, "/account/login?next=") {
+		t.Fatalf("expected login redirect, got %q", location)
+	}
+}
+
+func TestAuthorizeStillRequiresPKCEForAuthenticatedUser(t *testing.T) {
+	manager := newTestManager(t, "admin@example.com", "super-secret-password")
+
+	client, err := manager.registerClient(
+		"Open WebUI",
+		[]string{"https://chat.example.com/oauth/clients/mcp:legal/callback"},
+		nil,
+		nil,
+		"client_secret_post",
+	)
+	if err != nil {
+		t.Fatalf("register client: %v", err)
+	}
+
+	userID := manager.ListUsers()[0].ID
+	sessionRec := httptest.NewRecorder()
+	sessionReq := httptest.NewRequest(http.MethodGet, "https://mcp.example.com/account", nil)
+	if err := manager.startSession(sessionRec, sessionReq, userID); err != nil {
+		t.Fatalf("start session: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "https://mcp.example.com/authorize?client_id="+url.QueryEscape(client.ID)+"&redirect_uri="+url.QueryEscape("https://chat.example.com/oauth/clients/mcp:legal/callback")+"&response_type=code&scope=mcp", nil)
+	for _, cookie := range sessionRec.Result().Cookies() {
+		req.AddCookie(cookie)
+	}
+	rec := httptest.NewRecorder()
+
+	manager.HandleAuthorize(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected PKCE validation failure for authenticated request, got %d with body %q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "PKCE") {
+		t.Fatalf("expected PKCE error, got %q", rec.Body.String())
+	}
+}
+
 func TestGatewayWideAccessTokenCanBeValidatedForSpecificResource(t *testing.T) {
 	manager := newTestManager(t, "admin@example.com", "super-secret-password")
 	userID := manager.ListUsers()[0].ID

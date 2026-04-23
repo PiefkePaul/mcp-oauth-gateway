@@ -93,7 +93,11 @@ func (s *Server) routeByOpenAPISpecPath(requestPath string) (config.Route, http.
 	defer s.mu.RUnlock()
 
 	for _, route := range s.routes {
-		if requestPath == route.PublicOpenAPISpecPath() {
+		specPath := route.PublicOpenAPISpecPath()
+		// Open WebUI treats the configured OpenAPI URL as a base and appends
+		// /openapi.json during connection checks. Accept both forms so users can
+		// paste either the route base URL or the generated spec URL.
+		if requestPath == specPath || requestPath == joinURLPath(specPath, "openapi.json") {
 			runtime, ok := s.runtime[route.ID]
 			if !ok {
 				return config.Route{}, nil, false
