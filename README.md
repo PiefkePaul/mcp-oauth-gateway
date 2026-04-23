@@ -12,7 +12,7 @@ Ein typisches Zielbild ist:
 
 Beispiel:
 
-- `https://mcp.example.com/n8n/mcp` -> Gateway -> `http://n8n-mcp:8080/mcp`
+- `https://mcp.example.com/n8n/mcp` -> Gateway -> `http://n8n-mcp:3000/mcp`
 - `https://mcp.example.com/portainer/mcp` -> Gateway -> `http://portainer-mcp:8080/mcp`
 
 Wichtig:
@@ -274,6 +274,8 @@ Authorization: Bearer <interner-upstream-token>
 ```
 
 Nutzerspezifische Upstream-Bearer haben Vorrang vor dem globalen Route-Bearer. So kann ein gemeinsamer Gateway-OAuth vor mehreren MCPs liegen, waehrend einzelne Upstreams weiterhin ihre eigenen Secrets behalten.
+
+Bei `ghcr.io/czlonkowski/n8n-mcp` ist der interne Container-Port standardmaessig `3000`, nicht `8080`. Die Route sollte deshalb typischerweise `upstream: http://n8n-mcp:3000` und `upstream_mcp_path: /mcp` nutzen. Der n8n-MCP-Container selbst braucht denselben Wert als `AUTH_TOKEN`, den du im Gateway als Upstream Bearer speicherst.
 
 ## Open WebUI Hinweise
 

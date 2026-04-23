@@ -143,6 +143,7 @@ type deploymentFormData struct {
 	RestartPolicy         string
 	ResourceDocumentation string
 	Environment           string
+	UpstreamBearerToken   string
 	StdioCommand          string
 	StdioArgs             string
 	StdioEnv              string
@@ -773,6 +774,12 @@ func (s *Server) handleAdminDeploymentCreate(w http.ResponseWriter, r *http.Requ
 		s.renderAdminDashboard(w, r, identity, newEmptyRouteFormData(), "", err.Error(), http.StatusBadRequest)
 		return
 	}
+	if formData.UpstreamBearerToken != "" {
+		if err := s.authManager.SetRouteUpstreamBearer(route.ID, formData.UpstreamBearerToken); err != nil {
+			s.renderAdminDashboard(w, r, identity, newEmptyRouteFormData(), "", err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
 
 	http.Redirect(w, r, adminRedirectURLWithTab("deployments", route.ID, "Deployment created successfully", ""), http.StatusFound)
 }
@@ -1393,6 +1400,7 @@ func (s *Server) parseDeploymentForm(r *http.Request) (deploymentFormData, confi
 		RestartPolicy:         defaultIfEmpty(strings.TrimSpace(r.FormValue("restart_policy")), s.cfg.DockerManagement.RestartPolicy),
 		ResourceDocumentation: strings.TrimSpace(r.FormValue("resource_documentation")),
 		Environment:           normalizeMultiline(r.FormValue("environment")),
+		UpstreamBearerToken:   strings.TrimSpace(r.FormValue("deployment_upstream_bearer_token")),
 		StdioCommand:          strings.TrimSpace(r.FormValue("stdio_command")),
 		StdioArgs:             normalizeMultiline(r.FormValue("stdio_args")),
 		StdioEnv:              normalizeMultiline(r.FormValue("stdio_env")),
@@ -1417,6 +1425,7 @@ func (s *Server) parseDeploymentForm(r *http.Request) (deploymentFormData, confi
 	if formData.PathPrefix == "" {
 		formData.PathPrefix = "/" + formData.ID
 	}
+	applyKnownDeploymentDefaults(&formData)
 
 	if formData.Transport == "stdio" {
 		env, err := parseMapTextarea(formData.StdioEnv, "env")
@@ -1547,6 +1556,66 @@ func newDeploymentFormData(cfg config.DockerManagementConfig) deploymentFormData
 		Networks:        strings.Join(cfg.DefaultNetworks, "\n"),
 		RestartPolicy:   defaultIfEmpty(cfg.RestartPolicy, "unless-stopped"),
 	}
+}
+
+func applyKnownDeploymentDefaults(formData *deploymentFormData) {
+	if formData == nil || formData.Transport != "http" || !isN8NMCPImage(formData.Image) {
+		return
+	}
+
+	envPort := envLineValue(formData.Environment, "PORT")
+	port := "3000"
+	if isPortString(envPort) {
+		port = envPort
+	}
+	if formData.InternalPort == "" || formData.InternalPort == "8080" {
+		formData.InternalPort = port
+	}
+	formData.Environment = ensureEnvLine(formData.Environment, "MCP_MODE", "http")
+	formData.Environment = ensureEnvLine(formData.Environment, "PORT", port)
+	if formData.ResourceDocumentation == "" {
+		formData.ResourceDocumentation = "https://github.com/czlonkowski/n8n-mcp"
+	}
+	if formData.Notes == "" {
+		formData.Notes = "n8n-mcp nutzt intern standardmaessig Port 3000. Wenn AUTH_TOKEN im Container gesetzt ist, denselben Wert als Gateway Upstream Bearer speichern."
+	}
+}
+
+func isN8NMCPImage(image string) bool {
+	image = strings.ToLower(strings.TrimSpace(image))
+	return strings.Contains(image, "czlonkowski/n8n-mcp") || strings.Contains(image, "/n8n-mcp") || strings.HasPrefix(image, "n8n-mcp")
+}
+
+func isPortString(value string) bool {
+	port, err := strconv.Atoi(strings.TrimSpace(value))
+	return err == nil && port > 0 && port <= 65535
+}
+
+func envLineValue(raw string, key string) string {
+	key = strings.TrimSpace(key)
+	for _, line := range strings.Split(strings.ReplaceAll(raw, "\r\n", "\n"), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		name, value, ok := splitKeyValueLine(line, "env")
+		if ok && name == key {
+			return value
+		}
+	}
+	return ""
+}
+
+func ensureEnvLine(raw string, key string, value string) string {
+	if envLineValue(raw, key) != "" {
+		return normalizeMultiline(raw)
+	}
+	line := key + "=" + value
+	raw = normalizeMultiline(raw)
+	if raw == "" {
+		return line
+	}
+	return raw + "\n" + line
 }
 
 func newArtifactBuildFormData(cfg config.BuildManagementConfig) artifactBuildFormData {
@@ -2761,7 +2830,12 @@ const adminDashboardTemplate = `
                 </div>
                 <div class="full">
                   <label for="deploy_environment">Environment</label>
-                  <textarea id="deploy_environment" name="environment" placeholder="MCP_MODE=http&#10;PORT=8080">{{.DeploymentForm.Environment}}</textarea>
+                  <textarea id="deploy_environment" name="environment" placeholder="MCP_MODE=http&#10;PORT=3000&#10;AUTH_TOKEN=secret-for-upstream">{{.DeploymentForm.Environment}}</textarea>
+                </div>
+                <div class="full">
+                  <label for="deployment_upstream_bearer_token">Gateway Upstream Bearer</label>
+                  <input id="deployment_upstream_bearer_token" name="deployment_upstream_bearer_token" type="password" placeholder="Optional: derselbe Wert wie AUTH_TOKEN bei n8n-mcp">
+                  <p class="helper">Wird verschluesselt im Auth-Store gespeichert und vom Gateway als <code>Authorization: Bearer ...</code> zum Upstream gesendet. Fuer individuelle Nutzer-Bearer die Route nach dem Erstellen bearbeiten.</p>
                 </div>
                 <div class="full">
                   <label for="deploy_resource_documentation">Resource Documentation URL</label>

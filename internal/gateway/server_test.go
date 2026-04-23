@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -274,6 +275,44 @@ func TestAdminDashboardTemplateRenders(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "Import / Export") {
 		t.Fatalf("expected import/export section to render")
+	}
+}
+
+func TestParseDeploymentFormAppliesN8NDefaults(t *testing.T) {
+	handler := newTestServer(t)
+	form := url.Values{}
+	form.Set("transport", "http")
+	form.Set("id", "n8n")
+	form.Set("display_name", "n8n MCP")
+	form.Set("path_prefix", "/n8n")
+	form.Set("image", "ghcr.io/czlonkowski/n8n-mcp:latest")
+	form.Set("container_name", "n8n-mcp")
+	form.Set("internal_port", "8080")
+	form.Set("upstream_mcp_path", "/mcp")
+	form.Set("scopes_supported", "mcp")
+	form.Set("environment", "AUTH_TOKEN=secret")
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/deployments", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	formData, route, spec, err := handler.parseDeploymentForm(req)
+	if err != nil {
+		t.Fatalf("parse deployment form: %v", err)
+	}
+	if got, want := route.Upstream, "http://n8n-mcp:3000"; got != want {
+		t.Fatalf("expected n8n upstream %q, got %q", want, got)
+	}
+	if spec == nil || spec.InternalPort != 3000 {
+		t.Fatalf("expected internal port 3000, got %#v", spec)
+	}
+	if got := spec.Env["PORT"]; got != "3000" {
+		t.Fatalf("expected PORT=3000, got %q", got)
+	}
+	if got := spec.Env["MCP_MODE"]; got != "http" {
+		t.Fatalf("expected MCP_MODE=http, got %q", got)
+	}
+	if !strings.Contains(formData.Notes, "Port 3000") {
+		t.Fatalf("expected n8n notes to mention port 3000, got %q", formData.Notes)
 	}
 }
 
