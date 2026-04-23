@@ -1,4 +1,8 @@
-FROM golang:1.24.2-bookworm AS build
+ARG BUILDPLATFORM
+ARG TARGETOS
+ARG TARGETARCH
+
+FROM --platform=$BUILDPLATFORM golang:1.24.2-bookworm AS build
 
 WORKDIR /src
 
@@ -8,10 +12,11 @@ RUN go mod download
 COPY cmd ./cmd
 COPY internal ./internal
 
-ARG TARGETOS=linux
-ARG TARGETARCH=amd64
+ARG TARGETOS
+ARG TARGETARCH
 
-RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/mcp-oauth-gateway ./cmd/mcp-oauth-gateway
+RUN test -n "$TARGETOS" && test -n "$TARGETARCH" \
+    && CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/mcp-oauth-gateway ./cmd/mcp-oauth-gateway
 
 FROM debian:bookworm-slim
 
