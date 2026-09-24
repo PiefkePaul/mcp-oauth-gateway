@@ -16,6 +16,7 @@ import (
 
 	"github.com/PiefkePaul/mcp-oauth-gateway/internal/auth"
 	"github.com/PiefkePaul/mcp-oauth-gateway/internal/config"
+	"github.com/PiefkePaul/mcp-oauth-gateway/internal/webui"
 )
 
 type dashboardData struct {
@@ -28,6 +29,7 @@ type dashboardData struct {
 	RoutesPath          string
 	SelfSignupEnabled   bool
 	ActiveTab           string
+	ShowRouteEditor     bool
 	DockerEnabled       bool
 	DockerHost          string
 	DockerNetworks      string
@@ -303,8 +305,26 @@ func (s *Server) handleAdminRouteSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	http.Redirect(w, r, adminRedirectURL(route.ID, "Route saved successfully", ""), http.StatusFound)
+	notice := "Route saved successfully"
+	switch next := strings.TrimSpace(r.FormValue("next_route")); next {
+	case "":
+		http.Redirect(w, r, adminRedirectURL(route.ID, notice, ""), http.StatusFound)
+	case routeEditorBrowseSentinel:
+		http.Redirect(w, r, adminRedirectURL("", notice, ""), http.StatusFound)
+	case routeEditorNewSentinel:
+		http.Redirect(w, r, "/admin?new=1&notice="+url.QueryEscape(notice), http.StatusFound)
+	default:
+		http.Redirect(w, r, adminRedirectURL(next, notice, ""), http.StatusFound)
+	}
 }
+
+// The route editor's "next_route" hidden field carries the id of the route
+// to continue to after a "save, then switch" action; these two sentinel
+// values cover the two destinations that are not an existing route id.
+const (
+	routeEditorBrowseSentinel = "__browse__"
+	routeEditorNewSentinel    = "__new__"
+)
 
 func (s *Server) saveRouteUpstreamBearerForm(r *http.Request, routeID string) error {
 	token := strings.TrimSpace(r.FormValue("upstream_bearer_token"))
@@ -863,7 +883,7 @@ func (s *Server) handleAdminArtifactBuild(w http.ResponseWriter, r *http.Request
 		return
 	}
 	notice := fmt.Sprintf("Image %s built from verified artifact sha256:%s", result.ImageTag, result.SHA256)
-	http.Redirect(w, r, adminRedirectURLWithTab("deployments", "", notice, ""), http.StatusFound)
+	http.Redirect(w, r, adminRedirectURLWithTab("build", "", notice, ""), http.StatusFound)
 }
 
 func (s *Server) handleAdminStdioInstall(w http.ResponseWriter, r *http.Request) {
@@ -997,7 +1017,7 @@ func (s *Server) handleAdminStdioInstall(w http.ResponseWriter, r *http.Request)
 	}
 
 	notice := fmt.Sprintf("STDIO MCP %s installed with executable %s", route.ID, result.ExecutablePath)
-	http.Redirect(w, r, adminRedirectURLWithTab("deployments", route.ID, notice, ""), http.StatusFound)
+	http.Redirect(w, r, adminRedirectURLWithTab("build", route.ID, notice, ""), http.StatusFound)
 }
 
 func (s *Server) handleAdminDeploymentAction(w http.ResponseWriter, r *http.Request, action string) {
@@ -1153,6 +1173,7 @@ func (s *Server) renderAdminDashboard(w http.ResponseWriter, r *http.Request, id
 		RoutesPath:          s.cfg.RoutesPath,
 		SelfSignupEnabled:   s.cfg.AllowSelfSignup,
 		ActiveTab:           adminActiveTab(r),
+		ShowRouteEditor:     errText != "" || len(routes) == 0 || strings.TrimSpace(r.URL.Query().Get("route")) != "" || r.URL.Query().Get("new") == "1",
 		DockerEnabled:       s.cfg.DockerManagement.Enabled,
 		DockerHost:          s.cfg.DockerManagement.Host,
 		DockerNetworks:      strings.Join(s.cfg.DockerManagement.DefaultNetworks, ", "),
@@ -1860,12 +1881,15 @@ func adminActiveTab(r *http.Request) string {
 	if strings.HasPrefix(r.URL.Path, "/admin/deployments") {
 		return "deployments"
 	}
+	if strings.HasPrefix(r.URL.Path, "/admin/artifacts") || strings.HasPrefix(r.URL.Path, "/admin/stdio") {
+		return "build"
+	}
 	if strings.HasPrefix(r.URL.Path, "/admin/users") || strings.HasPrefix(r.URL.Path, "/admin/groups") {
 		return "users"
 	}
 	tab := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("tab")))
 	switch tab {
-	case "deployments", "users":
+	case "deployments", "users", "build":
 		return tab
 	default:
 		return "routes"
@@ -2120,7 +2144,7 @@ func renderAdminHTML(w http.ResponseWriter, status int, data dashboardData) {
 	w.Header().Set("Pragma", "no-cache")
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; script-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
 	w.WriteHeader(status)
 	_ = t.Execute(w, data)
 }
@@ -2132,470 +2156,309 @@ const adminDashboardTemplate = `
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{.Title}}</title>
-  <style>
-    :root {
-      color-scheme: light;
-      --bg: #eef3ee;
-      --card: #fffdf7;
-      --card-2: #f8fbf4;
-      --border: #d9dece;
-      --ink: #18201c;
-      --muted: #627064;
-      --accent: #145a49;
-      --accent-soft: #e2efe7;
-      --danger: #8c1d1d;
-      --success: #14623d;
-      --warn: #9b5a15;
-      font-family: "Aptos", "Trebuchet MS", system-ui, sans-serif;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      background:
-        radial-gradient(circle at 8% 2%, rgba(20,90,73,0.13), transparent 28rem),
-        radial-gradient(circle at 92% 0%, rgba(155,90,21,0.13), transparent 24rem),
-        linear-gradient(180deg, #fbf8ef 0%, var(--bg) 100%);
-      color: var(--ink);
-    }
-    main { max-width: 88rem; margin: 0 auto; padding: 2rem 1rem 4rem; }
-    header { display: flex; justify-content: space-between; gap: 1rem; align-items: flex-start; margin-bottom: 1.2rem; }
-    h1, h2, h3 { margin: 0; letter-spacing: -0.02em; }
-    h1 { font-size: clamp(2rem, 5vw, 3.4rem); line-height: 1; }
-    h2 { font-size: 1.15rem; margin-bottom: 0.45rem; }
-    h3 { font-size: 0.98rem; }
-    p { margin: 0; }
-    a { color: var(--accent); }
-    .muted { color: var(--muted); }
-    .pill, .tag {
-      display: inline-flex;
-      width: fit-content;
-      background: var(--accent-soft);
-      color: var(--accent);
-      border-radius: 999px;
-      padding: 0.24rem 0.62rem;
-      font-size: 0.82rem;
-      font-weight: 800;
-    }
-    .tag.private { background: #f7e7d7; color: var(--warn); }
-    .top-actions, .route-actions, .inline-actions, .form-actions, .toolbar {
-      display: flex;
-      gap: 0.55rem;
-      flex-wrap: wrap;
-      align-items: center;
-    }
-    .link-button, button {
-      appearance: none;
-      border: 1px solid transparent;
-      background: var(--accent);
-      color: white;
-      border-radius: 999px;
-      padding: 0.72rem 1rem;
-      font: inherit;
-      font-weight: 750;
-      cursor: pointer;
-      text-decoration: none;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-    }
-    button.secondary, .link-button.secondary { background: #fffdf7; color: var(--ink); border-color: var(--border); }
-    button.danger { background: var(--danger); }
-    details.import-menu { position: relative; }
-    details.import-menu summary {
-      list-style: none;
-      border: 1px solid var(--border);
-      background: #fffdf7;
-      color: var(--ink);
-      border-radius: 999px;
-      padding: 0.72rem 1rem;
-      font-weight: 750;
-      cursor: pointer;
-    }
-    details.import-menu summary::-webkit-details-marker { display: none; }
-    .import-panel {
-      position: absolute;
-      right: 0;
-      top: calc(100% + .55rem);
-      z-index: 10;
-      width: min(34rem, calc(100vw - 2rem));
-      background: var(--card);
-      border: 1px solid var(--border);
-      border-radius: 20px;
-      padding: 1rem;
-      box-shadow: 0 24px 70px rgba(24,32,28,0.18);
-    }
-    .tabs {
-      display: flex;
-      gap: .55rem;
-      flex-wrap: wrap;
-      margin: 1rem 0;
-    }
-    .tab {
-      border: 1px solid var(--border);
-      border-radius: 999px;
-      padding: .72rem 1rem;
-      color: var(--ink);
-      background: #fffdf7;
-      text-decoration: none;
-      font-weight: 800;
-    }
-    .tab.active { background: var(--accent); color: white; border-color: var(--accent); }
-    .notice, .error {
-      margin-bottom: 1rem;
-      padding: 0.9rem 1rem;
-      border-radius: 16px;
-      border: 1px solid var(--border);
-    }
-    .notice { background: #edf8f1; color: var(--success); border-color: #b7e1c6; }
-    .error { background: #fff0f0; color: var(--danger); border-color: #f0c3c3; }
-    .summary {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
-      gap: 0.8rem;
-      margin-bottom: 1rem;
-    }
-    .summary-card, section {
-      background: rgba(255,253,247,0.92);
-      border: 1px solid var(--border);
-      border-radius: 22px;
-      box-shadow: 0 18px 50px rgba(24,32,28,0.07);
-    }
-    .summary-card { padding: 1rem; }
-    .summary-card strong { display: block; font-size: 1.22rem; margin-top: 0.35rem; word-break: break-all; }
-    .layout {
-      display: grid;
-      grid-template-columns: minmax(18rem, 0.88fr) minmax(26rem, 1.35fr);
-      gap: 1rem;
-      align-items: start;
-    }
-    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; align-items: start; }
-    section { padding: 1rem; }
-    .stack { display: grid; gap: 0.85rem; }
-    .route-list, .users { display: grid; gap: 0.75rem; margin-top: 1rem; }
-    .route-card, .user-card, .mini-card {
-      border: 1px solid var(--border);
-      border-radius: 18px;
-      padding: 0.95rem;
-      background: linear-gradient(180deg, #fffefb, var(--card-2));
-    }
-    .route-meta, .user-meta, .mini-meta {
-      display: grid;
-      gap: 0.22rem;
-      margin-top: 0.45rem;
-      font-size: 0.91rem;
-    }
-    label { display: block; font-size: 0.9rem; font-weight: 800; margin-bottom: 0.35rem; }
-    input[type="text"], input[type="url"], input[type="email"], input[type="password"], input[type="file"], select, textarea {
-      width: 100%;
-      border: 1px solid #cbd2c3;
-      border-radius: 14px;
-      padding: 0.72rem 0.82rem;
-      font: inherit;
-      background: #fff;
-      color: var(--ink);
-    }
-    textarea {
-      min-height: 7.2rem;
-      resize: vertical;
-      font-family: "SFMono-Regular", "Cascadia Mono", monospace;
-      font-size: 0.88rem;
-    }
-    .field-grid { display: grid; gap: 0.8rem; grid-template-columns: repeat(2, minmax(0, 1fr)); }
-    .full { grid-column: 1 / -1; }
-    .checkbox, .checkline {
-      display: flex;
-      gap: 0.58rem;
-      align-items: flex-start;
-      border: 1px dashed #cad3c2;
-      border-radius: 15px;
-      padding: 0.72rem 0.82rem;
-      background: #fcfff8;
-    }
-    .checkline { font-weight: 650; margin: 0; }
-    .checkbox input, .checkline input { width: auto; margin: 0.18rem 0 0; }
-    .picker-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.6rem; }
-    details.advanced {
-      border: 1px solid var(--border);
-      border-radius: 18px;
-      background: #fffdf7;
-      padding: .85rem;
-    }
-    details.advanced summary {
-      cursor: pointer;
-      font-weight: 850;
-    }
-    .access-table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: .92rem;
-      margin-top: .7rem;
-    }
-    .data-table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: .92rem;
-      margin-top: .8rem;
-    }
-    .data-table th, .data-table td {
-      border-bottom: 1px solid var(--border);
-      padding: .72rem .5rem;
-      text-align: left;
-      vertical-align: top;
-    }
-    .data-table th { color: var(--muted); font-size: .78rem; text-transform: uppercase; letter-spacing: .04em; }
-    .data-table td:last-child { text-align: right; }
-    .detail-panel { margin-top: 1rem; }
-    .access-table th, .access-table td {
-      border-bottom: 1px solid var(--border);
-      padding: .55rem .45rem;
-      text-align: left;
-      vertical-align: middle;
-    }
-    .access-table th { color: var(--muted); font-size: .82rem; }
-    .access-table select { min-width: 9rem; padding: .48rem .55rem; border-radius: 10px; }
-    .helper { font-size: 0.86rem; color: var(--muted); margin-top: 0.3rem; }
-    .small-form { display: grid; gap: 0.5rem; margin-top: 0.75rem; }
-    .divider { height: 1px; background: var(--border); margin: 1rem 0; }
-    code { background: #f0eadf; padding: 0.12rem 0.35rem; border-radius: 7px; word-break: break-all; }
-    @media (max-width: 1080px) {
-      .layout, .grid { grid-template-columns: 1fr; }
-      .field-grid, .picker-grid { grid-template-columns: 1fr; }
-      header { flex-direction: column; }
-    }
-  </style>
+  ` + webui.GoogleFonts + `
+  ` + webui.Style + `
 </head>
 <body>
-  <main>
-    <header>
-      <div class="stack">
-        <span class="pill">Admin Dashboard</span>
-        <h1>{{.Title}}</h1>
-        <p class="muted">Angemeldet als <strong>{{.AdminEmail}}</strong>. Routen, Sichtbarkeit, Rechte, Gruppen und Export zentral verwalten.</p>
+  <div class="admin-shell">
+    <aside class="admin-rail">
+      <a class="wordmark" href="/admin"><span class="mark">GW</span> {{.Title}}</a>
+      <div class="rail-group">
+        <div class="rail-title">Steuerung</div>
+        <a class="rail-link {{if eq .ActiveTab "routes"}}is-active{{end}}" href="/admin">MCP-Routen</a>
+        <a class="rail-link {{if eq .ActiveTab "deployments"}}is-active{{end}}" href="/admin?tab=deployments">Deployments</a>
+        <a class="rail-link {{if eq .ActiveTab "build"}}is-active{{end}}" href="/admin?tab=build">Build &amp; Stdio</a>
       </div>
-      <div class="top-actions">
-        <details class="import-menu">
-          <summary>Import / Export</summary>
-          <div class="import-panel">
-            <h2>Routen sichern</h2>
-            <p class="muted">Full Export enthaelt ggf. interne Tokens. Redacted Export ist zum Teilen gedacht.</p>
-            <div class="form-actions">
-              <a class="link-button" href="/admin/routes/export">Full Export</a>
-              <a class="link-button secondary" href="/admin/routes/export?redacted=true">Redacted Export</a>
+      <div class="rail-group">
+        <div class="rail-title">Zugriff</div>
+        <a class="rail-link {{if eq .ActiveTab "users"}}is-active{{end}}" href="/admin?tab=users">Nutzer &amp; Gruppen</a>
+      </div>
+      <div class="rail-group">
+        <div class="rail-title">Werkzeuge</div>
+        <details>
+          <summary style="font-size:.86rem; padding:.5rem;">Import / Export</summary>
+          <div class="stack-sm" style="margin-top:.7rem;">
+            <p class="hint">Full Export enth&auml;lt ggf. interne Tokens. Redacted Export ist zum Teilen gedacht.</p>
+            <div class="cluster">
+              <a class="btn btn-sm" href="/admin/routes/export">Full Export</a>
+              <a class="btn btn-sm btn-ghost" href="/admin/routes/export?redacted=true">Redacted</a>
             </div>
-            <div class="divider"></div>
-            <form method="post" action="/admin/routes/import" enctype="multipart/form-data" class="small-form">
+            <hr>
+            <form method="post" action="/admin/routes/import" enctype="multipart/form-data" class="stack-sm">
               <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
-              <label for="routes_file">YAML-Datei importieren</label>
-              <input id="routes_file" name="routes_file" type="file" accept=".yaml,.yml,text/yaml">
-              <label for="routes_yaml">Oder YAML einfuegen</label>
-              <textarea id="routes_yaml" name="routes_yaml" placeholder="routes: []"></textarea>
-              <p class="helper">Import ersetzt die aktuelle Routen-Konfiguration nach erfolgreicher Validierung.</p>
-              <button type="submit">Importieren</button>
+              <div class="field" style="margin-top:0;">
+                <label for="routes_file">YAML-Datei importieren</label>
+                <input id="routes_file" name="routes_file" type="file" accept=".yaml,.yml,text/yaml">
+              </div>
+              <div class="field">
+                <label for="routes_yaml">Oder YAML einf&uuml;gen</label>
+                <textarea id="routes_yaml" name="routes_yaml" placeholder="routes: []" rows="3"></textarea>
+                <p class="hint">Ersetzt die aktuelle Routen-Konfiguration nach erfolgreicher Validierung.</p>
+              </div>
+              <button type="submit" class="btn btn-sm">Importieren</button>
             </form>
           </div>
         </details>
-        <a class="link-button secondary" href="/">Public Dashboard</a>
-        <a class="link-button secondary" href="/docs">Docs</a>
-        <a class="link-button secondary" href="/account">Account</a>
       </div>
-    </header>
+      <div class="rail-foot">
+        <div class="cluster">
+          <a class="navlink" style="padding:0;" href="/">Katalog</a>
+          <a class="navlink" style="padding:0;" href="/docs">Docs</a>
+          <a class="navlink" style="padding:0;" href="/account">Account</a>
+        </div>
+        <div class="mono" style="margin-top:.5rem;">{{.AdminEmail}}</div>
+      </div>
+    </aside>
+    <div class="admin-main">
+      <div class="admin-topbar">
+        <div class="breadcrumb">Admin <span>/</span> <strong>{{if eq .ActiveTab "deployments"}}Deployments{{else if eq .ActiveTab "build"}}Build &amp; Stdio{{else if eq .ActiveTab "users"}}Nutzer &amp; Gruppen{{else}}Routes{{end}}</strong></div>
+      </div>
+      <div class="admin-content">
 
-    {{if .Notice}}<div class="notice">{{.Notice}}</div>{{end}}
-    {{if .Error}}<div class="error">{{.Error}}</div>{{end}}
+    {{if .Notice}}<div class="callout success">{{.Notice}}</div>{{end}}
+    {{if .Error}}<div class="callout danger">{{.Error}}</div>{{end}}
 
-    <div class="summary">
-      <div class="summary-card"><span class="muted">Public Base URL</span><strong>{{.PublicBaseURL}}</strong></div>
-      <div class="summary-card"><span class="muted">Routes Config</span><strong>{{.RoutesPath}}</strong></div>
-      <div class="summary-card"><span class="muted">Self-Signup</span><strong>{{if .SelfSignupEnabled}}Enabled{{else}}Disabled{{end}}</strong></div>
-      <div class="summary-card"><span class="muted">Routes / Deployments</span><strong>{{len .Routes}} / {{len .Deployments}}</strong></div>
-      <div class="summary-card"><span class="muted">Docker Management</span><strong>{{if .DockerEnabled}}Enabled{{else}}Disabled{{end}}</strong></div>
+    <div class="stat-row">
+      <div class="stat-tile"><div class="label">Public Base URL</div><div class="value" style="font-size:1rem;">{{.PublicBaseURL}}</div></div>
+      <div class="stat-tile"><div class="label">Routes / Deployments</div><div class="value">{{len .Routes}} / {{len .Deployments}}</div></div>
+      <div class="stat-tile"><div class="label">Self-Signup</div><div class="value" style="font-size:1.1rem;">{{if .SelfSignupEnabled}}Aktiviert{{else}}Deaktiviert{{end}}</div></div>
+      <div class="stat-tile"><div class="label">Docker Management</div><div class="value" style="font-size:1.1rem;">{{if .DockerEnabled}}Aktiviert{{else}}Deaktiviert{{end}}</div></div>
     </div>
 
-    <nav class="tabs">
-      <a class="tab {{if eq .ActiveTab "routes"}}active{{end}}" href="/admin">MCP-Routen</a>
-      <a class="tab {{if eq .ActiveTab "deployments"}}active{{end}}" href="/admin?tab=deployments">Deployments</a>
-      <a class="tab {{if eq .ActiveTab "users"}}active{{end}}" href="/admin?tab=users">Nutzer & Gruppen</a>
-    </nav>
-
     {{if eq .ActiveTab "routes"}}
-    <div class="layout">
-      <section>
-        <div class="toolbar" style="justify-content:space-between;">
-          <div>
-            <h2>MCP Routes</h2>
-            <p class="muted">Oeffentliche Routen erscheinen im Katalog. Private Routen bleiben verborgen und sind nur per direkter URL fuer berechtigte Nutzer sichtbar.</p>
-          </div>
-          <a class="link-button secondary" href="/admin">Neue Route</a>
-        </div>
-        <div class="route-list">
-          {{if .Routes}}
-            {{range .Routes}}
-              <article class="route-card">
-                <div style="display:flex; justify-content:space-between; gap:1rem; align-items:flex-start;">
-                  <div>
-                    <h3>{{.DisplayName}}</h3>
-                    <p class="muted"><code>{{.ID}}</code> at <code>{{.PathPrefix}}</code></p>
-                  </div>
-                  <div class="stack" style="gap:.35rem; justify-items:end;">
-                    <span class="tag {{if eq .AccessVisibility "private"}}private{{end}}">{{.AccessVisibility}}</span>
-                    <span class="tag">{{.AccessMode}}</span>
-                  </div>
-                </div>
-                <div class="route-meta">
-                  <span>Transport: <code>{{.Transport}}</code></span>
-                  <span>MCP: <code>{{.PublicMCPURL}}</code></span>
-                  <span>Docs: <code>{{.PublicMCPURL}}</code> -> <code>{{.PathPrefix}}/docs</code></span>
-                  <span>OpenAPI Adapter: <code>{{.PathPrefix}}/openapi.json</code></span>
-                  <span>Upstream: <code>{{.Upstream}}</code>{{if eq .Transport "http"}}<code>{{.UpstreamMCPPath}}</code>{{end}}</span>
-                  <span>Headers: {{.ForwardHeadersCount}} | Env: {{.UpstreamEnvironmentCount}} | Pass Auth: {{if .PassAuthorization}}yes{{else}}no{{end}}</span>
-                  <span>Upstream Bearer: {{if .UpstreamBearerConfigured}}global{{else}}none{{end}}{{if .UserUpstreamBearerCount}} + {{.UserUpstreamBearerCount}} user{{end}}</span>
-                  {{if .MCPHTTPSessionMode}}<span>Session: <code>{{.MCPHTTPSessionMode}}</code></span>{{end}}
-                </div>
-                <div class="route-actions">
-                  <a class="link-button secondary" href="/admin?route={{.ID}}">Bearbeiten</a>
-                  <a class="link-button secondary" href="{{.PathPrefix}}/docs">Docs</a>
-                </div>
-              </article>
-            {{end}}
-          {{else}}
-            <article class="route-card"><p>Noch keine MCP-Routen angelegt.</p></article>
-          {{end}}
-        </div>
-      </section>
 
-      <section>
-        <h2>{{if .SelectedRoute.OriginalID}}Route bearbeiten{{else}}Route anlegen{{end}}</h2>
-        <p class="muted">Die Route-ID ist optional. Wenn sie leer bleibt, erzeugt der Gateway sie aus dem Display Name oder Path Prefix.</p>
-        <form method="post" action="/admin/routes/save" enctype="multipart/form-data" style="margin-top: 1rem;">
+    <div class="toolbar">
+      <div>
+        <h2>MCP Routes</h2>
+        <p class="hint">Oeffentliche Routen erscheinen im Katalog. Private Routen bleiben verborgen und sind nur per direkter URL fuer berechtigte Nutzer sichtbar.</p>
+      </div>
+      <a class="btn btn-primary btn-sm dirty-guard" data-next="__new__" href="/admin?new=1">+ Neue Route</a>
+    </div>
+
+    {{if .ShowRouteEditor}}
+    <div class="editor-shell">
+      <aside class="route-compact-list">
+        <div class="compact-list-head">
+          <a class="btn btn-ghost btn-sm dirty-guard" data-next="__browse__" href="/admin">&larr; Uebersicht</a>
+          <a class="btn btn-sm dirty-guard" data-next="__new__" href="/admin?new=1">+ Neu</a>
+        </div>
+        {{range .Routes}}
+          <a class="compact-row {{if eq .ID $.SelectedRoute.OriginalID}}is-active{{end}} dirty-guard" data-next="{{.ID}}" href="/admin?route={{.ID}}">
+            <span class="dot"></span><span class="name">{{.DisplayName}}</span><span class="chip">{{.Transport}}</span>
+          </a>
+        {{else}}
+          <div class="compact-row" style="cursor:default;"><span class="name hint">Noch keine Routen</span></div>
+        {{end}}
+      </aside>
+
+      <div class="editor-center">
+        <form class="panel editor-panel" id="routeForm" method="post" action="/admin/routes/save" enctype="multipart/form-data">
           <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
           <input type="hidden" name="original_id" value="{{.SelectedRoute.OriginalID}}">
-          <div class="field-grid">
+          <input type="hidden" name="next_route" id="next_route" value="">
+          <div class="panel-head">
             <div>
-              <label for="id">Route ID</label>
-              <input id="id" name="id" type="text" value="{{.SelectedRoute.ID}}" placeholder="auto, z.B. german-legal">
-              <p class="helper">Leer lassen fuer Autofill.</p>
+              <h3>{{if .SelectedRoute.OriginalID}}{{.SelectedRoute.DisplayName}}{{else}}Neue Route{{end}}</h3>
+              <span class="hint" id="rf-dirty-hint" hidden>&#9679; Ungespeicherte Aenderungen</span>
             </div>
-            <div>
-              <label for="display_name">Display Name</label>
-              <input id="display_name" name="display_name" type="text" value="{{.SelectedRoute.DisplayName}}" placeholder="German Legal">
+            {{if .SelectedRoute.OriginalID}}
+              {{if eq .SelectedRoute.AccessMode "admin"}}<span class="pill pill-danger">Nur Admins</span>{{else if eq .SelectedRoute.AccessMode "restricted"}}<span class="pill pill-warning">Eingeschraenkt</span>{{else}}<span class="pill pill-neutral">Alle Nutzer</span>{{end}}
+            {{end}}
+          </div>
+          <div class="panel-body">
+            {{if .Error}}<div class="callout danger">{{.Error}}</div>{{end}}
+            <p class="hint">Die Route-ID ist optional. Wenn sie leer bleibt, erzeugt der Gateway sie aus dem Display Name oder Path Prefix.</p>
+
+            <div class="fieldset-title" style="margin-top:.9rem;">Grunddaten</div>
+            <div class="field-grid">
+              <div class="field" style="margin-top:0;">
+                <label for="display_name">Anzeigename</label>
+                <input id="display_name" name="display_name" type="text" value="{{.SelectedRoute.DisplayName}}" placeholder="German Legal">
+              </div>
+              <div class="field" style="margin-top:0;">
+                <label for="path_prefix">Pfad-Praefix</label>
+                <input id="path_prefix" name="path_prefix" type="text" class="mono" value="{{.SelectedRoute.PathPrefix}}" placeholder="/german-legal">
+              </div>
             </div>
-            <div>
+            <div class="field">
+              <label for="id">Route ID <span class="hint">(optional, leer = Autofill)</span></label>
+              <input id="id" name="id" type="text" class="mono" value="{{.SelectedRoute.ID}}" placeholder="auto, z.B. german-legal">
+            </div>
+            <div class="field">
               <label for="route_transport">Transport</label>
               <select id="route_transport" name="transport">
                 <option value="http" {{if eq .SelectedRoute.Transport "http"}}selected{{end}}>HTTP / Streamable HTTP</option>
                 <option value="stdio" {{if eq .SelectedRoute.Transport "stdio"}}selected{{end}}>Native STDIO</option>
-                <option value="openapi" {{if eq .SelectedRoute.Transport "openapi"}}selected{{end}}>OpenAPI -> MCP Tools</option>
+                <option value="openapi" {{if eq .SelectedRoute.Transport "openapi"}}selected{{end}}>OpenAPI -&gt; MCP Tools</option>
               </select>
+              <p class="hint" data-dyn-hint="http">Der Gateway spricht das MCP-Protokoll direkt per Streamable HTTP mit dem Upstream-Server.</p>
+              <p class="hint" data-dyn-hint="stdio">Der Gateway startet den MCP-Server als lokalen Prozess -- kein Netzwerk-Upstream noetig.</p>
+              <p class="hint" data-dyn-hint="openapi">Der Gateway liest eine OpenAPI-Spec und stellt jede Operation als eigenes MCP-Tool bereit.</p>
             </div>
-            <div>
-              <label for="path_prefix">Path Prefix</label>
-              <input id="path_prefix" name="path_prefix" type="text" value="{{.SelectedRoute.PathPrefix}}" placeholder="/german-legal">
-            </div>
-            <div>
+            <div class="field">
               <label for="scopes_supported">Scopes</label>
-              <input id="scopes_supported" name="scopes_supported" type="text" value="{{.SelectedRoute.ScopesSupported}}" placeholder="mcp">
+              <input id="scopes_supported" name="scopes_supported" type="text" class="mono" value="{{.SelectedRoute.ScopesSupported}}" placeholder="mcp">
             </div>
-            <div class="full">
-              <label for="upstream">Upstream Base URL</label>
-              <input id="upstream" name="upstream" type="url" value="{{.SelectedRoute.Upstream}}" placeholder="http://n8n-mcp:8080">
-              <p class="helper">Nur fuer HTTP-Routen erforderlich.</p>
+
+            <div data-dyn-group="http">
+              <div class="fieldset-title">Upstream (HTTP)</div>
+              <div class="field" style="margin-top:0;">
+                <label for="upstream">Upstream Base URL</label>
+                <input id="upstream" name="upstream" type="url" class="mono" value="{{.SelectedRoute.Upstream}}" placeholder="http://n8n-mcp:8080">
+              </div>
+              <div class="field">
+                <label for="upstream_mcp_path">Upstream MCP Path</label>
+                <input id="upstream_mcp_path" name="upstream_mcp_path" type="text" class="mono" value="{{.SelectedRoute.UpstreamMCPPath}}" placeholder="/mcp">
+              </div>
             </div>
-            <div>
-              <label for="upstream_mcp_path">Upstream MCP Path</label>
-              <input id="upstream_mcp_path" name="upstream_mcp_path" type="text" value="{{.SelectedRoute.UpstreamMCPPath}}" placeholder="/mcp">
-            </div>
-            <div class="full">
-              <label for="notes">Notes / Beschreibung</label>
-              <textarea id="notes" name="notes" placeholder="Kurzbeschreibung, Setup-Hinweise, Reverse-Proxy-Anforderungen...">{{.SelectedRoute.Notes}}</textarea>
-            </div>
-            <details class="advanced full">
-              <summary>STDIO-Command</summary>
-              <div class="field-grid" style="margin-top:.9rem;">
-                <div class="full">
+
+            <details data-dyn-group="stdio">
+              <summary>Prozess (STDIO)</summary>
+              <div style="margin-top:.8rem;">
+                <div class="field" style="margin-top:0;">
                   <label for="stdio_command">Executable / Command</label>
-                  <input id="stdio_command" name="stdio_command" type="text" value="{{.SelectedRoute.StdioCommand}}" placeholder="/tools/portainer-mcp">
+                  <input id="stdio_command" name="stdio_command" type="text" class="mono" value="{{.SelectedRoute.StdioCommand}}" placeholder="/tools/portainer-mcp">
                 </div>
-                <div class="full">
-                  <label for="stdio_args">Argumente</label>
-                  <textarea id="stdio_args" name="stdio_args" placeholder="-server&#10;https://portainer:9443&#10;-token&#10;...">{{.SelectedRoute.StdioArgs}}</textarea>
-                  <p class="helper">Ein Argument pro Zeile. Nur fuer STDIO-Routen.</p>
+                <div class="field">
+                  <label for="stdio_args">Argumente <span class="hint">(ein Argument pro Zeile)</span></label>
+                  <textarea id="stdio_args" name="stdio_args" class="mono" placeholder="-server&#10;https://portainer:9443&#10;-token&#10;...">{{.SelectedRoute.StdioArgs}}</textarea>
                 </div>
-                <div class="full">
+                <div class="field">
                   <label for="stdio_env">STDIO Environment</label>
-                  <textarea id="stdio_env" name="stdio_env" placeholder="ANNAS_SECRET_KEY=...&#10;ANNAS_DOWNLOAD_PATH=/data/downloads">{{.SelectedRoute.StdioEnv}}</textarea>
+                  <textarea id="stdio_env" name="stdio_env" class="mono" placeholder="ANNAS_SECRET_KEY=...&#10;ANNAS_DOWNLOAD_PATH=/data/downloads">{{.SelectedRoute.StdioEnv}}</textarea>
                 </div>
-                <div class="full">
+                <div class="field">
                   <label for="stdio_working_dir">Working Directory</label>
-                  <input id="stdio_working_dir" name="stdio_working_dir" type="text" value="{{.SelectedRoute.StdioWorkingDir}}" placeholder="/tools">
+                  <input id="stdio_working_dir" name="stdio_working_dir" type="text" class="mono" value="{{.SelectedRoute.StdioWorkingDir}}" placeholder="/tools">
                 </div>
+                <div class="callout" style="margin-top:.8rem; font-size:.82rem;">Der Gateway startet und ueberwacht diesen Prozess selbst -- kein separater Upstream-Server noetig.</div>
               </div>
             </details>
-            <details class="advanced full">
+
+            <details data-dyn-group="openapi">
               <summary>OpenAPI Tool-Bridge</summary>
-              <div class="field-grid" style="margin-top:.9rem;">
-                <div class="full">
+              <div style="margin-top:.8rem;">
+                <div class="field" style="margin-top:0;">
                   <label for="openapi_spec_file">OpenAPI Spec importieren</label>
                   <input id="openapi_spec_file" name="openapi_spec_file" type="file" accept=".yaml,.yml,.json,application/yaml,application/json">
-                  <p class="helper">Optionaler Upload. Der Gateway prueft die Spec und speichert sie im konfigurierten OpenAPI Store.</p>
+                  <p class="hint">Optionaler Upload. Der Gateway prueft die Spec und speichert sie im konfigurierten OpenAPI Store.</p>
                 </div>
-                <div class="full">
+                <div class="field">
                   <label for="openapi_spec_path">OpenAPI Spec Path</label>
-                  <input id="openapi_spec_path" name="openapi_spec_path" type="text" value="{{.SelectedRoute.OpenAPISpecPath}}" placeholder="/data/openapi/example.yaml">
-                  <p class="helper">Absoluter Pfad im Gateway-Container. Wird durch Upload automatisch befuellt.</p>
+                  <input id="openapi_spec_path" name="openapi_spec_path" type="text" class="mono" value="{{.SelectedRoute.OpenAPISpecPath}}" placeholder="/data/openapi/example.yaml">
+                  <p class="hint">Absoluter Pfad im Gateway-Container. Wird durch Upload automatisch befuellt.</p>
                 </div>
-                <div class="full">
+                <div class="field">
                   <label for="openapi_spec_url">OpenAPI Spec URL</label>
-                  <input id="openapi_spec_url" name="openapi_spec_url" type="url" value="{{.SelectedRoute.OpenAPISpecURL}}" placeholder="https://api.example.com/openapi.yaml">
+                  <input id="openapi_spec_url" name="openapi_spec_url" type="url" class="mono" value="{{.SelectedRoute.OpenAPISpecURL}}" placeholder="https://api.example.com/openapi.yaml">
                 </div>
-                <div class="full">
+                <div class="field">
                   <label for="openapi_base_url">OpenAPI Base URL</label>
-                  <input id="openapi_base_url" name="openapi_base_url" type="url" value="{{.SelectedRoute.OpenAPIBaseURL}}" placeholder="https://api.example.com">
-                  <p class="helper">Ziel-API, gegen die die generierten Tools Requests ausfuehren.</p>
+                  <input id="openapi_base_url" name="openapi_base_url" type="url" class="mono" value="{{.SelectedRoute.OpenAPIBaseURL}}" placeholder="https://api.example.com">
+                  <p class="hint">Ziel-API, gegen die die generierten Tools Requests ausfuehren.</p>
                 </div>
-                <div class="full">
-                  <label for="openapi_headers">OpenAPI API Headers</label>
-                  <textarea id="openapi_headers" name="openapi_headers" placeholder="Authorization: Bearer internal-api-token&#10;X-Api-Key: ...">{{.SelectedRoute.OpenAPIHeaders}}</textarea>
+                <div class="field">
+                  <label for="openapi_headers">API Headers <span class="hint">(statisch, fuer jeden Request)</span></label>
+                  <textarea id="openapi_headers" name="openapi_headers" class="mono" placeholder="X-Api-Key: ...">{{.SelectedRoute.OpenAPIHeaders}}</textarea>
                 </div>
-                <div>
-                  <label for="openapi_timeout_seconds">OpenAPI Timeout Sekunden</label>
-                  <input id="openapi_timeout_seconds" name="openapi_timeout_seconds" type="text" value="{{.SelectedRoute.OpenAPITimeoutSeconds}}" placeholder="30">
+                <div class="field">
+                  <label for="openapi_timeout_seconds">Timeout (Sekunden)</label>
+                  <input id="openapi_timeout_seconds" name="openapi_timeout_seconds" type="text" class="mono" value="{{.SelectedRoute.OpenAPITimeoutSeconds}}" placeholder="30">
                 </div>
               </div>
             </details>
-            <details class="advanced full">
-              <summary>Erweiterte Einstellungen</summary>
-              <div class="field-grid" style="margin-top:.9rem;">
-                <div>
-                  <label for="mcp_http_session_mode">MCP_HTTP_SESSION_MODE</label>
-                  <input id="mcp_http_session_mode" name="mcp_http_session_mode" type="text" value="{{.SelectedRoute.MCPHTTPSessionMode}}" placeholder="stateful or stateless">
+
+            <div data-dyn-group="http">
+              <div class="fieldset-title">Verbindung &amp; Weiterleitung</div>
+              <div class="field" style="margin-top:0;">
+                <label for="mcp_http_session_mode">Session Mode</label>
+                <input id="mcp_http_session_mode" name="mcp_http_session_mode" type="text" class="mono" value="{{.SelectedRoute.MCPHTTPSessionMode}}" placeholder="stateful oder stateless">
+              </div>
+              <label class="checkbox-row">
+                <input id="pass_authorization_header" name="pass_authorization_header" type="checkbox" {{if .SelectedRoute.PassAuthorization}}checked{{end}}>
+                <span>
+                  Inbound Authorization an Upstream weiterreichen
+                  <p class="hint" style="margin-top:.2rem;">Aus lassen, wenn der Gateway interne Header wie <code>Authorization: Bearer ...</code> setzen soll.</p>
+                </span>
+              </label>
+              <details style="margin-top:.85rem;">
+                <summary>Upstream Bearer Auth</summary>
+                <div style="margin-top:.8rem;">
+                  <p class="hint">Fuer MCP-Server wie n8n-mcp, die zusaetzlich zum Gateway-OAuth einen internen Bearer erwarten. Werte werden verschluesselt gespeichert und nicht nach <code>routes.yaml</code> exportiert.</p>
+                  <div class="field">
+                    <label for="upstream_bearer_token">Globaler Upstream Bearer</label>
+                    <input id="upstream_bearer_token" name="upstream_bearer_token" type="password" placeholder="{{if .SelectedRoute.UpstreamBearerConfigured}}Token ist gesetzt; leer lassen zum Beibehalten{{else}}n8n AUTH_TOKEN oder anderer Upstream-Bearer{{end}}">
+                    <p class="hint">{{if .SelectedRoute.UpstreamBearerConfigured}}Aktuell ist ein globaler Upstream-Bearer gesetzt.{{else}}Kein globaler Upstream-Bearer gesetzt.{{end}} Nutzer-spezifische Tokens haben Vorrang.</p>
+                  </div>
+                  <label class="checkbox-row">
+                    <input id="clear_upstream_bearer" name="clear_upstream_bearer" type="checkbox">
+                    <span>Globalen Upstream Bearer loeschen</span>
+                  </label>
+                  <table style="margin-top:.8rem;">
+                    <thead><tr><th>Nutzer</th><th>Status</th><th>Neuer Bearer</th><th>Loeschen</th></tr></thead>
+                    <tbody>
+                      {{range .Users}}
+                        {{$hasBearer := upstreamBearerConfigured $.SelectedRoute .ID}}
+                        <tr>
+                          <td>{{.Email}}</td>
+                          <td>{{if $hasBearer}}gesetzt{{else}}default/global{{end}}</td>
+                          <td>
+                            <input type="hidden" name="upstream_bearer_user_id" value="{{.ID}}">
+                            <input name="upstream_bearer_user_token" type="password" placeholder="{{if $hasBearer}}Leer lassen zum Beibehalten{{else}}Optionaler Nutzer-Bearer{{end}}">
+                          </td>
+                          <td style="text-align:center;"><input name="clear_user_upstream_bearer" type="checkbox" value="{{.ID}}" {{if not $hasBearer}}disabled{{end}}></td>
+                        </tr>
+                      {{end}}
+                    </tbody>
+                  </table>
                 </div>
-                <div>
-                  <label for="access_visibility">Katalog-Sichtbarkeit</label>
-                  <select id="access_visibility" name="access_visibility">
-                    <option value="public" {{if eq .SelectedRoute.AccessVisibility "public"}}selected{{end}}>Public im Dashboard</option>
-                    <option value="private" {{if eq .SelectedRoute.AccessVisibility "private"}}selected{{end}}>Private/versteckt</option>
-                  </select>
+              </details>
+              <div class="field">
+                <label for="upstream_environment">Upstream Environment Metadata</label>
+                <textarea id="upstream_environment" name="upstream_environment" class="mono" placeholder="AUTH_TOKEN=replace-me&#10;PORT=8080">{{.SelectedRoute.UpstreamEnvironment}}</textarea>
+                <p class="hint">Nur Metadaten zur Dokumentation des Upstreams.</p>
+              </div>
+            </div>
+
+            <div class="field" data-dyn-group="http openapi">
+              <label for="forward_headers">Forward Headers <span class="hint">(pro angemeldetem Nutzer, mit Platzhaltern wie <code>{email}</code>)</span></label>
+              <textarea id="forward_headers" name="forward_headers" class="mono" placeholder="X-MCP-User: {email}">{{.SelectedRoute.ForwardHeaders}}</textarea>
+            </div>
+
+            <details style="margin-top:.85rem;">
+              <summary>Sichtbarkeit, Zugriff &amp; Berechtigungen</summary>
+              <div style="margin-top:.8rem;">
+                <div class="field-grid">
+                  <div class="field" style="margin-top:0;">
+                    <label for="access_visibility">Katalog-Sichtbarkeit</label>
+                    <select id="access_visibility" name="access_visibility">
+                      <option value="public" {{if eq .SelectedRoute.AccessVisibility "public"}}selected{{end}}>Oeffentlicher Katalog</option>
+                      <option value="private" {{if eq .SelectedRoute.AccessVisibility "private"}}selected{{end}}>Verborgen (nur Link)</option>
+                    </select>
+                  </div>
+                  <div class="field" style="margin-top:0;">
+                    <label for="access_mode">Zugriffsmodus</label>
+                    <select id="access_mode" name="access_mode">
+                      <option value="public" {{if eq .SelectedRoute.AccessMode "public"}}selected{{end}}>Alle angemeldeten Nutzer</option>
+                      <option value="restricted" {{if eq .SelectedRoute.AccessMode "restricted"}}selected{{end}}>Eingeschraenkt (Gruppen/Nutzer)</option>
+                      <option value="admin" {{if eq .SelectedRoute.AccessMode "admin"}}selected{{end}}>Nur Admins</option>
+                    </select>
+                  </div>
                 </div>
-                <div>
-                  <label for="access_mode">Nutzungsrecht</label>
-                  <select id="access_mode" name="access_mode">
-                    <option value="public" {{if eq .SelectedRoute.AccessMode "public"}}selected{{end}}>Alle angemeldeten Nutzer</option>
-                    <option value="restricted" {{if eq .SelectedRoute.AccessMode "restricted"}}selected{{end}}>Nur ausgewaehlte Nutzer/Gruppen</option>
-                    <option value="admin" {{if eq .SelectedRoute.AccessMode "admin"}}selected{{end}}>Nur Admins</option>
-                  </select>
-                </div>
-                <div>
+                <div class="field">
                   <label for="resource_documentation">Resource Documentation URL</label>
                   <input id="resource_documentation" name="resource_documentation" type="url" value="{{.SelectedRoute.ResourceDocumentation}}" placeholder="https://github.com/your-server/docs">
                 </div>
-                <div class="full">
-                  <details>
-                    <summary>Berechtigungsmatrix fuer Nutzer und Gruppen</summary>
-                    <p class="helper">Default nutzt den Modus oben. Allow gilt bei restricted Routen, Deny ist eine harte Sperre und gilt auch fuer Admins.</p>
-                    <table class="access-table">
-                      <thead>
-                        <tr><th>Typ</th><th>Name</th><th>Berechtigung</th></tr>
-                      </thead>
+                <div class="field">
+                  <label for="notes">Notes / Beschreibung</label>
+                  <textarea id="notes" name="notes" placeholder="Kurzbeschreibung, Setup-Hinweise, Reverse-Proxy-Anforderungen...">{{.SelectedRoute.Notes}}</textarea>
+                </div>
+                <details style="margin-top:.8rem;">
+                  <summary>Berechtigungsmatrix fuer Nutzer und Gruppen</summary>
+                  <div style="margin-top:.8rem;">
+                    <p class="hint">Default nutzt den Modus oben. Allow gilt bei restricted Routen, Deny ist eine harte Sperre und gilt auch fuer Admins.</p>
+                    <table>
+                      <thead><tr><th>Typ</th><th>Name</th><th>Berechtigung</th></tr></thead>
                       <tbody>
                         {{range .Groups}}
                           {{$decision := accessDecision $.SelectedRoute "group" .Name}}
@@ -2629,312 +2492,328 @@ const adminDashboardTemplate = `
                         {{end}}
                       </tbody>
                     </table>
-                  </details>
-                </div>
-                <div class="full checkbox">
-                  <input id="pass_authorization_header" name="pass_authorization_header" type="checkbox" {{if .SelectedRoute.PassAuthorization}}checked{{end}}>
-                  <div>
-                    <label for="pass_authorization_header" style="margin:0;">Inbound Authorization an Upstream weiterreichen</label>
-                    <p class="helper">Aus lassen, wenn der Gateway interne Header wie <code>Authorization: Bearer ...</code> setzen soll.</p>
                   </div>
-                </div>
-                <div class="full">
-                  <details>
-                    <summary>Upstream Bearer Auth</summary>
-                    <p class="helper">Fuer MCP-Server wie n8n-mcp, die zusaetzlich zum Gateway-OAuth noch einen internen Bearer erwarten. Werte werden verschluesselt im Auth-Store gespeichert und nicht nach <code>routes.yaml</code> exportiert.</p>
-                    <div class="field-grid" style="margin-top:.9rem;">
-                      <div class="full">
-                        <label for="upstream_bearer_token">Globaler Upstream Bearer</label>
-                        <input id="upstream_bearer_token" name="upstream_bearer_token" type="password" placeholder="{{if .SelectedRoute.UpstreamBearerConfigured}}Token ist gesetzt; leer lassen zum Beibehalten{{else}}n8n AUTH_TOKEN oder anderer Upstream-Bearer{{end}}">
-                        <p class="helper">{{if .SelectedRoute.UpstreamBearerConfigured}}Aktuell ist ein globaler Upstream-Bearer gesetzt.{{else}}Kein globaler Upstream-Bearer gesetzt.{{end}} Nutzer-spezifische Tokens haben Vorrang.</p>
-                      </div>
-                      <div class="full checkbox">
-                        <input id="clear_upstream_bearer" name="clear_upstream_bearer" type="checkbox">
-                        <div>
-                          <label for="clear_upstream_bearer" style="margin:0;">Globalen Upstream Bearer loeschen</label>
-                          <p class="helper">Nur aktivieren, wenn der gespeicherte globale Bearer entfernt werden soll.</p>
-                        </div>
-                      </div>
-                      <div class="full">
-                        <table class="access-table">
-                          <thead>
-                            <tr><th>Nutzer</th><th>Status</th><th>Neuer Bearer</th><th>Loeschen</th></tr>
-                          </thead>
-                          <tbody>
-                            {{range .Users}}
-                              {{$hasBearer := upstreamBearerConfigured $.SelectedRoute .ID}}
-                              <tr>
-                                <td>{{.Email}}</td>
-                                <td>{{if $hasBearer}}gesetzt{{else}}default/global{{end}}</td>
-                                <td>
-                                  <input type="hidden" name="upstream_bearer_user_id" value="{{.ID}}">
-                                  <input name="upstream_bearer_user_token" type="password" placeholder="{{if $hasBearer}}Leer lassen zum Beibehalten{{else}}Optionaler Nutzer-Bearer{{end}}">
-                                </td>
-                                <td style="text-align:center;">
-                                  <input name="clear_user_upstream_bearer" type="checkbox" value="{{.ID}}" {{if not $hasBearer}}disabled{{end}}>
-                                </td>
-                              </tr>
-                            {{end}}
-                          </tbody>
-                        </table>
-                      </div>
-                    </div>
-                  </details>
-                </div>
-                <div class="full">
-                  <label for="forward_headers">Forward Headers</label>
-                  <textarea id="forward_headers" name="forward_headers" placeholder="Authorization: Bearer internal-token&#10;X-MCP-User: {email}">{{.SelectedRoute.ForwardHeaders}}</textarea>
-                </div>
-                <div class="full">
-                  <label for="upstream_environment">Upstream Environment Metadata</label>
-                  <textarea id="upstream_environment" name="upstream_environment" placeholder="AUTH_TOKEN=replace-me&#10;PORT=8080">{{.SelectedRoute.UpstreamEnvironment}}</textarea>
-                  <p class="helper">Nur Metadaten: Der Gateway startet Container in Phase 1 noch nicht selbst.</p>
-                </div>
+                </details>
               </div>
             </details>
-          </div>
-          <div class="form-actions">
-            <button type="submit">Route speichern</button>
-            <a class="link-button secondary" href="/admin">Neue Route</a>
+
+            <div style="display:flex; justify-content:space-between; gap:.6rem; margin-top:1.1rem;">
+              {{if .SelectedRoute.OriginalID}}
+                <button type="submit" form="routeDeleteForm" class="btn btn-danger btn-sm">Route loeschen</button>
+              {{else}}<span></span>{{end}}
+              <div style="display:flex; gap:.5rem;">
+                <a class="btn btn-sm discard-link" href="/admin?{{if .SelectedRoute.OriginalID}}route={{.SelectedRoute.OriginalID}}{{else}}new=1{{end}}">Verwerfen</a>
+                <button type="submit" class="btn btn-primary btn-sm">Speichern</button>
+              </div>
+            </div>
           </div>
         </form>
         {{if .SelectedRoute.OriginalID}}
-          <form method="post" action="/admin/routes/delete">
+          <form id="routeDeleteForm" method="post" action="/admin/routes/delete" style="display:none;">
             <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
             <input type="hidden" name="route_id" value="{{.SelectedRoute.OriginalID}}">
-            <div class="form-actions"><button type="submit" class="danger">Route loeschen</button></div>
           </form>
         {{end}}
-      </section>
+      </div>
     </div>
+    {{else}}
+    <div class="table-card" style="margin-top:1rem;">
+      <table>
+        <thead><tr><th>Route</th><th>Zugriff</th><th>Session</th><th></th></tr></thead>
+        <tbody>
+          {{range .Routes}}
+            <tr>
+              <td>
+                <div class="row-title">{{.DisplayName}}</div>
+                <div class="row-sub mono">{{.PathPrefix}} <span class="transport-chip">{{.Transport}}</span></div>
+              </td>
+              <td>
+                {{if eq .AccessMode "admin"}}<span class="pill pill-danger">Nur Admins</span>{{else if eq .AccessMode "restricted"}}<span class="pill pill-warning">Eingeschraenkt</span>{{else}}<span class="pill pill-neutral">Alle Nutzer</span>{{end}}
+                {{if eq .AccessVisibility "private"}}<span class="pill pill-neutral" style="margin-left:.3rem;">Privat</span>{{end}}
+              </td>
+              <td><span class="mono hint">{{if .MCPHTTPSessionMode}}{{.MCPHTTPSessionMode}}{{else}}&mdash;{{end}}</span></td>
+              <td style="text-align:right;"><a class="btn btn-sm btn-ghost" href="/admin?route={{.ID}}">Bearbeiten</a></td>
+            </tr>
+          {{else}}
+            <tr><td colspan="4" class="hint">Noch keine MCP-Routen angelegt.</td></tr>
+          {{end}}
+        </tbody>
+      </table>
+    </div>
+    {{end}}
+
     {{else if eq .ActiveTab "deployments"}}
 
-    <div class="layout">
-      <section>
-        <h2>Managed Deployments</h2>
-        <p class="muted">Container werden nur verwaltet, wenn Docker Management aktiv ist und der Gateway Zugriff auf den Docker Host hat.</p>
-        {{if .DockerError}}<div class="error" style="margin-top:1rem;">{{.DockerError}}</div>{{end}}
-        <div class="route-list">
-          {{if .Deployments}}
-            {{range .Deployments}}
-              <article class="route-card">
-                <div style="display:flex; justify-content:space-between; gap:1rem; align-items:flex-start;">
-                  <div>
-                    <h3>{{.DisplayName}}</h3>
-                    <p class="muted">{{if eq .Transport "stdio"}}Native STDIO fuer Route{{else}}<code>{{.ContainerName}}</code> fuer Route{{end}} <code>{{.RouteID}}</code></p>
-                  </div>
-                  <span class="tag {{if eq .State "running"}}{{else}}private{{end}}">{{.State}}</span>
-                </div>
-                <div class="route-meta">
-                  <span>Transport: <code>{{.Transport}}</code></span>
-                  {{if eq .Transport "stdio"}}
-                    <span>Command: <code>{{.Command}}</code></span>
-                  {{else}}
-                    <span>Image: <code>{{.Image}}</code></span>
-                    <span>Internal: <code>{{.ContainerName}}:{{.InternalPort}}</code></span>
-                  {{end}}
-                  <span>Upstream: <code>{{.Upstream}}</code></span>
-                  <span>Remote MCP: <code>{{.PublicMCPURL}}</code></span>
-                  {{if .Networks}}<span>Networks: <code>{{.Networks}}</code></span>{{end}}
-                </div>
-                <div class="route-actions">
-                  {{if ne .Transport "stdio"}}
-                    <form method="post" action="/admin/deployments/start">
-                      <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
-                      <input type="hidden" name="route_id" value="{{.RouteID}}">
-                      <button type="submit" class="secondary">Start</button>
-                    </form>
-                    <form method="post" action="/admin/deployments/stop">
-                      <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
-                      <input type="hidden" name="route_id" value="{{.RouteID}}">
-                      <button type="submit" class="secondary">Stop</button>
-                    </form>
-                    <form method="post" action="/admin/deployments/remove">
-                      <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
-                      <input type="hidden" name="route_id" value="{{.RouteID}}">
-                      <button type="submit" class="danger">Remove Container</button>
-                    </form>
-                  {{end}}
-                  <a class="link-button secondary" href="/admin?route={{.RouteID}}">Route bearbeiten</a>
-                </div>
-              </article>
-            {{end}}
-          {{else}}
-            <article class="route-card"><p>Noch keine vom Gateway verwalteten Deployments.</p></article>
-          {{end}}
+    <div class="split">
+      <div class="stack">
+        <div>
+          <h2>Managed Deployments</h2>
+          <p class="hint">Container werden nur verwaltet, wenn Docker Management aktiv ist und der Gateway Zugriff auf den Docker Host hat.</p>
         </div>
-      </section>
-
-      <section>
-        <h2>MCP Deployment anlegen</h2>
-        {{if .DockerEnabled}}
-          <p class="muted">Erzeugt entweder einen HTTP-MCP-Docker-Container oder eine native STDIO-Route im Gateway-Prozess.</p>
+        {{if .DockerError}}<div class="callout danger">{{.DockerError}}</div>{{end}}
+        {{if .Deployments}}
+          <div class="table-card">
+            <table>
+              <thead><tr><th>Deployment</th><th>Status</th><th></th></tr></thead>
+              <tbody>
+                {{range .Deployments}}
+                  <tr>
+                    <td>
+                      <div class="row-title">{{.DisplayName}}</div>
+                      <div class="row-sub mono">{{if eq .Transport "stdio"}}stdio{{else}}{{.ContainerName}}:{{.InternalPort}}{{end}} &middot; {{.RouteID}}</div>
+                      <div class="row-sub">{{if eq .Transport "stdio"}}Command: <code>{{.Command}}</code>{{else}}Image: <code>{{.Image}}</code>{{end}}</div>
+                      {{if .Networks}}<div class="row-sub">Networks: <code>{{.Networks}}</code></div>{{end}}
+                    </td>
+                    <td><span class="pill {{if eq .State "running"}}pill-success{{else}}pill-danger{{end}}">{{.State}}</span></td>
+                    <td style="text-align:right; white-space:nowrap;">
+                      {{if ne .Transport "stdio"}}
+                        <form method="post" action="/admin/deployments/start" style="display:inline;">
+                          <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+                          <input type="hidden" name="route_id" value="{{.RouteID}}">
+                          <button type="submit" class="btn btn-sm btn-ghost">Start</button>
+                        </form>
+                        <form method="post" action="/admin/deployments/stop" style="display:inline;">
+                          <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+                          <input type="hidden" name="route_id" value="{{.RouteID}}">
+                          <button type="submit" class="btn btn-sm btn-ghost">Stop</button>
+                        </form>
+                        <form method="post" action="/admin/deployments/remove" style="display:inline;">
+                          <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+                          <input type="hidden" name="route_id" value="{{.RouteID}}">
+                          <button type="submit" class="btn btn-sm btn-danger">Entfernen</button>
+                        </form>
+                      {{end}}
+                      <a class="btn btn-sm btn-ghost" href="/admin?route={{.RouteID}}">Route</a>
+                    </td>
+                  </tr>
+                {{end}}
+              </tbody>
+            </table>
+          </div>
         {{else}}
-          <p class="muted">Docker Management ist deaktiviert. Native STDIO-Routen funktionieren trotzdem, wenn das Executable im Gateway-Container vorhanden oder gemountet ist.</p>
+          <div class="empty"><p class="muted">Noch keine vom Gateway verwalteten Deployments.</p></div>
         {{end}}
-        <form method="post" action="/admin/deployments/create" style="margin-top:1rem;">
-          <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
-          <div class="field-grid">
-            <div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><h3>MCP Deployment anlegen</h3></div>
+        <div class="panel-body">
+          <p class="hint">{{if .DockerEnabled}}Erzeugt entweder einen HTTP-MCP-Docker-Container oder eine native STDIO-Route im Gateway-Prozess.{{else}}Docker Management ist deaktiviert. Native STDIO-Routen funktionieren trotzdem, wenn das Executable im Gateway-Container vorhanden oder gemountet ist.{{end}}</p>
+          <form method="post" action="/admin/deployments/create" id="deploymentForm">
+            <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+            <div class="field" style="margin-top:.9rem;">
               <label for="deploy_transport">Transport</label>
               <select id="deploy_transport" name="transport">
                 <option value="http" {{if eq .DeploymentForm.Transport "http"}}selected{{end}}>HTTP / Streamable HTTP Container</option>
                 <option value="stdio" {{if eq .DeploymentForm.Transport "stdio"}}selected{{end}}>Native STDIO Command</option>
               </select>
-              <p class="helper">STDIO startet der Gateway selbst pro MCP-Session. Kein extra Adapter-Container.</p>
+              <p class="hint">STDIO startet der Gateway selbst pro MCP-Session. Kein extra Adapter-Container.</p>
             </div>
-            <div>
-              <label for="deploy_display_name">Display Name</label>
-              <input id="deploy_display_name" name="display_name" type="text" value="{{.DeploymentForm.DisplayName}}" placeholder="n8n MCP">
+            <div class="field-grid">
+              <div class="field" style="margin-top:0;">
+                <label for="deploy_display_name">Display Name</label>
+                <input id="deploy_display_name" name="display_name" type="text" value="{{.DeploymentForm.DisplayName}}" placeholder="n8n MCP">
+              </div>
+              <div class="field" style="margin-top:0;">
+                <label for="deploy_id">Route ID</label>
+                <input id="deploy_id" name="id" type="text" class="mono" value="{{.DeploymentForm.ID}}" placeholder="auto">
+              </div>
             </div>
-            <div>
-              <label for="deploy_id">Route ID</label>
-              <input id="deploy_id" name="id" type="text" value="{{.DeploymentForm.ID}}" placeholder="auto">
-            </div>
-            <div class="full">
-              <label for="deploy_image">Docker Image</label>
-              <input id="deploy_image" name="image" type="text" value="{{.DeploymentForm.Image}}" placeholder="ghcr.io/czlonkowski/n8n-mcp:latest">
-              <p class="helper">Nur fuer HTTP-Container erforderlich.</p>
-            </div>
-            <div>
-              <label for="deploy_container_name">Container Name</label>
-              <input id="deploy_container_name" name="container_name" type="text" value="{{.DeploymentForm.ContainerName}}" placeholder="auto aus Route ID">
-            </div>
-            <div>
-              <label for="deploy_internal_port">Interner Port</label>
-              <input id="deploy_internal_port" name="internal_port" type="text" value="{{.DeploymentForm.InternalPort}}" placeholder="8080">
-            </div>
-            <div>
+            <div class="field">
               <label for="deploy_path_prefix">Path Prefix</label>
-              <input id="deploy_path_prefix" name="path_prefix" type="text" value="{{.DeploymentForm.PathPrefix}}" placeholder="/n8n">
+              <input id="deploy_path_prefix" name="path_prefix" type="text" class="mono" value="{{.DeploymentForm.PathPrefix}}" placeholder="/n8n">
             </div>
-            <div>
-              <label for="deploy_upstream_mcp_path">Upstream MCP Path</label>
-              <input id="deploy_upstream_mcp_path" name="upstream_mcp_path" type="text" value="{{.DeploymentForm.UpstreamMCPPath}}" placeholder="/mcp">
+
+            <div data-dyn-group="http">
+              <div class="fieldset-title">Docker-Container</div>
+              <div class="field" style="margin-top:0;">
+                <label for="deploy_image">Docker Image</label>
+                <input id="deploy_image" name="image" type="text" class="mono" value="{{.DeploymentForm.Image}}" placeholder="ghcr.io/czlonkowski/n8n-mcp:latest">
+              </div>
+              <div class="field-grid">
+                <div class="field" style="margin-top:0;">
+                  <label for="deploy_container_name">Container Name</label>
+                  <input id="deploy_container_name" name="container_name" type="text" class="mono" value="{{.DeploymentForm.ContainerName}}" placeholder="auto aus Route ID">
+                </div>
+                <div class="field" style="margin-top:0;">
+                  <label for="deploy_internal_port">Interner Port</label>
+                  <input id="deploy_internal_port" name="internal_port" type="text" class="mono" value="{{.DeploymentForm.InternalPort}}" placeholder="8080">
+                </div>
+              </div>
+              <div class="field">
+                <label for="deploy_upstream_mcp_path">Upstream MCP Path</label>
+                <input id="deploy_upstream_mcp_path" name="upstream_mcp_path" type="text" class="mono" value="{{.DeploymentForm.UpstreamMCPPath}}" placeholder="/mcp">
+              </div>
+              <div class="field">
+                <label for="deploy_networks">Docker Networks</label>
+                <textarea id="deploy_networks" name="networks" class="mono" placeholder="mcp-shared&#10;mcp-internal">{{.DeploymentForm.Networks}}</textarea>
+                <p class="hint">Mindestens ein gemeinsames Docker-Netz mit dem Gateway ist empfohlen, damit <code>http://container:port</code> aufloest.</p>
+              </div>
+              <div class="field">
+                <label for="deployment_upstream_bearer_token">Gateway Upstream Bearer</label>
+                <input id="deployment_upstream_bearer_token" name="deployment_upstream_bearer_token" type="password" placeholder="Optional: derselbe Wert wie AUTH_TOKEN bei n8n-mcp">
+                <p class="hint">Verschluesselt gespeichert, vom Gateway als <code>Authorization: Bearer ...</code> zum Upstream gesendet.</p>
+              </div>
             </div>
-            <details class="advanced full">
-              <summary>Container-Details</summary>
-              <div class="field-grid" style="margin-top:.9rem;">
-                <div>
-                  <label for="deploy_scopes">Scopes</label>
-                  <input id="deploy_scopes" name="scopes_supported" type="text" value="{{.DeploymentForm.ScopesSupported}}" placeholder="mcp">
+
+            <details data-dyn-group="stdio">
+              <summary>Prozess (STDIO)</summary>
+              <div style="margin-top:.8rem;">
+                <div class="field" style="margin-top:0;">
+                  <label for="deploy_stdio_command">Executable / Command</label>
+                  <input id="deploy_stdio_command" name="stdio_command" type="text" class="mono" value="{{.DeploymentForm.StdioCommand}}" placeholder="/tools/portainer-mcp">
+                  <p class="hint">Pfad oder Command, der innerhalb des Gateway-Containers existiert. Fuer Host-Dateien bitte als Volume in den Gateway mounten.</p>
                 </div>
-                <div>
-                  <label for="deploy_restart_policy">Restart Policy</label>
-                  <input id="deploy_restart_policy" name="restart_policy" type="text" value="{{.DeploymentForm.RestartPolicy}}" placeholder="unless-stopped">
+                <div class="field">
+                  <label for="deploy_stdio_args">Argumente</label>
+                  <textarea id="deploy_stdio_args" name="stdio_args" class="mono" placeholder="-server&#10;https://portainer:9443&#10;-token&#10;...">{{.DeploymentForm.StdioArgs}}</textarea>
                 </div>
-                <div class="full">
-                  <label for="deploy_networks">Docker Networks</label>
-                  <textarea id="deploy_networks" name="networks" placeholder="mcp-shared&#10;mcp-internal">{{.DeploymentForm.Networks}}</textarea>
-                  <p class="helper">Mindestens ein gemeinsames Docker-Netz mit dem Gateway ist empfohlen, damit <code>http://container:port</code> aufloest.</p>
+                <div class="field">
+                  <label for="deploy_stdio_env">STDIO Environment</label>
+                  <textarea id="deploy_stdio_env" name="stdio_env" class="mono" placeholder="ANNAS_SECRET_KEY=...&#10;ANNAS_DOWNLOAD_PATH=/data/downloads">{{.DeploymentForm.StdioEnv}}</textarea>
                 </div>
-                <div class="full">
+                <div class="field">
+                  <label for="deploy_stdio_working_dir">Working Directory</label>
+                  <input id="deploy_stdio_working_dir" name="stdio_working_dir" type="text" class="mono" value="{{.DeploymentForm.StdioWorkingDir}}" placeholder="/tools">
+                </div>
+              </div>
+            </details>
+
+            <details style="margin-top:.85rem;">
+              <summary>Weitere Details</summary>
+              <div style="margin-top:.8rem;">
+                <div class="field-grid">
+                  <div class="field" style="margin-top:0;">
+                    <label for="deploy_scopes">Scopes</label>
+                    <input id="deploy_scopes" name="scopes_supported" type="text" class="mono" value="{{.DeploymentForm.ScopesSupported}}" placeholder="mcp">
+                  </div>
+                  <div class="field" style="margin-top:0;">
+                    <label for="deploy_restart_policy">Restart Policy</label>
+                    <input id="deploy_restart_policy" name="restart_policy" type="text" class="mono" value="{{.DeploymentForm.RestartPolicy}}" placeholder="unless-stopped">
+                  </div>
+                </div>
+                <div class="field">
                   <label for="deploy_environment">Environment</label>
-                  <textarea id="deploy_environment" name="environment" placeholder="MCP_MODE=http&#10;PORT=3000&#10;AUTH_TOKEN=secret-for-upstream">{{.DeploymentForm.Environment}}</textarea>
+                  <textarea id="deploy_environment" name="environment" class="mono" placeholder="MCP_MODE=http&#10;PORT=3000&#10;AUTH_TOKEN=secret-for-upstream">{{.DeploymentForm.Environment}}</textarea>
                 </div>
-                <div class="full">
-                  <label for="deployment_upstream_bearer_token">Gateway Upstream Bearer</label>
-                  <input id="deployment_upstream_bearer_token" name="deployment_upstream_bearer_token" type="password" placeholder="Optional: derselbe Wert wie AUTH_TOKEN bei n8n-mcp">
-                  <p class="helper">Wird verschluesselt im Auth-Store gespeichert und vom Gateway als <code>Authorization: Bearer ...</code> zum Upstream gesendet. Fuer individuelle Nutzer-Bearer die Route nach dem Erstellen bearbeiten.</p>
-                </div>
-                <div class="full">
+                <div class="field">
                   <label for="deploy_resource_documentation">Resource Documentation URL</label>
                   <input id="deploy_resource_documentation" name="resource_documentation" type="url" value="{{.DeploymentForm.ResourceDocumentation}}" placeholder="https://github.com/example/mcp">
                 </div>
-                <div class="full">
+                <div class="field">
                   <label for="deploy_notes">Notes</label>
                   <textarea id="deploy_notes" name="notes" placeholder="Deployment-Hinweise...">{{.DeploymentForm.Notes}}</textarea>
                 </div>
               </div>
             </details>
-            <details class="advanced full">
-              <summary>STDIO-Command</summary>
-              <div class="field-grid" style="margin-top:.9rem;">
-                <div class="full">
-                  <label for="deploy_stdio_command">Executable / Command</label>
-                  <input id="deploy_stdio_command" name="stdio_command" type="text" value="{{.DeploymentForm.StdioCommand}}" placeholder="/tools/portainer-mcp">
-                  <p class="helper">Pfad oder Command, der innerhalb des Gateway-Containers existiert. Fuer Host-Dateien bitte als Volume in den Gateway mounten.</p>
-                </div>
-                <div class="full">
-                  <label for="deploy_stdio_args">Argumente</label>
-                  <textarea id="deploy_stdio_args" name="stdio_args" placeholder="-server&#10;https://portainer:9443&#10;-token&#10;...">{{.DeploymentForm.StdioArgs}}</textarea>
-                  <p class="helper">Ein Argument pro Zeile. Leerzeichen werden nicht gesplittet.</p>
-                </div>
-                <div class="full">
-                  <label for="deploy_stdio_env">STDIO Environment</label>
-                  <textarea id="deploy_stdio_env" name="stdio_env" placeholder="ANNAS_SECRET_KEY=...&#10;ANNAS_DOWNLOAD_PATH=/data/downloads">{{.DeploymentForm.StdioEnv}}</textarea>
-                </div>
-                <div class="full">
-                  <label for="deploy_stdio_working_dir">Working Directory</label>
-                  <input id="deploy_stdio_working_dir" name="stdio_working_dir" type="text" value="{{.DeploymentForm.StdioWorkingDir}}" placeholder="/tools">
-                </div>
-              </div>
-            </details>
-          </div>
-          <div class="form-actions">
-            <button type="submit">Deployment erstellen & Route anlegen</button>
-          </div>
-        </form>
-        <div class="divider"></div>
-        <h2>STDIO MCP installieren</h2>
+
+            <div style="margin-top:1.1rem;">
+              <button type="submit" class="btn btn-primary btn-sm">Deployment erstellen &amp; Route anlegen</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    </div>
+
+    {{else if eq .ActiveTab "build"}}
+
+    <div class="build-chooser">
+      <button type="button" class="build-choice is-active" data-build-choice="stdio">
+        <span class="build-choice-title">STDIO MCP installieren</span>
+        <span class="build-choice-desc">Fertiges Binary/Release per GitHub, Download-URL oder Upload als lokal gestarteten MCP-Prozess einbinden.</span>
+      </button>
+      <button type="button" class="build-choice" data-build-choice="image">
+        <span class="build-choice-title">Image aus Artefakt bauen</span>
+        <span class="build-choice-desc">Ein heruntergeladenes oder hochgeladenes Artefakt zu einem eigenen Docker-Image verpacken.</span>
+      </button>
+    </div>
+
+    <div class="panel" data-build-panel="stdio">
+      <div class="panel-head">
+        <h3>STDIO MCP installieren</h3>
+        <span class="pill {{if .StdioInstallEnabled}}pill-success{{else}}pill-neutral{{end}}">{{if .StdioInstallEnabled}}Aktiviert{{else}}Deaktiviert{{end}}</span>
+      </div>
+      <div class="panel-body">
         {{if .StdioInstallEnabled}}
-          <p class="muted">Installiert fertige STDIO-MCP-Artefakte nach <code>{{.StdioInstallStore}}</code>. Maximalgroesse: {{.StdioInstallMaxMB}} MB. Env-Werte werden verschluesselt im Auth-Store gespeichert.</p>
+          <p class="hint">Installiert fertige STDIO-MCP-Artefakte nach <code>{{.StdioInstallStore}}</code>. Maximalgroesse: {{.StdioInstallMaxMB}} MB. Env-Werte werden verschluesselt im Auth-Store gespeichert.</p>
         {{else}}
-          <p class="muted">Der STDIO Installer ist deaktiviert. Setze <code>MCP_GATEWAY_STDIO_INSTALL_ENABLED=true</code>, wenn Admins Uploads, GitHub-Releases oder Download-Links installieren duerfen.</p>
+          <p class="hint">Der STDIO Installer ist deaktiviert. Setze <code>MCP_GATEWAY_STDIO_INSTALL_ENABLED=true</code>, wenn Admins Uploads, GitHub-Releases oder Download-Links installieren duerfen.</p>
         {{end}}
-        <form method="post" action="/admin/stdio/install" enctype="multipart/form-data" style="margin-top:1rem;">
+        <form method="post" action="/admin/stdio/install" enctype="multipart/form-data" id="stdioInstallForm">
           <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+          <div class="field" style="margin-top:.9rem;">
+            <label for="stdio_install_source_kind">Quelle</label>
+            <select id="stdio_install_source_kind" name="stdio_install_source_kind">
+              <option value="github" {{if eq .StdioInstallForm.SourceKind "github"}}selected{{end}}>GitHub Release</option>
+              <option value="url" {{if eq .StdioInstallForm.SourceKind "url"}}selected{{end}}>HTTPS Download</option>
+              <option value="upload" {{if eq .StdioInstallForm.SourceKind "upload"}}selected{{end}}>File Upload</option>
+            </select>
+            <p class="hint" data-dyn-hint="github">Laedt automatisch das passende Release-Asset aus einem GitHub-Repo.</p>
+            <p class="hint" data-dyn-hint="url">Laedt das Artefakt direkt von einer HTTPS-URL. SHA-256 ist Pflicht.</p>
+            <p class="hint" data-dyn-hint="upload">Artefakt wird direkt hochgeladen. SHA-256 ist Pflicht.</p>
+          </div>
           <div class="field-grid">
-            <div>
-              <label for="stdio_install_source_kind">Quelle</label>
-              <select id="stdio_install_source_kind" name="stdio_install_source_kind">
-                <option value="github" {{if eq .StdioInstallForm.SourceKind "github"}}selected{{end}}>GitHub Release</option>
-                <option value="url" {{if eq .StdioInstallForm.SourceKind "url"}}selected{{end}}>HTTPS Download</option>
-                <option value="upload" {{if eq .StdioInstallForm.SourceKind "upload"}}selected{{end}}>File Upload</option>
-              </select>
-            </div>
-            <div>
+            <div class="field" style="margin-top:0;">
               <label for="stdio_install_id">Route ID</label>
-              <input id="stdio_install_id" name="stdio_install_id" type="text" value="{{.StdioInstallForm.ID}}" placeholder="annas">
+              <input id="stdio_install_id" name="stdio_install_id" type="text" class="mono" value="{{.StdioInstallForm.ID}}" placeholder="annas">
             </div>
-            <div>
+            <div class="field" style="margin-top:0;">
               <label for="stdio_install_display_name">Display Name</label>
               <input id="stdio_install_display_name" name="stdio_install_display_name" type="text" value="{{.StdioInstallForm.DisplayName}}" placeholder="Anna's MCP">
             </div>
-            <div>
+            <div class="field" style="margin-top:0;">
               <label for="stdio_install_path_prefix">Path Prefix</label>
-              <input id="stdio_install_path_prefix" name="stdio_install_path_prefix" type="text" value="{{.StdioInstallForm.PathPrefix}}" placeholder="/annas">
+              <input id="stdio_install_path_prefix" name="stdio_install_path_prefix" type="text" class="mono" value="{{.StdioInstallForm.PathPrefix}}" placeholder="/annas">
             </div>
-            <div>
+            <div class="field" style="margin-top:0;">
               <label for="stdio_install_scopes">Scopes</label>
-              <input id="stdio_install_scopes" name="stdio_install_scopes_supported" type="text" value="{{.StdioInstallForm.ScopesSupported}}" placeholder="mcp">
+              <input id="stdio_install_scopes" name="stdio_install_scopes_supported" type="text" class="mono" value="{{.StdioInstallForm.ScopesSupported}}" placeholder="mcp">
             </div>
-            <div class="full">
+          </div>
+
+          <div data-dyn-group="github">
+            <div class="fieldset-title">Quelle: GitHub Release</div>
+            <div class="field" style="margin-top:0;">
               <label for="stdio_install_github_repo">GitHub Repo URL</label>
-              <input id="stdio_install_github_repo" name="stdio_install_github_repo" type="url" value="{{.StdioInstallForm.GitHubRepo}}" placeholder="https://github.com/iosifache/annas-mcp">
+              <input id="stdio_install_github_repo" name="stdio_install_github_repo" type="url" class="mono" value="{{.StdioInstallForm.GitHubRepo}}" placeholder="https://github.com/iosifache/annas-mcp">
             </div>
-            <div>
-              <label for="stdio_install_github_version">GitHub Version</label>
-              <input id="stdio_install_github_version" name="stdio_install_github_version" type="text" value="{{.StdioInstallForm.GitHubVersion}}" placeholder="latest oder v0.0.5">
+            <div class="field-grid">
+              <div class="field" style="margin-top:0;">
+                <label for="stdio_install_github_version">Version</label>
+                <input id="stdio_install_github_version" name="stdio_install_github_version" type="text" class="mono" value="{{.StdioInstallForm.GitHubVersion}}" placeholder="latest oder v0.0.5">
+              </div>
+              <div class="field" style="margin-top:0;">
+                <label for="stdio_install_asset_pattern">Asset Pattern <span class="hint">(optional)</span></label>
+                <input id="stdio_install_asset_pattern" name="stdio_install_asset_pattern" type="text" class="mono" value="{{.StdioInstallForm.AssetPattern}}" placeholder="linux_amd64">
+              </div>
             </div>
-            <div>
-              <label for="stdio_install_asset_pattern">Asset Pattern</label>
-              <input id="stdio_install_asset_pattern" name="stdio_install_asset_pattern" type="text" value="{{.StdioInstallForm.AssetPattern}}" placeholder="linux_amd64">
-              <p class="helper">Leer nutzt automatisch linux_amd64, linux_arm64 usw. passend zur Gateway-Architektur.</p>
+          </div>
+          <div data-dyn-group="url">
+            <div class="fieldset-title">Quelle: HTTPS Download</div>
+            <div class="field" style="margin-top:0;">
+              <label for="stdio_install_download_url">Download URL</label>
+              <input id="stdio_install_download_url" name="stdio_install_download_url" type="url" class="mono" value="{{.StdioInstallForm.DownloadURL}}" placeholder="https://github.com/org/repo/releases/download/v1/server_linux_amd64.tar.xz">
             </div>
-            <div class="full">
-              <label for="stdio_install_download_url">HTTPS Download URL</label>
-              <input id="stdio_install_download_url" name="stdio_install_download_url" type="url" value="{{.StdioInstallForm.DownloadURL}}" placeholder="https://github.com/org/repo/releases/download/v1/server_linux_amd64.tar.xz">
-            </div>
-            <div class="full">
+          </div>
+          <div data-dyn-group="upload">
+            <div class="fieldset-title">Quelle: File Upload</div>
+            <div class="field" style="margin-top:0;">
               <label for="stdio_install_file">Artefakt hochladen</label>
               <input id="stdio_install_file" name="stdio_install_file" type="file">
             </div>
-            <div class="full">
-              <label for="stdio_install_sha256">SHA-256</label>
-              <input id="stdio_install_sha256" name="stdio_install_sha256" type="text" value="{{.StdioInstallForm.SHA256}}" placeholder="optional bei GitHub mit digest, Pflicht fuer Download URL">
-            </div>
-            <div>
+          </div>
+          <div class="field" data-dyn-group="url upload">
+            <label for="stdio_install_sha256">SHA-256 <span class="hint">(Pflicht)</span></label>
+            <input id="stdio_install_sha256" name="stdio_install_sha256" type="text" class="mono" value="{{.StdioInstallForm.SHA256}}" placeholder="64 hex chars oder sha256:...">
+          </div>
+          <div class="field" data-dyn-group="github">
+            <label for="stdio_install_sha256_gh">SHA-256 <span class="hint">(optional, wenn GitHub Digest bereitstellt)</span></label>
+            <input id="stdio_install_sha256_gh" name="stdio_install_sha256" type="text" class="mono" value="{{.StdioInstallForm.SHA256}}" placeholder="optional bei GitHub mit digest">
+          </div>
+
+          <div class="fieldset-title">Entpacken &amp; Start</div>
+          <div class="field-grid">
+            <div class="field" style="margin-top:0;">
               <label for="stdio_install_extract_mode">Entpacken</label>
               <select id="stdio_install_extract_mode" name="stdio_install_extract_mode">
                 <option value="auto" {{if eq .StdioInstallForm.ExtractMode "auto"}}selected{{end}}>Auto</option>
@@ -2944,18 +2823,21 @@ const adminDashboardTemplate = `
                 <option value="zip" {{if eq .StdioInstallForm.ExtractMode "zip"}}selected{{end}}>zip</option>
               </select>
             </div>
-            <div>
+            <div class="field" style="margin-top:0;">
               <label for="stdio_install_executable_path">Executable im Archiv</label>
-              <input id="stdio_install_executable_path" name="stdio_install_executable_path" type="text" value="{{.StdioInstallForm.ExecutablePath}}" placeholder="annas-mcp oder path/in/archive/annas-mcp">
+              <input id="stdio_install_executable_path" name="stdio_install_executable_path" type="text" class="mono" value="{{.StdioInstallForm.ExecutablePath}}" placeholder="annas-mcp oder path/in/archive/annas-mcp">
             </div>
-            <div class="full">
-              <label for="stdio_install_args">Start-Argumente</label>
-              <textarea id="stdio_install_args" name="stdio_install_args" placeholder="mcp">{{.StdioInstallForm.Args}}</textarea>
-              <p class="helper">Ein Argument pro Zeile. Fuer iosifache/annas-mcp: <code>mcp</code>.</p>
-            </div>
-            <div class="full">
+          </div>
+          <div class="field">
+            <label for="stdio_install_args">Start-Argumente <span class="hint">(ein Argument pro Zeile)</span></label>
+            <textarea id="stdio_install_args" name="stdio_install_args" class="mono" placeholder="mcp">{{.StdioInstallForm.Args}}</textarea>
+          </div>
+
+          <details style="margin-top:.85rem;">
+            <summary>Zusatzordner &amp; Environment Secrets</summary>
+            <div style="margin-top:.8rem;">
               <label>Zusatzordner</label>
-              <table class="access-table">
+              <table>
                 <thead><tr><th>Relativer Ordner unter der Installation</th></tr></thead>
                 <tbody>
                   {{range .StdioInstallForm.ExtraFolders}}
@@ -2963,11 +2845,9 @@ const adminDashboardTemplate = `
                   {{end}}
                 </tbody>
               </table>
-              <p class="helper">Leer lassen, wenn keine Ordner benoetigt werden. Absolute Pfade und <code>..</code> werden abgelehnt.</p>
-            </div>
-            <div class="full">
-              <label>Environment Secrets</label>
-              <table class="access-table">
+              <p class="hint">Leer lassen, wenn keine Ordner benoetigt werden. Absolute Pfade und <code>..</code> werden abgelehnt.</p>
+              <label style="margin-top:.9rem;">Environment Secrets</label>
+              <table>
                 <thead><tr><th>Name</th><th>Wert</th></tr></thead>
                 <tbody>
                   {{range $idx, $name := .StdioInstallForm.EnvNames}}
@@ -2978,49 +2858,66 @@ const adminDashboardTemplate = `
                   {{end}}
                 </tbody>
               </table>
-              <p class="helper">Diese Werte landen nicht in <code>routes.yaml</code>, sondern verschluesselt in <code>auth-store.enc</code> und werden erst beim STDIO-Prozessstart injiziert.</p>
+              <p class="hint">Diese Werte landen nicht in <code>routes.yaml</code>, sondern verschluesselt in <code>auth-store.enc</code> und werden erst beim STDIO-Prozessstart injiziert.</p>
             </div>
-          </div>
-          <div class="form-actions">
-            <button type="submit">STDIO MCP installieren & Route anlegen</button>
+          </details>
+
+          <div style="display:flex; justify-content:flex-end; margin-top:1.1rem;">
+            <button type="submit" class="btn btn-primary btn-sm">STDIO MCP installieren &amp; Route anlegen</button>
           </div>
         </form>
-        <div class="divider"></div>
-        <h2>Image aus Artefakt bauen</h2>
+      </div>
+    </div>
+
+    <div class="panel" data-build-panel="image" hidden>
+      <div class="panel-head">
+        <h3>Image aus Artefakt bauen</h3>
+        <span class="pill {{if .BuildEnabled}}pill-success{{else}}pill-neutral{{end}}">{{if .BuildEnabled}}Aktiviert{{else}}Deaktiviert{{end}}</span>
+      </div>
+      <div class="panel-body">
         {{if .BuildEnabled}}
-          <p class="muted">Builds sind aktiv. Downloads sind auf erlaubte Hosts beschraenkt: <code>{{.BuildHosts}}</code>. Maximalgroesse: {{.BuildMaxMB}} MB.</p>
+          <p class="hint">Builds sind aktiv. Downloads sind auf erlaubte Hosts beschraenkt: <code>{{.BuildHosts}}</code>. Maximalgroesse: {{.BuildMaxMB}} MB.</p>
         {{else}}
-          <p class="muted">Builds sind deaktiviert. Setze <code>MCP_GATEWAY_BUILD_ENABLED=true</code>, wenn Admins verifizierte Artefakte in eigene Images bauen duerfen.</p>
+          <p class="hint">Builds sind deaktiviert. Setze <code>MCP_GATEWAY_BUILD_ENABLED=true</code>, wenn Admins verifizierte Artefakte in eigene Images bauen duerfen.</p>
         {{end}}
-        <form method="post" action="/admin/artifacts/build" enctype="multipart/form-data" style="margin-top:1rem;">
+        <form method="post" action="/admin/artifacts/build" enctype="multipart/form-data" id="buildForm">
           <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
-          <div class="field-grid">
-            <div>
-              <label for="build_source_kind">Quelle</label>
-              <select id="build_source_kind" name="source_kind">
-                <option value="url" {{if eq .BuildForm.SourceKind "url"}}selected{{end}}>HTTPS Download</option>
-                <option value="upload" {{if eq .BuildForm.SourceKind "upload"}}selected{{end}}>File Upload</option>
-              </select>
-            </div>
-            <div>
-              <label for="build_image_tag">Image Tag</label>
-              <input id="build_image_tag" name="image_tag" type="text" value="{{.BuildForm.ImageTag}}" placeholder="local/portainer-mcp:0.7.0">
-            </div>
-            <div class="full">
+          <div class="field" style="margin-top:.9rem;">
+            <label for="build_source_kind">Quelle</label>
+            <select id="build_source_kind" name="source_kind">
+              <option value="url" {{if eq .BuildForm.SourceKind "url"}}selected{{end}}>HTTPS Download</option>
+              <option value="upload" {{if eq .BuildForm.SourceKind "upload"}}selected{{end}}>File Upload</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="build_image_tag">Image Tag</label>
+            <input id="build_image_tag" name="image_tag" type="text" class="mono" value="{{.BuildForm.ImageTag}}" placeholder="local/portainer-mcp:0.7.0">
+          </div>
+
+          <div data-dyn-group="url">
+            <div class="fieldset-title">Quelle: HTTPS Download</div>
+            <div class="field" style="margin-top:0;">
               <label for="build_download_url">GitHub Release / HTTPS URL</label>
-              <input id="build_download_url" name="download_url" type="url" value="{{.BuildForm.DownloadURL}}" placeholder="https://github.com/org/repo/releases/download/v1/server-linux-amd64.tar.gz">
-              <p class="helper">Nur HTTPS. Standardmaessig sind GitHub-Release-Hosts erlaubt; private/LAN-Ziele werden blockiert, wenn freie Hosts aktiviert werden.</p>
+              <input id="build_download_url" name="download_url" type="url" class="mono" value="{{.BuildForm.DownloadURL}}" placeholder="https://github.com/org/repo/releases/download/v1/server-linux-amd64.tar.gz">
+              <p class="hint">Nur HTTPS. Standardmaessig sind GitHub-Release-Hosts erlaubt; private/LAN-Ziele werden blockiert, wenn freie Hosts aktiviert werden.</p>
             </div>
-            <div class="full">
+          </div>
+          <div data-dyn-group="upload">
+            <div class="fieldset-title">Quelle: File Upload</div>
+            <div class="field" style="margin-top:0;">
               <label for="build_artifact_file">Artefakt hochladen</label>
               <input id="build_artifact_file" name="artifact_file" type="file">
             </div>
-            <div class="full">
-              <label for="build_sha256">SHA-256 Checksum</label>
-              <input id="build_sha256" name="sha256" type="text" value="{{.BuildForm.SHA256}}" placeholder="64 hex chars oder sha256:...">
-              <p class="helper">Pflicht fuer Upload und Download. Verifiziert wird das Originalartefakt vor dem Entpacken.</p>
-            </div>
-            <div>
+          </div>
+          <div class="field">
+            <label for="build_sha256">SHA-256 Checksum <span class="hint">(Pflicht bei Upload und Download)</span></label>
+            <input id="build_sha256" name="sha256" type="text" class="mono" value="{{.BuildForm.SHA256}}" placeholder="64 hex chars oder sha256:...">
+            <p class="hint">Verifiziert wird das Originalartefakt vor dem Entpacken.</p>
+          </div>
+
+          <div class="fieldset-title">Image-Details</div>
+          <div class="field-grid">
+            <div class="field" style="margin-top:0;">
               <label for="build_extract_mode">Entpacken</label>
               <select id="build_extract_mode" name="extract_mode">
                 <option value="none" {{if eq .BuildForm.ExtractMode "none"}}selected{{end}}>Nicht entpacken</option>
@@ -3028,208 +2925,303 @@ const adminDashboardTemplate = `
                 <option value="zip" {{if eq .BuildForm.ExtractMode "zip"}}selected{{end}}>zip</option>
               </select>
             </div>
-            <div>
+            <div class="field" style="margin-top:0;">
               <label for="build_artifact_path">Pfad im Archiv</label>
-              <input id="build_artifact_path" name="artifact_path" type="text" value="{{.BuildForm.ArtifactPath}}" placeholder="portainer-mcp">
-              <p class="helper">Pflicht bei Archiven. Absolute Pfade, Symlinks und Traversal werden abgelehnt.</p>
+              <input id="build_artifact_path" name="artifact_path" type="text" class="mono" value="{{.BuildForm.ArtifactPath}}" placeholder="portainer-mcp">
+              <p class="hint">Pflicht bei Archiven. Absolute Pfade, Symlinks und Traversal werden abgelehnt.</p>
             </div>
-            <div>
+          </div>
+          <div class="field-grid">
+            <div class="field" style="margin-top:0;">
               <label for="build_base_image">Base Image</label>
-              <input id="build_base_image" name="base_image" type="text" value="{{.BuildForm.BaseImage}}" placeholder="debian:bookworm-slim">
-              <p class="helper">Erlaubt: <code>{{.BuildBaseImages}}</code></p>
+              <input id="build_base_image" name="base_image" type="text" class="mono" value="{{.BuildForm.BaseImage}}" placeholder="debian:bookworm-slim">
+              <p class="hint">Erlaubt: <code>{{.BuildBaseImages}}</code></p>
             </div>
-            <div class="full">
-              <label for="build_entrypoint_args">Feste Start-Argumente</label>
-              <textarea id="build_entrypoint_args" name="entrypoint_args" placeholder="mcp&#10;--port&#10;8080">{{.BuildForm.EntrypointArgs}}</textarea>
-              <p class="helper">Optional, ein Argument pro Zeile. Wird als JSON-ENTRYPOINT erzeugt, nicht als Shell-Command.</p>
-            </div>
-            <div>
+            <div class="field" style="margin-top:0;">
               <label for="build_internal_port">EXPOSE Port</label>
-              <input id="build_internal_port" name="internal_port" type="text" value="{{.BuildForm.InternalPort}}" placeholder="8080">
+              <input id="build_internal_port" name="internal_port" type="text" class="mono" value="{{.BuildForm.InternalPort}}" placeholder="8080">
             </div>
           </div>
-          <div class="form-actions">
-            <button type="submit">Verifizieren & Image bauen</button>
+          <div class="field">
+            <label for="build_entrypoint_args">Feste Start-Argumente <span class="hint">(optional, ein Argument pro Zeile)</span></label>
+            <textarea id="build_entrypoint_args" name="entrypoint_args" class="mono" placeholder="mcp&#10;--port&#10;8080">{{.BuildForm.EntrypointArgs}}</textarea>
+            <p class="hint">Wird als JSON-ENTRYPOINT erzeugt, nicht als Shell-Command.</p>
           </div>
-          <p class="helper">Der Dockerfile-Inhalt wird vom Gateway erzeugt. Es werden keine frei eingegebenen Shell-Kommandos in den Build uebernommen.</p>
+
+          <div style="display:flex; justify-content:flex-end; margin-top:1.1rem;">
+            <button type="submit" class="btn btn-primary btn-sm">Verifizieren &amp; Image bauen</button>
+          </div>
+          <p class="hint" style="margin-top:.6rem;">Der Dockerfile-Inhalt wird vom Gateway erzeugt. Es werden keine frei eingegebenen Shell-Kommandos in den Build uebernommen.</p>
         </form>
-      </section>
+      </div>
     </div>
+
     {{else if eq .ActiveTab "users"}}
 
-    <div class="grid" style="margin-top: 1rem;">
-      <section>
-        <h2>Benutzer</h2>
-        <p class="muted">Schlanke Uebersicht. Details, Gruppen, Passwort und registrierte Clients oeffnest du pro Nutzer.</p>
-        <table class="data-table">
-          <thead>
-            <tr>
-              <th>Email</th>
-              <th>Rolle</th>
-              <th>Gruppen</th>
-              <th>Clients</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody>
-          {{range .Users}}
-            <tr>
-              <td><strong>{{.Email}}</strong><br><span class="muted"><code>{{.ID}}</code></span></td>
-              <td>{{if .IsAdmin}}<span class="pill">Admin</span>{{else}}Nutzer{{end}}</td>
-              <td>{{if .Groups}}{{.Groups}}{{else}}<span class="muted">keine</span>{{end}}</td>
-              <td>{{.DeviceCount}}</td>
-              <td><a class="link-button secondary" href="/admin?tab=users&user={{.ID}}">Details</a></td>
-            </tr>
-          {{else}}
-            <tr><td colspan="5" class="muted">Noch keine Nutzer vorhanden.</td></tr>
-          {{end}}
-          </tbody>
-        </table>
+    <div class="split">
+      <div class="stack">
+        <div class="toolbar">
+          <div>
+            <h2>Benutzer</h2>
+            <p class="hint">Schlanke Uebersicht. Details, Gruppen, Passwort und registrierte Clients oeffnest du pro Nutzer.</p>
+          </div>
+        </div>
+        <div class="table-card">
+          <table>
+            <thead><tr><th>Email</th><th>Rolle</th><th>Gruppen</th><th>Clients</th><th></th></tr></thead>
+            <tbody>
+            {{range .Users}}
+              <tr>
+                <td><div class="row-title">{{.Email}}</div><div class="row-sub mono">{{.ID}}</div></td>
+                <td>{{if .IsAdmin}}<span class="pill pill-info">Admin</span>{{else}}<span class="pill pill-neutral">Nutzer</span>{{end}}</td>
+                <td>{{if .Groups}}{{.Groups}}{{else}}<span class="hint">keine</span>{{end}}</td>
+                <td class="mono">{{.DeviceCount}}</td>
+                <td style="text-align:right;"><a class="btn btn-sm btn-ghost" href="/admin?tab=users&amp;user={{.ID}}">Details</a></td>
+              </tr>
+            {{else}}
+              <tr><td colspan="5" class="hint">Noch keine Nutzer vorhanden.</td></tr>
+            {{end}}
+            </tbody>
+          </table>
+        </div>
 
         {{with .SelectedUser}}
           {{$selected := .}}
-          <article class="user-card detail-panel">
-            <div style="display:flex; justify-content:space-between; gap:1rem; align-items:flex-start;">
-              <div>
-                <h3>{{.Email}}</h3>
-                <div class="user-meta">
-                  <span>ID: <code>{{.ID}}</code></span>
-                  <span>Gruppen: {{if .Groups}}{{.Groups}}{{else}}keine{{end}}</span>
-                  <span>Created: {{.CreatedAt}} | Updated: {{.UpdatedAt}}</span>
-                </div>
-              </div>
-              {{if .IsAdmin}}<span class="pill">Admin</span>{{end}}
+          <div class="panel">
+            <div class="panel-head">
+              <h3>{{.Email}}</h3>
+              {{if .IsAdmin}}<span class="pill pill-info">Admin</span>{{end}}
             </div>
-
-            <details class="advanced" open style="margin-top:1rem;">
-              <summary>Nutzerrechte und Gruppen</summary>
-              <div class="stack" style="margin-top:.9rem;">
-                <form method="post" action="/admin/users/groups" class="small-form">
-                  <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
-                  <input type="hidden" name="user_id" value="{{.ID}}">
-                  <label>Gruppen</label>
-                  <div class="picker-grid">
-                    {{range $.Groups}}
-                      <label class="checkline"><input type="checkbox" name="group_ids" value="{{.ID}}" {{if has $selected.GroupIDs .ID}}checked{{end}}> {{.Name}}</label>
-                    {{else}}
-                      <p class="muted">Noch keine Gruppen angelegt.</p>
-                    {{end}}
-                  </div>
-                  <button type="submit" class="secondary">Gruppen speichern</button>
-                </form>
-
-                <form method="post" action="/admin/users/admin" class="small-form">
-                  <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
-                  <input type="hidden" name="user_id" value="{{.ID}}">
-                  <input type="hidden" name="is_admin" value="{{if .IsAdmin}}false{{else}}true{{end}}">
-                  <button type="submit" class="secondary">{{if .IsAdmin}}Admin-Rolle entfernen{{else}}Admin-Rolle geben{{end}}</button>
-                </form>
+            <div class="panel-body stack">
+              <div class="kv-mini">
+                <span><span class="k">ID</span> <code>{{.ID}}</code></span>
+                <span><span class="k">Gruppen</span> {{if .Groups}}{{.Groups}}{{else}}keine{{end}}</span>
+                <span><span class="k">Erstellt</span> {{.CreatedAt}} &middot; Aktualisiert {{.UpdatedAt}}</span>
               </div>
-            </details>
 
-            <details class="advanced" style="margin-top:1rem;">
-              <summary>Passwort und Konto</summary>
-              <div class="stack" style="margin-top:.9rem;">
-                <form method="post" action="/admin/users/password" class="small-form">
-                  <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
-                  <input type="hidden" name="user_id" value="{{.ID}}">
-                  <label for="password_{{.ID}}">Passwort zuruecksetzen</label>
-                  <input id="password_{{.ID}}" name="password" type="password" minlength="10" placeholder="Neues Passwort" required>
-                  <button type="submit" class="secondary">Passwort setzen</button>
-                </form>
+              <details open>
+                <summary>Nutzerrechte und Gruppen</summary>
+                <div class="stack" style="margin-top:.8rem;">
+                  <form method="post" action="/admin/users/groups">
+                    <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+                    <input type="hidden" name="user_id" value="{{.ID}}">
+                    <label>Gruppen</label>
+                    <div class="field-grid" style="margin-top:.4rem;">
+                      {{range $.Groups}}
+                        <label class="checkbox-row" style="margin-top:0;"><input type="checkbox" name="group_ids" value="{{.ID}}" {{if has $selected.GroupIDs .ID}}checked{{end}}><span>{{.Name}}</span></label>
+                      {{else}}
+                        <p class="hint">Noch keine Gruppen angelegt.</p>
+                      {{end}}
+                    </div>
+                    <button type="submit" class="btn btn-sm" style="margin-top:.8rem;">Gruppen speichern</button>
+                  </form>
 
-                <form method="post" action="/admin/users/delete" class="small-form">
-                  <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
-                  <input type="hidden" name="user_id" value="{{.ID}}">
-                  <button type="submit" class="danger">Nutzer loeschen</button>
-                </form>
-              </div>
-            </details>
+                  <form method="post" action="/admin/users/admin">
+                    <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+                    <input type="hidden" name="user_id" value="{{.ID}}">
+                    <input type="hidden" name="is_admin" value="{{if .IsAdmin}}false{{else}}true{{end}}">
+                    <button type="submit" class="btn btn-sm">{{if .IsAdmin}}Admin-Rolle entfernen{{else}}Admin-Rolle geben{{end}}</button>
+                  </form>
+                </div>
+              </details>
 
-            <details class="advanced" open style="margin-top:1rem;">
-              <summary>Registrierte Clients / Geraete</summary>
-              {{if .Devices}}
-                <table class="data-table">
-                  <thead><tr><th>Client</th><th>Resource</th><th>Zuletzt</th><th>Gueltig bis</th><th></th></tr></thead>
-                  <tbody>
-                    {{range .Devices}}
-                      <tr>
-                        <td><strong>{{.ClientName}}</strong><br><span class="muted"><code>{{.ClientID}}</code></span></td>
-                        <td><code>{{.Resource}}</code><br><span class="muted">Scopes: {{.Scope}} | Tokens: {{.TokenCount}}</span></td>
-                        <td>{{.LastUsedAt}}</td>
-                        <td>{{.RefreshExpiresAt}}</td>
-                        <td>
-                          <form method="post" action="/admin/users/devices/delete">
-                            <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
-                            <input type="hidden" name="user_id" value="{{$selected.ID}}">
-                            <input type="hidden" name="device_id" value="{{.ID}}">
-                            <button type="submit" class="danger">Widerrufen</button>
-                          </form>
-                        </td>
-                      </tr>
-                    {{end}}
-                  </tbody>
-                </table>
-              {{else}}
-                <p class="muted" style="margin-top:.8rem;">Dieser Nutzer hat noch keine OAuth-Clients autorisiert.</p>
-              {{end}}
-            </details>
-          </article>
+              <details>
+                <summary>Passwort und Konto</summary>
+                <div class="stack" style="margin-top:.8rem;">
+                  <form method="post" action="/admin/users/password">
+                    <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+                    <input type="hidden" name="user_id" value="{{.ID}}">
+                    <div class="field" style="margin-top:0;">
+                      <label for="password_{{.ID}}">Passwort zuruecksetzen</label>
+                      <input id="password_{{.ID}}" name="password" type="password" minlength="10" placeholder="Neues Passwort" required>
+                    </div>
+                    <button type="submit" class="btn btn-sm" style="margin-top:.6rem;">Passwort setzen</button>
+                  </form>
+
+                  <form method="post" action="/admin/users/delete">
+                    <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+                    <input type="hidden" name="user_id" value="{{.ID}}">
+                    <button type="submit" class="btn btn-sm btn-danger">Nutzer loeschen</button>
+                  </form>
+                </div>
+              </details>
+
+              <details open>
+                <summary>Registrierte Clients / Geraete</summary>
+                {{if .Devices}}
+                  <table style="margin-top:.8rem;">
+                    <thead><tr><th>Client</th><th>Resource</th><th>Zuletzt</th><th>Gueltig bis</th><th></th></tr></thead>
+                    <tbody>
+                      {{range .Devices}}
+                        <tr>
+                          <td><div class="row-title">{{.ClientName}}</div><div class="row-sub mono">{{.ClientID}}</div></td>
+                          <td><code>{{.Resource}}</code><div class="row-sub">Scopes: {{.Scope}} &middot; Tokens: {{.TokenCount}}</div></td>
+                          <td>{{.LastUsedAt}}</td>
+                          <td>{{.RefreshExpiresAt}}</td>
+                          <td>
+                            <form method="post" action="/admin/users/devices/delete">
+                              <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+                              <input type="hidden" name="user_id" value="{{$selected.ID}}">
+                              <input type="hidden" name="device_id" value="{{.ID}}">
+                              <button type="submit" class="btn btn-sm btn-danger">Widerrufen</button>
+                            </form>
+                          </td>
+                        </tr>
+                      {{end}}
+                    </tbody>
+                  </table>
+                {{else}}
+                  <p class="hint" style="margin-top:.7rem;">Dieser Nutzer hat noch keine OAuth-Clients autorisiert.</p>
+                {{end}}
+              </details>
+            </div>
+          </div>
         {{else}}
-          <article class="mini-card detail-panel"><p class="muted">Waehle einen Nutzer aus, um Gruppen, Rolle, Passwort und registrierte Clients zu verwalten.</p></article>
+          <div class="empty"><p class="muted">Waehle einen Nutzer aus, um Gruppen, Rolle, Passwort und registrierte Clients zu verwalten.</p></div>
         {{end}}
-      </section>
+      </div>
 
-      <section class="stack">
-        <div>
-          <h2>Gruppen</h2>
-          <p class="muted">Gruppen dienen als wiederverwendbare Berechtigungslisten fuer MCP-Routen.</p>
-        </div>
-        <form method="post" action="/admin/groups/create" class="small-form">
-          <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
-          <label for="group_name">Neue Gruppe</label>
-          <input id="group_name" name="name" type="text" placeholder="Legal Team" required>
-          <button type="submit">Gruppe anlegen</button>
-        </form>
-        <div class="stack">
-          {{range .Groups}}
-            <article class="mini-card">
-              <h3>{{.Name}}</h3>
-              <div class="mini-meta">
-                <span>ID: <code>{{.ID}}</code></span>
-                <span>Members: {{.MemberCount}}</span>
+      <div class="stack">
+        <div class="panel">
+          <div class="panel-head"><h3>Gruppen</h3></div>
+          <div class="panel-body stack">
+            <form method="post" action="/admin/groups/create">
+              <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+              <div class="field" style="margin-top:0;">
+                <label for="group_name">Neue Gruppe</label>
+                <input id="group_name" name="name" type="text" placeholder="Legal Team" required>
               </div>
-              <form method="post" action="/admin/groups/delete" class="small-form">
-                <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
-                <input type="hidden" name="group_id" value="{{.ID}}">
-                <button type="submit" class="danger">Gruppe loeschen</button>
-              </form>
-            </article>
-          {{else}}
-            <article class="mini-card"><p class="muted">Noch keine Gruppen angelegt.</p></article>
-          {{end}}
+              <button type="submit" class="btn btn-sm" style="margin-top:.6rem;">Gruppe anlegen</button>
+            </form>
+            <div class="stack-sm">
+              {{range .Groups}}
+                <div class="table-card" style="padding:.8rem 1rem; display:flex; align-items:center; justify-content:space-between; gap:.8rem;">
+                  <div>
+                    <div class="row-title">{{.Name}}</div>
+                    <div class="row-sub mono">{{.ID}} &middot; {{.MemberCount}} Mitglieder</div>
+                  </div>
+                  <form method="post" action="/admin/groups/delete">
+                    <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+                    <input type="hidden" name="group_id" value="{{.ID}}">
+                    <button type="submit" class="btn btn-sm btn-danger">L&ouml;schen</button>
+                  </form>
+                </div>
+              {{else}}
+                <p class="hint">Noch keine Gruppen angelegt.</p>
+              {{end}}
+            </div>
+          </div>
         </div>
 
-        <div class="divider"></div>
-
-        <div>
-          <h2>Neuen Nutzer anlegen</h2>
-          <p class="muted">Auch moeglich, wenn Self-Signup deaktiviert ist.</p>
+        <div class="panel">
+          <div class="panel-head"><h3>Neuen Nutzer anlegen</h3></div>
+          <div class="panel-body">
+            <p class="hint">Auch moeglich, wenn Self-Signup deaktiviert ist.</p>
+            <form method="post" action="/admin/users/create" style="margin-top:.8rem;">
+              <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+              <div class="field" style="margin-top:0;">
+                <label for="user_email">Email</label>
+                <input id="user_email" name="email" type="email" required>
+              </div>
+              <div class="field">
+                <label for="user_password">Passwort</label>
+                <input id="user_password" name="password" type="password" minlength="10" required>
+              </div>
+              <label class="checkbox-row"><input id="user_is_admin" name="is_admin" type="checkbox"><span>Admin-Rechte direkt vergeben</span></label>
+              <button type="submit" class="btn btn-sm" style="margin-top:.8rem;">Nutzer anlegen</button>
+            </form>
+          </div>
         </div>
-        <form method="post" action="/admin/users/create" class="small-form">
-          <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
-          <label for="user_email">Email</label>
-          <input id="user_email" name="email" type="email" required>
-          <label for="user_password">Passwort</label>
-          <input id="user_password" name="password" type="password" minlength="10" required>
-          <label class="checkbox"><input id="user_is_admin" name="is_admin" type="checkbox"> Admin-Rechte direkt vergeben</label>
-          <button type="submit">Nutzer anlegen</button>
-        </form>
-      </section>
+      </div>
     </div>
 
     {{end}}
-  </main>
+
+      </div>
+    </div>
+  </div>
+
+  <div class="confirm-overlay" id="confirm-overlay" hidden>
+    <div class="confirm-card">
+      <h3>Ungespeicherte &Auml;nderungen</h3>
+      <p class="muted" style="margin-top:.4rem;">Diese Route hat ungespeicherte &Auml;nderungen. Was m&ouml;chtest du tun, bevor du wechselst?</p>
+      <div class="confirm-actions">
+        <button type="button" class="btn btn-sm" id="confirm-cancel">Abbrechen</button>
+        <button type="button" class="btn btn-sm btn-danger" id="confirm-discard">Verwerfen &amp; wechseln</button>
+        <button type="button" class="btn btn-sm btn-primary" id="confirm-save">Speichern &amp; wechseln</button>
+      </div>
+    </div>
+  </div>
+
+  ` + webui.DynGroupScript + `
+  <script>
+    (function () {
+      wireDynGroup('route_transport');
+      wireDynGroup('deploy_transport');
+      wireDynGroup('stdio_install_source_kind');
+      wireDynGroup('build_source_kind');
+
+      // ---- Build & Stdio: choose which panel to show ----
+      var choices = document.querySelectorAll('.build-choice');
+      var buildPanels = document.querySelectorAll('[data-build-panel]');
+      choices.forEach(function (choice) {
+        choice.addEventListener('click', function () {
+          var mode = choice.getAttribute('data-build-choice');
+          choices.forEach(function (c) { c.classList.toggle('is-active', c === choice); });
+          buildPanels.forEach(function (p) { p.hidden = p.getAttribute('data-build-panel') !== mode; });
+        });
+      });
+
+      // ---- route editor: dirty tracking + ask before switching away ----
+      var form = document.getElementById('routeForm');
+      if (!form) return;
+      var dirtyHint = document.getElementById('rf-dirty-hint');
+      var nextRouteInput = document.getElementById('next_route');
+      var isDirty = false;
+
+      function setDirty(v) { isDirty = v; if (dirtyHint) dirtyHint.hidden = !v; }
+      form.addEventListener('input', function () { setDirty(true); });
+      form.addEventListener('change', function () { setDirty(true); });
+
+      document.querySelectorAll('.discard-link').forEach(function (a) {
+        a.addEventListener('click', function () { isDirty = false; });
+      });
+
+      var overlay = document.getElementById('confirm-overlay');
+      var pendingHref = null, pendingNext = null;
+      function showConfirm(href, next) { pendingHref = href; pendingNext = next; overlay.hidden = false; }
+      function hideConfirm() { pendingHref = null; pendingNext = null; overlay.hidden = true; }
+
+      document.querySelectorAll('.dirty-guard').forEach(function (a) {
+        a.addEventListener('click', function (e) {
+          if (!isDirty) return;
+          e.preventDefault();
+          showConfirm(a.getAttribute('href'), a.getAttribute('data-next'));
+        });
+      });
+
+      var cancelBtn = document.getElementById('confirm-cancel');
+      var discardBtn = document.getElementById('confirm-discard');
+      var saveBtn = document.getElementById('confirm-save');
+      if (cancelBtn) cancelBtn.addEventListener('click', hideConfirm);
+      if (discardBtn) discardBtn.addEventListener('click', function () {
+        var href = pendingHref;
+        isDirty = false;
+        hideConfirm();
+        if (href) window.location.href = href;
+      });
+      if (saveBtn) saveBtn.addEventListener('click', function () {
+        if (nextRouteInput) nextRouteInput.value = pendingNext || '';
+        isDirty = false;
+        overlay.hidden = true;
+        form.requestSubmit();
+      });
+
+      window.addEventListener('beforeunload', function (e) {
+        if (isDirty) { e.preventDefault(); e.returnValue = ''; }
+      });
+    })();
+  </script>
 </body>
 </html>
 `

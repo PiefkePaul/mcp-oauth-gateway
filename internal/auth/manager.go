@@ -24,6 +24,8 @@ import (
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
+
+	"github.com/PiefkePaul/mcp-oauth-gateway/internal/webui"
 )
 
 const (
@@ -2215,7 +2217,7 @@ func renderHTML(w http.ResponseWriter, tmpl string, data map[string]any) {
 	w.Header().Set("Pragma", "no-cache")
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; img-src 'self' data:; frame-ancestors 'none'")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; form-action 'self'; base-uri 'none'; img-src 'self' data:; frame-ancestors 'none'")
 	_ = t.Execute(w, data)
 }
 
@@ -2242,38 +2244,26 @@ func setNoStoreHeaders(w http.ResponseWriter) {
 
 const layoutTemplate = `
 <!doctype html>
-<html lang="en">
+<html lang="de">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{.Title}}</title>
-  <style>
-    :root { color-scheme: light; font-family: ui-sans-serif, system-ui, sans-serif; }
-    body { margin: 2rem auto; max-width: 44rem; padding: 0 1rem; line-height: 1.5; color: #122033; }
-    h1 { font-size: 1.8rem; margin-bottom: 0.5rem; }
-    h2 { font-size: 1.15rem; margin-top: 1.25rem; }
-    .card { border: 1px solid #d3dae6; border-radius: 16px; padding: 1.25rem; box-shadow: 0 10px 25px rgba(18,32,51,0.06); }
-    .muted { color: #596579; }
-    .error { color: #8f1d1d; margin-bottom: 1rem; }
-    .success { color: #116236; margin-bottom: 1rem; }
-    label { display: block; margin: 0.85rem 0 0.25rem; font-weight: 600; }
-    input[type="email"], input[type="password"], input[type="text"], input[type="number"] {
-      width: 100%; border: 1px solid #c2cbd8; border-radius: 10px; padding: 0.75rem 0.85rem; font: inherit;
-      box-sizing: border-box;
-    }
-    button {
-      margin-top: 1rem; background: #173b67; color: white; border: none; border-radius: 10px; padding: 0.75rem 1rem;
-      font: inherit; cursor: pointer;
-    }
-    a { color: #173b67; }
-    form { margin: 0; }
-    code { background: #f2f5f9; padding: 0.1rem 0.35rem; border-radius: 6px; }
-    hr { border: 0; border-top: 1px solid #d3dae6; margin: 1.25rem 0; }
-  </style>
+  ` + webui.GoogleFonts + `
+  ` + webui.Style + `
 </head>
 <body>
-  <div class="card">
-    {{template "body" .}}
+  <div class="auth-shell">
+    <div class="auth-side">
+      <a class="wordmark" href="/"><span class="mark">GW</span> {{.Title}}</a>
+      <blockquote>&bdquo;Ein Zugang, klare Scopes, volle Kontrolle &uuml;ber jeden MCP-Server.&ldquo;</blockquote>
+      <div class="foot mono">OAuth 2.1 &middot; Dynamic Client Registration</div>
+    </div>
+    <div class="auth-main">
+      <div class="auth-card">
+        {{template "body" .}}
+      </div>
+    </div>
   </div>
 </body>
 </html>
@@ -2281,129 +2271,191 @@ const layoutTemplate = `
 
 const registerTemplate = `
 {{define "body"}}
-<h1>{{.Title}} Registration</h1>
-<p class="muted">Create an account for the shared MCP OAuth gateway.</p>
-{{if .Error}}<p class="error">{{.Error}}</p>{{end}}
-<form method="post" action="/account/register">
+<div>
+  <h1>Konto erstellen</h1>
+  <p class="muted" style="margin-top:.3rem;">Registriere dich f&uuml;r den gemeinsamen MCP OAuth Gateway.</p>
+</div>
+{{if .Error}}<div class="callout danger">{{.Error}}</div>{{end}}
+<form method="post" action="/account/register" class="stack-sm">
   <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
   <input type="hidden" name="next" value="{{.Next}}">
-  <label for="email">Email</label>
-  <input id="email" name="email" type="email" value="{{.Email}}" required autocomplete="email">
-  <label for="password">Password</label>
-  <input id="password" name="password" type="password" required minlength="10" autocomplete="new-password">
-  <button type="submit">Create account</button>
+  <div class="field" style="margin-top:0;">
+    <label for="email">E-Mail</label>
+    <input id="email" name="email" type="email" value="{{.Email}}" required autocomplete="email">
+  </div>
+  <div class="field">
+    <label for="password">Passwort</label>
+    <input id="password" name="password" type="password" required minlength="10" autocomplete="new-password">
+  </div>
+  <button type="submit" class="btn btn-primary" style="justify-content:center; margin-top:.4rem;">Konto erstellen</button>
 </form>
-<p class="muted">Already registered? <a href="/account/login{{if .Next}}?next={{.Next}}{{end}}">Sign in</a></p>
+<p class="muted">Bereits registriert? <a href="/account/login{{if .Next}}?next={{.Next}}{{end}}">Anmelden</a></p>
 {{end}}
 `
 
 const loginTemplate = `
 {{define "body"}}
-<h1>{{.Title}} Sign In</h1>
-<p class="muted">Use your account to authorize MCP clients for protected upstream servers.</p>
-{{if .Error}}<p class="error">{{.Error}}</p>{{end}}
-<form method="post" action="/account/login">
+<div>
+  <h1>Willkommen zur&uuml;ck</h1>
+  <p class="muted" style="margin-top:.3rem;">Melde dich an, um MCP-Clients f&uuml;r gesch&uuml;tzte Server zu autorisieren.</p>
+</div>
+{{if .Error}}<div class="callout danger">{{.Error}}</div>{{end}}
+<form method="post" action="/account/login" class="stack-sm">
   <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
   <input type="hidden" name="next" value="{{.Next}}">
-  <label for="email">Email</label>
-  <input id="email" name="email" type="email" value="{{.Email}}" required autocomplete="email">
-  <label for="password">Password</label>
-  <input id="password" name="password" type="password" required autocomplete="current-password">
-  <button type="submit">Sign in</button>
+  <div class="field" style="margin-top:0;">
+    <label for="email">E-Mail</label>
+    <input id="email" name="email" type="email" value="{{.Email}}" required autocomplete="email">
+  </div>
+  <div class="field">
+    <label for="password">Passwort</label>
+    <input id="password" name="password" type="password" required autocomplete="current-password">
+  </div>
+  <button type="submit" class="btn btn-primary" style="justify-content:center; margin-top:.4rem;">Anmelden</button>
 </form>
-{{if .Next}}<p class="muted">After sign-in you will return to the pending authorization request automatically.</p>{{end}}
+{{if .Next}}<p class="hint">Nach der Anmeldung geht es automatisch mit der ausstehenden Autorisierung weiter.</p>{{end}}
 {{end}}
 `
 
 const accountTemplate = `
 {{define "body"}}
-<h1>{{.Title}} Account</h1>
-<p>Angemeldet als <strong>{{.Email}}</strong>.</p>
-<p class="muted">Hier verwaltest du deine eigenen Gateway-Einstellungen.</p>
-{{if .Notice}}<p class="success">{{.Notice}}</p>{{end}}
-{{if .Error}}<p class="error">{{.Error}}</p>{{end}}
-<p>Rolle: {{if .IsAdmin}}<strong>Admin</strong>{{else}}Nutzer{{end}}</p>
-<p class="muted">Gruppen: {{if .GroupNames}}{{range $idx, $name := .GroupNames}}{{if $idx}}, {{end}}{{$name}}{{end}}{{else}}keine{{end}}</p>
-{{if .IsAdmin}}<p class="muted"><a href="/admin">Admin-Dashboard oeffnen</a></p>{{end}}
-<hr>
-<h2>Registrierte Clients / Geraete</h2>
-<p class="muted">Hier siehst du Clients, fuer die du per OAuth Zugriff freigegeben hast. Entfernen widerruft bestehende Tokens.</p>
+<div>
+  <h1>Dein Account</h1>
+  <p class="muted" style="margin-top:.3rem;">Angemeldet als <strong>{{.Email}}</strong></p>
+</div>
+{{if .Notice}}<div class="callout success">{{.Notice}}</div>{{end}}
+{{if .Error}}<div class="callout danger">{{.Error}}</div>{{end}}
+
+<div class="stat-row">
+  <div class="stat-tile"><div class="label">Rolle</div><div class="value" style="font-size:1.05rem;">{{if .IsAdmin}}Admin{{else}}Mitglied{{end}}</div></div>
+  <div class="stat-tile"><div class="label">Gruppen</div><div class="value" style="font-size:1.05rem;">{{if .GroupNames}}{{range $idx, $name := .GroupNames}}{{if $idx}}, {{end}}{{$name}}{{end}}{{else}}keine{{end}}</div></div>
+  <div class="stat-tile"><div class="label">Ger&auml;te</div><div class="value">{{len .Devices}}</div></div>
+</div>
+{{if .IsAdmin}}<a class="btn btn-sm" href="/admin">Admin-Dashboard &ouml;ffnen</a>{{end}}
+
+<div>
+  <div class="fieldset-title" style="margin-top:0;">Registrierte Clients / Ger&auml;te</div>
+  <p class="hint">Clients, f&uuml;r die du per OAuth Zugriff freigegeben hast. Entfernen widerruft bestehende Tokens.</p>
+</div>
 {{if .Devices}}
-  {{range .Devices}}
-    <div class="card" style="margin-top:.85rem;">
-      <strong>{{.ClientName}}</strong>
-      <p class="muted">Resource: <code>{{if .Resource}}{{.Resource}}{{else}}gatewayweit{{end}}</code></p>
-      <p class="muted">Zuletzt verwendet: {{.LastUsedAt.Format "2006-01-02 15:04"}} | Refresh gueltig bis: {{.RefreshExpiresAt.Format "2006-01-02 15:04"}}</p>
-      <form method="post" action="/account/devices/delete" style="margin-top:.8rem;">
-        <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
-        <input type="hidden" name="device_id" value="{{.ID}}">
-        <button type="submit">Zugriff widerrufen</button>
-      </form>
-    </div>
-  {{end}}
+  <div class="table-card">
+    <table>
+      <tbody>
+        {{range .Devices}}
+          <tr>
+            <td>
+              <div class="row-title">{{.ClientName}}</div>
+              <div class="row-sub mono">Resource: {{if .Resource}}{{.Resource}}{{else}}gatewayweit{{end}}</div>
+              <div class="row-sub">Zuletzt: {{.LastUsedAt.Format "2006-01-02 15:04"}} &middot; Refresh g&uuml;ltig bis {{.RefreshExpiresAt.Format "2006-01-02 15:04"}}</div>
+            </td>
+            <td style="text-align:right; white-space:nowrap;">
+              <form method="post" action="/account/devices/delete">
+                <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+                <input type="hidden" name="device_id" value="{{.ID}}">
+                <button type="submit" class="btn btn-sm btn-danger">Widerrufen</button>
+              </form>
+            </td>
+          </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
 {{else}}
-  <p class="muted">Noch keine OAuth-Clients fuer deinen Account autorisiert.</p>
+  <p class="hint">Noch keine OAuth-Clients f&uuml;r deinen Account autorisiert.</p>
 {{end}}
-<hr>
-<h2>OpenAPI / Bearer Tokens</h2>
-<p class="muted">Diese Tokens sind fuer Clients gedacht, die keinen MCP-OAuth-Flow koennen, z.B. OpenAPI-Tools in Open WebUI. Sie laufen unter deinem Gateway-Account und beachten weiterhin Allow-/Deny-Regeln.</p>
+
+<div>
+  <div class="fieldset-title">OpenAPI / Bearer Tokens</div>
+  <p class="hint">F&uuml;r Clients ohne MCP-OAuth-Flow, z.B. OpenAPI-Tools in Open WebUI. Laufen unter deinem Account und beachten weiterhin Allow-/Deny-Regeln.</p>
+</div>
 {{if .NewBearerToken}}
-  <p class="success">Neuer Bearer Token, nur jetzt sichtbar:</p>
-  <p><code style="word-break:break-all;">{{.NewBearerToken}}</code></p>
+  <div class="callout success" style="display:block;">
+    <strong>Neuer Bearer Token, nur jetzt sichtbar:</strong>
+    <div class="mono" style="word-break:break-all; margin-top:.4rem;">{{.NewBearerToken}}</div>
+  </div>
 {{end}}
-<form method="post" action="/account/tokens/create">
+<form method="post" action="/account/tokens/create" class="field-grid">
   <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
-  <label for="token_name">Name</label>
-  <input id="token_name" name="name" type="text" value="Open WebUI OpenAPI">
-  <label for="expires_days">Gueltigkeit in Tagen</label>
-  <input id="expires_days" name="expires_days" type="number" min="1" max="3650" value="180">
-  <button type="submit">Bearer Token erstellen</button>
+  <div class="field" style="margin-top:0;">
+    <label for="token_name">Name</label>
+    <input id="token_name" name="name" type="text" value="Open WebUI OpenAPI">
+  </div>
+  <div class="field" style="margin-top:0;">
+    <label for="expires_days">G&uuml;ltigkeit in Tagen</label>
+    <input id="expires_days" name="expires_days" type="number" min="1" max="3650" value="180">
+  </div>
+  <div class="full">
+    <button type="submit" class="btn btn-sm">Bearer Token erstellen</button>
+  </div>
 </form>
 {{if .PersonalTokens}}
-  {{range .PersonalTokens}}
-    <div class="card" style="margin-top:.85rem;">
-      <strong>{{.Name}}</strong>
-      <p class="muted">Scope: <code>{{.Scope}}</code> | Resource: <code>{{if .Resource}}{{.Resource}}{{else}}gatewayweit{{end}}</code></p>
-      <p class="muted">Erstellt: {{.CreatedAt.Format "2006-01-02 15:04"}} | Gueltig bis: {{if .ExpiresAt.IsZero}}ohne Ablauf{{else}}{{.ExpiresAt.Format "2006-01-02 15:04"}}{{end}}</p>
-      <p class="muted">Zuletzt verwendet: {{if .LastUsedAt.IsZero}}noch nie{{else}}{{.LastUsedAt.Format "2006-01-02 15:04"}}{{end}}</p>
-      <form method="post" action="/account/tokens/delete" style="margin-top:.8rem;">
-        <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
-        <input type="hidden" name="token_id" value="{{.ID}}">
-        <button type="submit">Token widerrufen</button>
-      </form>
-    </div>
-  {{end}}
+  <div class="table-card">
+    <table>
+      <tbody>
+        {{range .PersonalTokens}}
+          <tr>
+            <td>
+              <div class="row-title">{{.Name}}</div>
+              <div class="row-sub mono">Scope: {{.Scope}} &middot; Resource: {{if .Resource}}{{.Resource}}{{else}}gatewayweit{{end}}</div>
+              <div class="row-sub">Erstellt: {{.CreatedAt.Format "2006-01-02 15:04"}} &middot; G&uuml;ltig bis: {{if .ExpiresAt.IsZero}}ohne Ablauf{{else}}{{.ExpiresAt.Format "2006-01-02 15:04"}}{{end}} &middot; Zuletzt: {{if .LastUsedAt.IsZero}}noch nie{{else}}{{.LastUsedAt.Format "2006-01-02 15:04"}}{{end}}</div>
+            </td>
+            <td style="text-align:right; white-space:nowrap;">
+              <form method="post" action="/account/tokens/delete">
+                <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+                <input type="hidden" name="token_id" value="{{.ID}}">
+                <button type="submit" class="btn btn-sm btn-danger">Widerrufen</button>
+              </form>
+            </td>
+          </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
 {{else}}
-  <p class="muted">Noch keine Bearer Tokens erstellt.</p>
+  <p class="hint">Noch keine Bearer Tokens erstellt.</p>
 {{end}}
-<hr>
-<h2>Passwort aendern</h2>
-<form method="post" action="/account/password">
-  <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
-  <label for="current_password">Aktuelles Passwort</label>
-  <input id="current_password" name="current_password" type="password" required autocomplete="current-password">
-  <label for="new_password">Neues Passwort</label>
-  <input id="new_password" name="new_password" type="password" minlength="10" required autocomplete="new-password">
-  <label for="confirm_password">Neues Passwort bestaetigen</label>
-  <input id="confirm_password" name="confirm_password" type="password" minlength="10" required autocomplete="new-password">
-  <button type="submit">Passwort speichern</button>
-</form>
-<hr>
+
+<details>
+  <summary>Passwort &auml;ndern</summary>
+  <form method="post" action="/account/password" class="stack-sm" style="margin-top:.8rem;">
+    <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+    <div class="field" style="margin-top:0;">
+      <label for="current_password">Aktuelles Passwort</label>
+      <input id="current_password" name="current_password" type="password" required autocomplete="current-password">
+    </div>
+    <div class="field">
+      <label for="new_password">Neues Passwort</label>
+      <input id="new_password" name="new_password" type="password" minlength="10" required autocomplete="new-password">
+    </div>
+    <div class="field">
+      <label for="confirm_password">Neues Passwort best&auml;tigen</label>
+      <input id="confirm_password" name="confirm_password" type="password" minlength="10" required autocomplete="new-password">
+    </div>
+    <button type="submit" class="btn btn-sm" style="width:fit-content;">Passwort speichern</button>
+  </form>
+</details>
+
 <form method="post" action="/account/logout">
   <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
-  <button type="submit">Abmelden</button>
+  <button type="submit" class="btn btn-ghost btn-sm">Abmelden</button>
 </form>
 {{end}}
 `
 
 const authorizeTemplate = `
 {{define "body"}}
-<h1>{{.Title}} Authorization</h1>
-<p><strong>{{.ClientName}}</strong> wants access to:</p>
-<p><code>{{.Resource}}</code></p>
-<p class="muted">Requested scopes: <code>{{.Scope}}</code></p>
-<p class="muted">Signed in as {{.Email}}</p>
-<form method="post" action="/authorize">
+<div>
+  <h1>Zugriff autorisieren</h1>
+  <p class="muted" style="margin-top:.3rem;">Angemeldet als {{.Email}}</p>
+</div>
+<div class="panel">
+  <div class="panel-body stack-sm">
+    <div><strong>{{.ClientName}}</strong> m&ouml;chte auf folgende Ressource zugreifen:</div>
+    <code style="word-break:break-all;">{{.Resource}}</code>
+    <div class="hint">Angeforderte Scopes: <code>{{.Scope}}</code></div>
+  </div>
+</div>
+<form method="post" action="/authorize" class="cluster">
   <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
   <input type="hidden" name="client_id" value="{{.ClientID}}">
   <input type="hidden" name="redirect_uri" value="{{.RedirectURI}}">
@@ -2413,23 +2465,20 @@ const authorizeTemplate = `
   <input type="hidden" name="resource" value="{{.ResourceValue}}">
   <input type="hidden" name="code_challenge" value="{{.CodeChallenge}}">
   <input type="hidden" name="code_challenge_method" value="{{.CodeChallengeMethod}}">
-  <button type="submit" name="action" value="approve">Approve</button>
-  <button type="submit" name="action" value="deny">Deny</button>
+  <button type="submit" name="action" value="approve" class="btn btn-primary">Freigeben</button>
+  <button type="submit" name="action" value="deny" class="btn btn-ghost">Ablehnen</button>
 </form>
 {{end}}
 `
 
 const redirectTemplate = `
 <!doctype html>
-<html lang="en">
+<html lang="de">
 <head>
   <meta charset="utf-8">
   <meta name="referrer" content="no-referrer">
   <title>{{.Title}}</title>
-  <style>
-    body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 2rem; color: #122033; }
-    code { background: #f2f5f9; padding: 0.1rem 0.35rem; border-radius: 6px; word-break: break-all; }
-  </style>
+  ` + webui.Style + `
   <script>
     (function () {
       var target = {{.TargetURLJS}};
@@ -2447,8 +2496,14 @@ const redirectTemplate = `
   </script>
 </head>
 <body>
-  <p>Redirecting... If nothing happens, <a href="{{.TargetURL}}">continue here</a>.</p>
-  <p><code>{{.TargetDisplay}}</code></p>
+  <div class="page" style="max-width:34rem;">
+    <div class="panel">
+      <div class="panel-body stack-sm">
+        <p>Weiterleitung l&auml;uft&hellip; Falls nichts passiert, <a href="{{.TargetURL}}">hier fortfahren</a>.</p>
+        <code style="word-break:break-all;">{{.TargetDisplay}}</code>
+      </div>
+    </div>
+  </div>
 </body>
 </html>
 `
