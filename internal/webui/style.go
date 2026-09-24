@@ -264,8 +264,9 @@ const Style = `<style>
   .route-row-card {
     background: var(--surface); border: 1px solid var(--line); border-radius: 999px;
     padding: .7rem .8rem .7rem 1.2rem; box-shadow: var(--shadow);
-    display: grid; grid-template-columns: 13rem 1fr 11rem 9rem 12rem; gap: 1.2rem; align-items: center; justify-items: start;
+    display: grid; grid-template-columns: 13rem 1fr 11rem 9rem 12rem; gap: 1.2rem; align-items: center;
   }
+  .route-row-card > .pill { justify-self: start; }
   .route-row-card:hover { box-shadow: var(--shadow-lift); border-color: var(--line-strong); }
   .rrc-id h3 { font-size: .94rem; }
   .rrc-id .path { font-family: var(--font-mono); font-size: .76rem; color: var(--faint); margin-top: .1rem; }
