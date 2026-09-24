@@ -222,37 +222,30 @@ const publicDashboardTemplate = `
   <h2>Server</h2>
   <span class="hint">{{len .Routes}} oeffentlich sichtbar</span>
 </div>
-<div class="catalog">
-  {{if .Routes}}
+{{if .Routes}}
+  <div class="catalog-list">
     {{range .Routes}}
-      <article class="route-card">
-        <div class="cluster" style="justify-content:space-between; align-items:flex-start;">
-          <div>
-            <h3>{{.DisplayName}}</h3>
-            <div class="path">{{.ID}}</div>
-          </div>
-          <span class="pill pill-neutral">{{.AccessLabel}}</span>
+      <article class="route-row-card">
+        <div class="rrc-id">
+          <h3>{{.DisplayName}}</h3>
+          <div class="path">{{.MCPURL}}</div>
         </div>
-        {{if .Description}}<p class="muted" style="font-size:.86rem;">{{.Description}}</p>{{end}}
-        <div class="kv-mini">
-          <span><span class="k">MCP URL</span> <code>{{.MCPURL}}</code></span>
-          <span><span class="k">OpenAPI Adapter</span> <code>{{.OpenAPIURL}}</code></span>
-          <span><span class="k">Scopes</span> <code>{{.Scopes}}</code></span>
-          {{if .SessionMode}}<span><span class="k">Session Mode</span> <code>{{.SessionMode}}</code></span>{{end}}
-        </div>
-        <div class="cluster">
+        <p class="rrc-desc">{{if .Description}}{{.Description}}{{else}}<span class="hint">Route <code>{{.ID}}</code></span>{{end}}</p>
+        <div class="rrc-meta"><span class="k">Scopes</span><span class="tt" data-full="{{.Scopes}}"><code>{{.Scopes}}</code></span></div>
+        <span class="pill pill-neutral">{{.AccessLabel}}</span>
+        <div class="rrc-actions">
           <a class="btn btn-sm" href="{{.DocsURL}}">Docs ansehen</a>
           {{if .ResourceDocsURL}}<a class="btn btn-ghost btn-sm" href="{{.ResourceDocsURL}}">Projekt-Doku</a>{{end}}
         </div>
       </article>
     {{end}}
-  {{else}}
-    <div class="empty" style="grid-column:1/-1;">
-      <strong>Noch keine oeffentlichen MCP-Server</strong>
-      <p class="muted">Admins koennen Routen im Dashboard anlegen und entscheiden, welche davon im Katalog sichtbar sind.</p>
-    </div>
-  {{end}}
-</div>
+  </div>
+{{else}}
+  <div class="empty">
+    <strong>Noch keine oeffentlichen MCP-Server</strong>
+    <p class="muted">Admins koennen Routen im Dashboard anlegen und entscheiden, welche davon im Katalog sichtbar sind.</p>
+  </div>
+{{end}}
 {{end}}
 `
 

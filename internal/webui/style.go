@@ -259,6 +259,79 @@ const Style = `<style>
 
   .empty { display: grid; place-items: center; gap: .5rem; padding: 3rem 1rem; text-align: center; color: var(--faint); }
 
+  /* ---------- catalog: one full-width row per server ---------- */
+  .catalog-list { display: grid; gap: .7rem; }
+  .route-row-card {
+    background: var(--surface); border: 1px solid var(--line); border-radius: 999px;
+    padding: .7rem .8rem .7rem 1.2rem; box-shadow: var(--shadow);
+    display: grid; grid-template-columns: 13rem 1fr 11rem auto auto; gap: 1.2rem; align-items: center;
+  }
+  .route-row-card:hover { box-shadow: var(--shadow-lift); border-color: var(--line-strong); }
+  .rrc-id h3 { font-size: .94rem; }
+  .rrc-id .path { font-family: var(--font-mono); font-size: .76rem; color: var(--faint); margin-top: .1rem; }
+  .rrc-desc { font-size: .84rem; color: var(--muted); }
+  .rrc-meta { display: flex; align-items: baseline; gap: .4rem; font-size: .78rem; min-width: 0; text-align: left; }
+  .rrc-meta .k { color: var(--faint); flex: none; }
+  .rrc-meta .tt { position: relative; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: default; }
+  .rrc-meta .tt::after {
+    content: attr(data-full); position: absolute; left: 0; top: calc(100% + .4rem); z-index: 20;
+    background: var(--ink); color: var(--bg); font-family: var(--font-mono); font-size: .74rem;
+    padding: .35rem .55rem; border-radius: 6px; white-space: nowrap; box-shadow: var(--shadow-lift);
+    opacity: 0; pointer-events: none; transform: translateY(-2px); transition: opacity .1s, transform .1s;
+  }
+  .rrc-meta .tt:hover::after { opacity: 1; transform: translateY(0); }
+  .rrc-actions { display: flex; gap: .4rem; }
+
+  /* ---------- admin routes: browse-all vs. compact-list + centered editor ---------- */
+  .editor-shell { display: grid; grid-template-columns: 15rem 1fr; gap: 1.2rem; align-items: start; }
+  .route-compact-list { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); overflow: hidden; position: sticky; top: 1rem; }
+  .compact-list-head { display: flex; justify-content: space-between; gap: .4rem; padding: .7rem; border-bottom: 1px solid var(--line); }
+  .compact-row {
+    display: flex; align-items: center; gap: .5rem; padding: .65rem .7rem; cursor: pointer;
+    border-bottom: 1px solid var(--line); font-size: .82rem; background: none; border-left: 0 solid transparent;
+    width: 100%; text-align: left; color: var(--ink); font: inherit;
+  }
+  .compact-row:last-child { border-bottom: none; }
+  .compact-row:hover { background: var(--surface-2); }
+  .compact-row.is-active { background: var(--accent-soft); border-left: 3px solid var(--accent-strong); padding-left: calc(.7rem - 3px); }
+  .compact-row .dot { width: .5rem; height: .5rem; border-radius: 999px; flex: none; background: var(--faint); }
+  .compact-row.is-active .dot { background: var(--accent-strong); }
+  .compact-row .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+  .compact-row .chip { font-family: var(--font-mono); font-size: .66rem; color: var(--faint); flex: none; }
+  .transport-chip {
+    display: inline-block; font-family: var(--font-mono); font-size: .68rem; font-weight: 600;
+    color: var(--info); background: var(--info-soft); padding: .04rem .4rem; border-radius: 4px; margin-left: .35rem;
+  }
+
+  .editor-center { display: flex; justify-content: center; }
+  .editor-panel { width: 100%; max-width: 40rem; }
+  .editor-panel .panel-body { padding: 1.6rem 1.8rem 1.8rem; }
+  .editor-panel .panel-head { padding: 1.2rem 1.8rem; }
+
+  .confirm-overlay {
+    position: fixed; inset: 0; background: rgba(10,14,12,0.45); backdrop-filter: blur(2px);
+    display: flex; align-items: center; justify-content: center; z-index: 100; padding: 1rem;
+  }
+  .confirm-overlay[hidden] { display: none; }
+  .confirm-card {
+    background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius);
+    box-shadow: var(--shadow-lift); padding: 1.3rem 1.4rem; width: 100%; max-width: 24rem;
+  }
+  .confirm-actions { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: 1.1rem; justify-content: flex-end; }
+
+  /* ---------- build & stdio: choose which form to show ---------- */
+  .build-chooser { display: grid; grid-template-columns: 1fr 1fr; gap: .8rem; }
+  .build-choice {
+    text-align: left; appearance: none; cursor: pointer; font: inherit;
+    background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 1rem 1.1rem; display: grid; gap: .35rem; box-shadow: var(--shadow);
+  }
+  .build-choice:hover { border-color: var(--line-strong); }
+  .build-choice.is-active { border-color: var(--accent); background: var(--accent-soft); box-shadow: none; }
+  .build-choice-title { font-weight: 700; font-size: .92rem; }
+  .build-choice.is-active .build-choice-title { color: var(--accent-strong); }
+  .build-choice-desc { font-size: .8rem; color: var(--muted); }
+
   @media (max-width: 980px) {
     .auth-shell { grid-template-columns: 1fr; }
     .auth-side { display: none; }
@@ -266,6 +339,12 @@ const Style = `<style>
     .admin-rail { display: none; }
     .split { grid-template-columns: 1fr; }
     .field-grid { grid-template-columns: 1fr; }
+    .route-row-card { grid-template-columns: 1fr; border-radius: var(--radius); gap: .5rem; text-align: left; padding: .9rem 1rem; }
+    .rrc-actions { justify-content: flex-start; }
+    .rrc-meta .tt { overflow: visible; white-space: normal; }
+    .editor-shell { grid-template-columns: 1fr; }
+    .route-compact-list { position: static; }
+    .build-chooser { grid-template-columns: 1fr; }
   }
 </style>`
 
@@ -277,12 +356,14 @@ const Style = `<style>
 const GoogleFonts = `<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">`
 
 // DynGroupScript wires up a <select> that toggles a set of sibling
-// "[data-dyn-group]" sections, showing only the one whose data-dyn-group
-// value matches the select's current value. It is the client-side half of
-// "show only the settings that actually apply to the current choice" used by
-// the route transport selector and the STDIO-install / image-build source
-// pickers. Call wireDynGroup('select-id') once per <select> after the DOM
-// for that form has rendered.
+// "[data-dyn-group]" sections, showing only the ones whose data-dyn-group
+// value (a single value, or several separated by spaces when a field
+// applies to more than one choice) contains the select's current value. It
+// is the client-side half of "show only the settings that actually apply to
+// the current choice" used by the route transport selector (some fields,
+// like Forward Headers, are valid for more than one transport) and the
+// STDIO-install / image-build source pickers. Call wireDynGroup('select-id')
+// once per <select> after the DOM for that form has rendered.
 const DynGroupScript = `<script>
   function wireDynGroup(selectId) {
     var select = document.getElementById(selectId);
@@ -290,14 +371,14 @@ const DynGroupScript = `<script>
     var scope = select.closest('form') || document;
     var groups = scope.querySelectorAll('[data-dyn-group]');
     var hints = scope.querySelectorAll('[data-dyn-hint]');
+    function matches(el, attr, mode) {
+      var raw = el.getAttribute(attr) || '';
+      return raw.split(/\s+/).indexOf(mode) !== -1;
+    }
     function apply() {
       var mode = select.value;
-      groups.forEach(function (g) {
-        g.hidden = g.getAttribute('data-dyn-group') !== mode;
-      });
-      hints.forEach(function (h) {
-        h.hidden = h.getAttribute('data-dyn-hint') !== mode;
-      });
+      groups.forEach(function (g) { g.hidden = !matches(g, 'data-dyn-group', mode); });
+      hints.forEach(function (h) { h.hidden = !matches(h, 'data-dyn-hint', mode); });
     }
     select.addEventListener('change', apply);
     apply();
