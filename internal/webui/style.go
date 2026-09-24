@@ -264,7 +264,7 @@ const Style = `<style>
   .route-row-card {
     background: var(--surface); border: 1px solid var(--line); border-radius: 999px;
     padding: .7rem .8rem .7rem 1.2rem; box-shadow: var(--shadow);
-    display: grid; grid-template-columns: 13rem 1fr 11rem auto auto; gap: 1.2rem; align-items: center;
+    display: grid; grid-template-columns: 13rem 1fr 11rem 9rem 12rem; gap: 1.2rem; align-items: center; justify-items: start;
   }
   .route-row-card:hover { box-shadow: var(--shadow-lift); border-color: var(--line-strong); }
   .rrc-id h3 { font-size: .94rem; }
@@ -280,7 +280,7 @@ const Style = `<style>
     opacity: 0; pointer-events: none; transform: translateY(-2px); transition: opacity .1s, transform .1s;
   }
   .rrc-meta .tt:hover::after { opacity: 1; transform: translateY(0); }
-  .rrc-actions { display: flex; gap: .4rem; }
+  .rrc-actions { display: flex; gap: .4rem; flex-wrap: wrap; }
 
   /* ---------- admin routes: browse-all vs. compact-list + centered editor ---------- */
   .editor-shell { display: grid; grid-template-columns: 15rem 1fr; gap: 1.2rem; align-items: start; }
