@@ -16,6 +16,7 @@ import (
 
 	"github.com/PiefkePaul/mcp-oauth-gateway/internal/auth"
 	"github.com/PiefkePaul/mcp-oauth-gateway/internal/config"
+	"github.com/PiefkePaul/mcp-oauth-gateway/internal/webui"
 )
 
 type dashboardData struct {
@@ -863,7 +864,7 @@ func (s *Server) handleAdminArtifactBuild(w http.ResponseWriter, r *http.Request
 		return
 	}
 	notice := fmt.Sprintf("Image %s built from verified artifact sha256:%s", result.ImageTag, result.SHA256)
-	http.Redirect(w, r, adminRedirectURLWithTab("deployments", "", notice, ""), http.StatusFound)
+	http.Redirect(w, r, adminRedirectURLWithTab("build", "", notice, ""), http.StatusFound)
 }
 
 func (s *Server) handleAdminStdioInstall(w http.ResponseWriter, r *http.Request) {
@@ -997,7 +998,7 @@ func (s *Server) handleAdminStdioInstall(w http.ResponseWriter, r *http.Request)
 	}
 
 	notice := fmt.Sprintf("STDIO MCP %s installed with executable %s", route.ID, result.ExecutablePath)
-	http.Redirect(w, r, adminRedirectURLWithTab("deployments", route.ID, notice, ""), http.StatusFound)
+	http.Redirect(w, r, adminRedirectURLWithTab("build", route.ID, notice, ""), http.StatusFound)
 }
 
 func (s *Server) handleAdminDeploymentAction(w http.ResponseWriter, r *http.Request, action string) {
@@ -1860,12 +1861,15 @@ func adminActiveTab(r *http.Request) string {
 	if strings.HasPrefix(r.URL.Path, "/admin/deployments") {
 		return "deployments"
 	}
+	if strings.HasPrefix(r.URL.Path, "/admin/artifacts") || strings.HasPrefix(r.URL.Path, "/admin/stdio") {
+		return "build"
+	}
 	if strings.HasPrefix(r.URL.Path, "/admin/users") || strings.HasPrefix(r.URL.Path, "/admin/groups") {
 		return "users"
 	}
 	tab := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("tab")))
 	switch tab {
-	case "deployments", "users":
+	case "deployments", "users", "build":
 		return tab
 	default:
 		return "routes"
@@ -2120,7 +2124,7 @@ func renderAdminHTML(w http.ResponseWriter, status int, data dashboardData) {
 	w.Header().Set("Pragma", "no-cache")
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; script-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
 	w.WriteHeader(status)
 	_ = t.Execute(w, data)
 }
@@ -2132,290 +2136,74 @@ const adminDashboardTemplate = `
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{.Title}}</title>
-  <style>
-    :root {
-      color-scheme: light;
-      --bg: #eef3ee;
-      --card: #fffdf7;
-      --card-2: #f8fbf4;
-      --border: #d9dece;
-      --ink: #18201c;
-      --muted: #627064;
-      --accent: #145a49;
-      --accent-soft: #e2efe7;
-      --danger: #8c1d1d;
-      --success: #14623d;
-      --warn: #9b5a15;
-      font-family: "Aptos", "Trebuchet MS", system-ui, sans-serif;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      background:
-        radial-gradient(circle at 8% 2%, rgba(20,90,73,0.13), transparent 28rem),
-        radial-gradient(circle at 92% 0%, rgba(155,90,21,0.13), transparent 24rem),
-        linear-gradient(180deg, #fbf8ef 0%, var(--bg) 100%);
-      color: var(--ink);
-    }
-    main { max-width: 88rem; margin: 0 auto; padding: 2rem 1rem 4rem; }
-    header { display: flex; justify-content: space-between; gap: 1rem; align-items: flex-start; margin-bottom: 1.2rem; }
-    h1, h2, h3 { margin: 0; letter-spacing: -0.02em; }
-    h1 { font-size: clamp(2rem, 5vw, 3.4rem); line-height: 1; }
-    h2 { font-size: 1.15rem; margin-bottom: 0.45rem; }
-    h3 { font-size: 0.98rem; }
-    p { margin: 0; }
-    a { color: var(--accent); }
-    .muted { color: var(--muted); }
-    .pill, .tag {
-      display: inline-flex;
-      width: fit-content;
-      background: var(--accent-soft);
-      color: var(--accent);
-      border-radius: 999px;
-      padding: 0.24rem 0.62rem;
-      font-size: 0.82rem;
-      font-weight: 800;
-    }
-    .tag.private { background: #f7e7d7; color: var(--warn); }
-    .top-actions, .route-actions, .inline-actions, .form-actions, .toolbar {
-      display: flex;
-      gap: 0.55rem;
-      flex-wrap: wrap;
-      align-items: center;
-    }
-    .link-button, button {
-      appearance: none;
-      border: 1px solid transparent;
-      background: var(--accent);
-      color: white;
-      border-radius: 999px;
-      padding: 0.72rem 1rem;
-      font: inherit;
-      font-weight: 750;
-      cursor: pointer;
-      text-decoration: none;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-    }
-    button.secondary, .link-button.secondary { background: #fffdf7; color: var(--ink); border-color: var(--border); }
-    button.danger { background: var(--danger); }
-    details.import-menu { position: relative; }
-    details.import-menu summary {
-      list-style: none;
-      border: 1px solid var(--border);
-      background: #fffdf7;
-      color: var(--ink);
-      border-radius: 999px;
-      padding: 0.72rem 1rem;
-      font-weight: 750;
-      cursor: pointer;
-    }
-    details.import-menu summary::-webkit-details-marker { display: none; }
-    .import-panel {
-      position: absolute;
-      right: 0;
-      top: calc(100% + .55rem);
-      z-index: 10;
-      width: min(34rem, calc(100vw - 2rem));
-      background: var(--card);
-      border: 1px solid var(--border);
-      border-radius: 20px;
-      padding: 1rem;
-      box-shadow: 0 24px 70px rgba(24,32,28,0.18);
-    }
-    .tabs {
-      display: flex;
-      gap: .55rem;
-      flex-wrap: wrap;
-      margin: 1rem 0;
-    }
-    .tab {
-      border: 1px solid var(--border);
-      border-radius: 999px;
-      padding: .72rem 1rem;
-      color: var(--ink);
-      background: #fffdf7;
-      text-decoration: none;
-      font-weight: 800;
-    }
-    .tab.active { background: var(--accent); color: white; border-color: var(--accent); }
-    .notice, .error {
-      margin-bottom: 1rem;
-      padding: 0.9rem 1rem;
-      border-radius: 16px;
-      border: 1px solid var(--border);
-    }
-    .notice { background: #edf8f1; color: var(--success); border-color: #b7e1c6; }
-    .error { background: #fff0f0; color: var(--danger); border-color: #f0c3c3; }
-    .summary {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
-      gap: 0.8rem;
-      margin-bottom: 1rem;
-    }
-    .summary-card, section {
-      background: rgba(255,253,247,0.92);
-      border: 1px solid var(--border);
-      border-radius: 22px;
-      box-shadow: 0 18px 50px rgba(24,32,28,0.07);
-    }
-    .summary-card { padding: 1rem; }
-    .summary-card strong { display: block; font-size: 1.22rem; margin-top: 0.35rem; word-break: break-all; }
-    .layout {
-      display: grid;
-      grid-template-columns: minmax(18rem, 0.88fr) minmax(26rem, 1.35fr);
-      gap: 1rem;
-      align-items: start;
-    }
-    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; align-items: start; }
-    section { padding: 1rem; }
-    .stack { display: grid; gap: 0.85rem; }
-    .route-list, .users { display: grid; gap: 0.75rem; margin-top: 1rem; }
-    .route-card, .user-card, .mini-card {
-      border: 1px solid var(--border);
-      border-radius: 18px;
-      padding: 0.95rem;
-      background: linear-gradient(180deg, #fffefb, var(--card-2));
-    }
-    .route-meta, .user-meta, .mini-meta {
-      display: grid;
-      gap: 0.22rem;
-      margin-top: 0.45rem;
-      font-size: 0.91rem;
-    }
-    label { display: block; font-size: 0.9rem; font-weight: 800; margin-bottom: 0.35rem; }
-    input[type="text"], input[type="url"], input[type="email"], input[type="password"], input[type="file"], select, textarea {
-      width: 100%;
-      border: 1px solid #cbd2c3;
-      border-radius: 14px;
-      padding: 0.72rem 0.82rem;
-      font: inherit;
-      background: #fff;
-      color: var(--ink);
-    }
-    textarea {
-      min-height: 7.2rem;
-      resize: vertical;
-      font-family: "SFMono-Regular", "Cascadia Mono", monospace;
-      font-size: 0.88rem;
-    }
-    .field-grid { display: grid; gap: 0.8rem; grid-template-columns: repeat(2, minmax(0, 1fr)); }
-    .full { grid-column: 1 / -1; }
-    .checkbox, .checkline {
-      display: flex;
-      gap: 0.58rem;
-      align-items: flex-start;
-      border: 1px dashed #cad3c2;
-      border-radius: 15px;
-      padding: 0.72rem 0.82rem;
-      background: #fcfff8;
-    }
-    .checkline { font-weight: 650; margin: 0; }
-    .checkbox input, .checkline input { width: auto; margin: 0.18rem 0 0; }
-    .picker-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.6rem; }
-    details.advanced {
-      border: 1px solid var(--border);
-      border-radius: 18px;
-      background: #fffdf7;
-      padding: .85rem;
-    }
-    details.advanced summary {
-      cursor: pointer;
-      font-weight: 850;
-    }
-    .access-table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: .92rem;
-      margin-top: .7rem;
-    }
-    .data-table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: .92rem;
-      margin-top: .8rem;
-    }
-    .data-table th, .data-table td {
-      border-bottom: 1px solid var(--border);
-      padding: .72rem .5rem;
-      text-align: left;
-      vertical-align: top;
-    }
-    .data-table th { color: var(--muted); font-size: .78rem; text-transform: uppercase; letter-spacing: .04em; }
-    .data-table td:last-child { text-align: right; }
-    .detail-panel { margin-top: 1rem; }
-    .access-table th, .access-table td {
-      border-bottom: 1px solid var(--border);
-      padding: .55rem .45rem;
-      text-align: left;
-      vertical-align: middle;
-    }
-    .access-table th { color: var(--muted); font-size: .82rem; }
-    .access-table select { min-width: 9rem; padding: .48rem .55rem; border-radius: 10px; }
-    .helper { font-size: 0.86rem; color: var(--muted); margin-top: 0.3rem; }
-    .small-form { display: grid; gap: 0.5rem; margin-top: 0.75rem; }
-    .divider { height: 1px; background: var(--border); margin: 1rem 0; }
-    code { background: #f0eadf; padding: 0.12rem 0.35rem; border-radius: 7px; word-break: break-all; }
-    @media (max-width: 1080px) {
-      .layout, .grid { grid-template-columns: 1fr; }
-      .field-grid, .picker-grid { grid-template-columns: 1fr; }
-      header { flex-direction: column; }
-    }
-  </style>
+  ` + webui.GoogleFonts + `
+  ` + webui.Style + `
 </head>
 <body>
-  <main>
-    <header>
-      <div class="stack">
-        <span class="pill">Admin Dashboard</span>
-        <h1>{{.Title}}</h1>
-        <p class="muted">Angemeldet als <strong>{{.AdminEmail}}</strong>. Routen, Sichtbarkeit, Rechte, Gruppen und Export zentral verwalten.</p>
+  <div class="admin-shell">
+    <aside class="admin-rail">
+      <a class="wordmark" href="/admin"><span class="mark">GW</span> {{.Title}}</a>
+      <div class="rail-group">
+        <div class="rail-title">Steuerung</div>
+        <a class="rail-link {{if eq .ActiveTab "routes"}}is-active{{end}}" href="/admin">MCP-Routen</a>
+        <a class="rail-link {{if eq .ActiveTab "deployments"}}is-active{{end}}" href="/admin?tab=deployments">Deployments</a>
+        <a class="rail-link {{if eq .ActiveTab "build"}}is-active{{end}}" href="/admin?tab=build">Build &amp; Stdio</a>
       </div>
-      <div class="top-actions">
-        <details class="import-menu">
-          <summary>Import / Export</summary>
-          <div class="import-panel">
-            <h2>Routen sichern</h2>
-            <p class="muted">Full Export enthaelt ggf. interne Tokens. Redacted Export ist zum Teilen gedacht.</p>
-            <div class="form-actions">
-              <a class="link-button" href="/admin/routes/export">Full Export</a>
-              <a class="link-button secondary" href="/admin/routes/export?redacted=true">Redacted Export</a>
+      <div class="rail-group">
+        <div class="rail-title">Zugriff</div>
+        <a class="rail-link {{if eq .ActiveTab "users"}}is-active{{end}}" href="/admin?tab=users">Nutzer &amp; Gruppen</a>
+      </div>
+      <div class="rail-group">
+        <div class="rail-title">Werkzeuge</div>
+        <details>
+          <summary style="font-size:.86rem; padding:.5rem;">Import / Export</summary>
+          <div class="stack-sm" style="margin-top:.7rem;">
+            <p class="hint">Full Export enth&auml;lt ggf. interne Tokens. Redacted Export ist zum Teilen gedacht.</p>
+            <div class="cluster">
+              <a class="btn btn-sm" href="/admin/routes/export">Full Export</a>
+              <a class="btn btn-sm btn-ghost" href="/admin/routes/export?redacted=true">Redacted</a>
             </div>
-            <div class="divider"></div>
-            <form method="post" action="/admin/routes/import" enctype="multipart/form-data" class="small-form">
+            <hr>
+            <form method="post" action="/admin/routes/import" enctype="multipart/form-data" class="stack-sm">
               <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
-              <label for="routes_file">YAML-Datei importieren</label>
-              <input id="routes_file" name="routes_file" type="file" accept=".yaml,.yml,text/yaml">
-              <label for="routes_yaml">Oder YAML einfuegen</label>
-              <textarea id="routes_yaml" name="routes_yaml" placeholder="routes: []"></textarea>
-              <p class="helper">Import ersetzt die aktuelle Routen-Konfiguration nach erfolgreicher Validierung.</p>
-              <button type="submit">Importieren</button>
+              <div class="field" style="margin-top:0;">
+                <label for="routes_file">YAML-Datei importieren</label>
+                <input id="routes_file" name="routes_file" type="file" accept=".yaml,.yml,text/yaml">
+              </div>
+              <div class="field">
+                <label for="routes_yaml">Oder YAML einf&uuml;gen</label>
+                <textarea id="routes_yaml" name="routes_yaml" placeholder="routes: []" rows="3"></textarea>
+                <p class="hint">Ersetzt die aktuelle Routen-Konfiguration nach erfolgreicher Validierung.</p>
+              </div>
+              <button type="submit" class="btn btn-sm">Importieren</button>
             </form>
           </div>
         </details>
-        <a class="link-button secondary" href="/">Public Dashboard</a>
-        <a class="link-button secondary" href="/docs">Docs</a>
-        <a class="link-button secondary" href="/account">Account</a>
       </div>
-    </header>
+      <div class="rail-foot">
+        <div class="cluster">
+          <a class="navlink" style="padding:0;" href="/">Katalog</a>
+          <a class="navlink" style="padding:0;" href="/docs">Docs</a>
+          <a class="navlink" style="padding:0;" href="/account">Account</a>
+        </div>
+        <div class="mono" style="margin-top:.5rem;">{{.AdminEmail}}</div>
+      </div>
+    </aside>
+    <div class="admin-main">
+      <div class="admin-topbar">
+        <div class="breadcrumb">Admin <span>/</span> <strong>{{if eq .ActiveTab "deployments"}}Deployments{{else if eq .ActiveTab "build"}}Build &amp; Stdio{{else if eq .ActiveTab "users"}}Nutzer &amp; Gruppen{{else}}Routes{{end}}</strong></div>
+      </div>
+      <div class="admin-content">
 
-    {{if .Notice}}<div class="notice">{{.Notice}}</div>{{end}}
-    {{if .Error}}<div class="error">{{.Error}}</div>{{end}}
+    {{if .Notice}}<div class="callout success">{{.Notice}}</div>{{end}}
+    {{if .Error}}<div class="callout danger">{{.Error}}</div>{{end}}
 
-    <div class="summary">
-      <div class="summary-card"><span class="muted">Public Base URL</span><strong>{{.PublicBaseURL}}</strong></div>
-      <div class="summary-card"><span class="muted">Routes Config</span><strong>{{.RoutesPath}}</strong></div>
-      <div class="summary-card"><span class="muted">Self-Signup</span><strong>{{if .SelfSignupEnabled}}Enabled{{else}}Disabled{{end}}</strong></div>
-      <div class="summary-card"><span class="muted">Routes / Deployments</span><strong>{{len .Routes}} / {{len .Deployments}}</strong></div>
-      <div class="summary-card"><span class="muted">Docker Management</span><strong>{{if .DockerEnabled}}Enabled{{else}}Disabled{{end}}</strong></div>
+    <div class="stat-row">
+      <div class="stat-tile"><div class="label">Public Base URL</div><div class="value" style="font-size:1rem;">{{.PublicBaseURL}}</div></div>
+      <div class="stat-tile"><div class="label">Routes / Deployments</div><div class="value">{{len .Routes}} / {{len .Deployments}}</div></div>
+      <div class="stat-tile"><div class="label">Self-Signup</div><div class="value" style="font-size:1.1rem;">{{if .SelfSignupEnabled}}Aktiviert{{else}}Deaktiviert{{end}}</div></div>
+      <div class="stat-tile"><div class="label">Docker Management</div><div class="value" style="font-size:1.1rem;">{{if .DockerEnabled}}Aktiviert{{else}}Deaktiviert{{end}}</div></div>
     </div>
-
-    <nav class="tabs">
-      <a class="tab {{if eq .ActiveTab "routes"}}active{{end}}" href="/admin">MCP-Routen</a>
-      <a class="tab {{if eq .ActiveTab "deployments"}}active{{end}}" href="/admin?tab=deployments">Deployments</a>
-      <a class="tab {{if eq .ActiveTab "users"}}active{{end}}" href="/admin?tab=users">Nutzer & Gruppen</a>
-    </nav>
 
     {{if eq .ActiveTab "routes"}}
     <div class="layout">
