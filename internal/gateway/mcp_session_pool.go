@@ -20,7 +20,7 @@ const (
 )
 
 // mcpSessionPool keeps initialized MCP sessions for the OpenAPI adapter, one
-// per route and user, so OpenAPI tool calls do not pay for initialize,
+// per route and agent (auth.Identity.OwnerKey), so OpenAPI tool calls do not pay for initialize,
 // tools/list and (for STDIO routes) a process start on every request.
 type mcpSessionPool struct {
 	idleTTL    time.Duration
@@ -33,7 +33,7 @@ type mcpSessionPool struct {
 
 type mcpSessionKey struct {
 	routeID string
-	userID  string
+	owner   string
 }
 
 type mcpPooledSession struct {
@@ -64,20 +64,10 @@ func newMCPSessionPool() *mcpSessionPool {
 	}
 }
 
-func mcpSessionUserKey(identity *auth.Identity) string {
-	if identity == nil {
-		return ""
-	}
-	if identity.UserID != "" {
-		return "user:" + identity.UserID
-	}
-	return "email:" + identity.Email
-}
-
 // acquire returns the pooled session for route and identity, creating it if
 // needed. Every acquire must be paired with release.
 func (p *mcpSessionPool) acquire(route config.Route, handler http.Handler, identity *auth.Identity, authHeader string) *mcpPooledSession {
-	key := mcpSessionKey{routeID: route.ID, userID: mcpSessionUserKey(identity)}
+	key := mcpSessionKey{routeID: route.ID, owner: identity.OwnerKey()}
 	creds := mcpCallCredentials{identity: identity, authHeader: authHeader}
 
 	p.mu.Lock()

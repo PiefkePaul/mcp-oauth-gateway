@@ -193,7 +193,7 @@ func TestStdioBridgeRejectsCrossUserSessionID(t *testing.T) {
 	sessionID := initStdioOwnerSession(t, handler, alice)
 
 	rec := stdioOwnerRequest(handler, http.MethodPost, bob, sessionID, stdioOwnerPingBody)
-	if rec.Code != http.StatusBadRequest {
+	if rec.Code != http.StatusNotFound {
 		t.Fatalf("cross-user status = %d body=%s", rec.Code, rec.Body.String())
 	}
 	if got := rec.Header().Get(stdioSessionHeader); got != "" {
@@ -212,7 +212,7 @@ func TestStdioBridgeRejectsCrossUserSessionID(t *testing.T) {
 
 	// Anonymous callers cannot reach an authenticated user's session either.
 	anon := stdioOwnerRequest(handler, http.MethodPost, nil, sessionID, stdioOwnerPingBody)
-	if anon.Code != http.StatusBadRequest {
+	if anon.Code != http.StatusNotFound {
 		t.Fatalf("anonymous status = %d body=%s", anon.Code, anon.Body.String())
 	}
 }
@@ -288,7 +288,7 @@ func TestStdioBridgeIgnoresCrossUserDelete(t *testing.T) {
 		t.Fatalf("owner delete status = %d", ownDel.Code)
 	}
 	gone := stdioOwnerRequest(handler, http.MethodPost, alice, sessionID, stdioOwnerPingBody)
-	if gone.Code != http.StatusBadRequest {
+	if gone.Code != http.StatusNotFound {
 		t.Fatalf("request after owner delete status = %d body=%s", gone.Code, gone.Body.String())
 	}
 }

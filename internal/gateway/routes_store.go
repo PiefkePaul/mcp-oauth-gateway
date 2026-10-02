@@ -269,7 +269,7 @@ func (s *Server) buildRouteRuntime(routes []config.Route) (map[string]routeRunti
 		}
 		runtimes[route.ID] = routeRuntime{
 			Route:   route,
-			Handler: handler,
+			Handler: newSessionBinding(route.ID, s.authManager.DeriveKey(sessionBindingKeyLabel), handler),
 			Close:   closeFn,
 		}
 	}

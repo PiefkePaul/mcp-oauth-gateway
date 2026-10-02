@@ -326,7 +326,7 @@ done`
 	if err != nil {
 		t.Fatalf("create bearer token: %v", err)
 	}
-	bridge := server.runtime["once"].Handler.(*stdioBridge)
+	bridge := server.runtime["once"].Handler.(*sessionBinding).next.(*stdioBridge)
 
 	call := func() *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodPost, "https://mcp.example.com/once/openapi/tools/once", strings.NewReader(`{}`))

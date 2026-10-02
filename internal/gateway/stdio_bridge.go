@@ -127,6 +127,11 @@ func (b *stdioBridge) handlePost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	session, err := b.sessionForRequest(r.Header.Get(stdioSessionHeader), stdioSessionOwner(r), hasInitialize)
+	if errors.Is(err, errStdioSessionUnknown) {
+		// 404 tells spec-compliant clients to start a new session.
+		writeSessionNotFound(w)
+		return
+	}
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"error":             "stdio_session_error",
@@ -223,21 +228,13 @@ func (b *stdioBridge) handleSSE(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// stdioSessionOwner returns the identity key a session is bound to: the
-// authenticated user ID, falling back to the email. Requests without an
-// identity map to "" and can only reach sessions created without one.
+var errStdioSessionUnknown = errors.New("unknown stdio session")
+
+// stdioSessionOwner returns the agent a session is bound to (user plus
+// credential, see auth.Identity.OwnerKey). Requests without an identity map
+// to "" and can only reach sessions created without one.
 func stdioSessionOwner(r *http.Request) string {
-	identity := auth.IdentityFromContext(r.Context())
-	if identity == nil {
-		return ""
-	}
-	if id := strings.TrimSpace(identity.UserID); id != "" {
-		return "user:" + id
-	}
-	if email := strings.TrimSpace(identity.Email); email != "" {
-		return "email:" + strings.ToLower(email)
-	}
-	return ""
+	return auth.IdentityFromContext(r.Context()).OwnerKey()
 }
 
 func (b *stdioBridge) sessionForRequest(requestedID, owner string, forceNew bool) (*stdioSession, error) {
@@ -257,7 +254,7 @@ func (b *stdioBridge) sessionForRequest(requestedID, owner string, forceNew bool
 		// A session owned by someone else is reported exactly like a missing
 		// one so callers cannot probe for other users' session IDs.
 		if session == nil || session.owner != owner {
-			return nil, fmt.Errorf("unknown stdio session %q", requestedID)
+			return nil, fmt.Errorf("%w %q", errStdioSessionUnknown, requestedID)
 		}
 		return session, nil
 	}

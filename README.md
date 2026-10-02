@@ -178,6 +178,16 @@ Wichtig:
 - Der Gateway bridged JSON-RPC direkt zwischen Streamable HTTP und STDIO. Server-seitige Reverse-Requests wie Sampling werden aktuell bewusst abgelehnt.
 - Admins sollten nur vertrauenswuerdige Executables eintragen. Native STDIO-Kommandos laufen mit den Rechten des Gateway-Containers.
 
+### Session-Isolation
+
+Jede MCP-Session ist an die Route und den Agenten gebunden, der sie erzeugt hat (User plus OAuth-Login bzw. persoenlicher Bearer-Token, siehe "Agenten und Refresh-Tokens"). Das gilt fuer alle Transporte, auch fuer HTTP-Upstreams, die alle Gateway-User mit demselben Upstream-Bearer sehen:
+
+- Der Gateway gibt `Mcp-Session-Id` nur signiert als `<upstream-id>.<signatur>` an Clients heraus und reicht dem Upstream die urspruengliche ID weiter.
+- Eine Session-ID eines anderen Users oder eines anderen Agenten desselben Users wird mit HTTP 404 beantwortet und erreicht den Upstream nicht. Spezifikationskonforme Clients starten daraufhin eine neue Session.
+- Mehrere Prozesse mit demselben Login (z.B. zwei Terminals) bekommen trotzdem je eine eigene Session und koennen parallel arbeiten.
+- Nach einem Update auf diese Version sind bestehende Session-IDs einmalig ungueltig (404); Clients initialisieren neu.
+- Nicht abgedeckt: Legacy-HTTP+SSE-Upstreams, die die Session-ID in der URL (`?sessionId=`) statt im Header fuehren.
+
 ### STDIO Installer
 
 Der optionale STDIO-Installer nimmt dir die NAS-Handarbeit ab: Im Deployments-Reiter kannst du ein Binary-Artefakt hochladen, per HTTPS-URL herunterladen oder aus einem GitHub-Release auswaehlen. Der Gateway installiert die ausgewaehlte Executable in einen persistenten Ordner unter `MCP_GATEWAY_STDIO_STORE_DIR`, erstellt eine STDIO-Route und speichert eingegebene Env-Werte im verschluesselten Auth-Store.

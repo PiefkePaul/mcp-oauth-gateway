@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -1990,6 +1991,14 @@ func (m *Manager) identityFromSession(r *http.Request) (*Identity, error) {
 	identity := m.identityForUserLocked(user)
 	identity.CredentialKind = CredentialWebSession
 	return identity, nil
+}
+
+// DeriveKey returns a 32-byte key for label derived from the master key, so
+// other components never need the master key itself.
+func (m *Manager) DeriveKey(label string) []byte {
+	mac := hmac.New(sha256.New, m.cfg.MasterKey)
+	mac.Write([]byte("mcp-oauth-gateway/" + label))
+	return mac.Sum(nil)
 }
 
 func (m *Manager) refreshReuseAllowed(record *refreshTokenRecord, now time.Time) bool {
