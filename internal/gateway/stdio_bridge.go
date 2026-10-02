@@ -255,6 +255,13 @@ func (b *stdioBridge) sessionForRequest(requestedID, owner string, forceNew bool
 		return session, nil
 	}
 
+	// Only initialize may open a session. Anything else without a session ID
+	// would otherwise start an uninitialized child process that is never
+	// cleaned up.
+	if requestedID == "" && !forceNew {
+		return nil, fmt.Errorf("missing %s header; send initialize first", stdioSessionHeader)
+	}
+
 	sessionID, err := randomSessionID()
 	if err != nil {
 		return nil, err

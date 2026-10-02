@@ -217,16 +217,52 @@ func TestStdioBridgeRejectsCrossUserSessionID(t *testing.T) {
 	}
 }
 
-func TestStdioBridgeDoesNotReuseOtherUsersSessionWithoutHeader(t *testing.T) {
+func stdioBridgeSessionCount(t *testing.T, handler http.Handler) int {
+	t.Helper()
+	bridge, ok := handler.(*stdioBridge)
+	if !ok {
+		t.Fatalf("handler is %T, want *stdioBridge", handler)
+	}
+	bridge.mu.Lock()
+	defer bridge.mu.Unlock()
+	return len(bridge.sessions)
+}
+
+func TestStdioBridgeRejectsNonInitializeWithoutSessionHeader(t *testing.T) {
 	handler := newOwnershipTestBridge(t)
 	alice := &auth.Identity{UserID: "alice-id"}
 	bob := &auth.Identity{UserID: "bob-id"}
 
-	aliceSession := initStdioOwnerSession(t, handler, alice)
+	// Without any session, a header-less request must not spawn a process.
+	rec := stdioOwnerRequest(handler, http.MethodPost, alice, "", stdioOwnerPingBody)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("header-less ping status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get(stdioSessionHeader); got != "" {
+		t.Fatalf("rejected request must not carry a session header, got %q", got)
+	}
+	if n := stdioBridgeSessionCount(t, handler); n != 0 {
+		t.Fatalf("header-less request started %d session(s)", n)
+	}
 
-	rec := stdioOwnerRequest(handler, http.MethodPost, bob, "", stdioOwnerPingBody)
-	if got := rec.Header().Get(stdioSessionHeader); got == aliceSession {
-		t.Fatalf("header-less request from another user was routed to the only existing session")
+	// Notifications are rejected the same way.
+	notify := stdioOwnerRequest(handler, http.MethodPost, alice, "", `{"jsonrpc":"2.0","method":"notifications/initialized"}`)
+	if notify.Code != http.StatusBadRequest {
+		t.Fatalf("header-less notification status = %d body=%s", notify.Code, notify.Body.String())
+	}
+
+	// With exactly one session open, a header-less request from another user
+	// is neither routed to it nor given a new process.
+	initStdioOwnerSession(t, handler, alice)
+	rec = stdioOwnerRequest(handler, http.MethodPost, bob, "", stdioOwnerPingBody)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("header-less ping with one session status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get(stdioSessionHeader); got != "" {
+		t.Fatalf("header-less request was routed to session %q", got)
+	}
+	if n := stdioBridgeSessionCount(t, handler); n != 1 {
+		t.Fatalf("expected 1 session, got %d", n)
 	}
 }
 
