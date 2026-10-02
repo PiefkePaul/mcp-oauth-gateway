@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/PiefkePaul/mcp-oauth-gateway/internal/auth"
 	"github.com/PiefkePaul/mcp-oauth-gateway/internal/config"
 )
 
@@ -44,6 +45,7 @@ type stdioSecretResolver func(route config.Route) (map[string]string, error)
 
 type stdioSession struct {
 	id     string
+	owner  string
 	route  config.Route
 	cancel context.CancelFunc
 	cmd    *exec.Cmd
@@ -124,7 +126,7 @@ func (b *stdioBridge) handlePost(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	session, err := b.sessionForRequest(r.Header.Get(stdioSessionHeader), hasInitialize)
+	session, err := b.sessionForRequest(r.Header.Get(stdioSessionHeader), stdioSessionOwner(r), hasInitialize)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"error":             "stdio_session_error",
@@ -176,9 +178,16 @@ func (b *stdioBridge) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	owner := stdioSessionOwner(r)
 	b.mu.Lock()
 	session := b.sessions[sessionID]
-	delete(b.sessions, sessionID)
+	if session != nil && session.owner == owner {
+		delete(b.sessions, sessionID)
+	} else {
+		// Unknown or foreign session: answer identically so the response does
+		// not reveal whether the session exists.
+		session = nil
+	}
 	b.mu.Unlock()
 
 	if session != nil {
@@ -214,7 +223,24 @@ func (b *stdioBridge) handleSSE(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (b *stdioBridge) sessionForRequest(requestedID string, forceNew bool) (*stdioSession, error) {
+// stdioSessionOwner returns the identity key a session is bound to: the
+// authenticated user ID, falling back to the email. Requests without an
+// identity map to "" and can only reach sessions created without one.
+func stdioSessionOwner(r *http.Request) string {
+	identity := auth.IdentityFromContext(r.Context())
+	if identity == nil {
+		return ""
+	}
+	if id := strings.TrimSpace(identity.UserID); id != "" {
+		return "user:" + id
+	}
+	if email := strings.TrimSpace(identity.Email); email != "" {
+		return "email:" + strings.ToLower(email)
+	}
+	return ""
+}
+
+func (b *stdioBridge) sessionForRequest(requestedID, owner string, forceNew bool) (*stdioSession, error) {
 	requestedID = strings.TrimSpace(requestedID)
 
 	b.mu.Lock()
@@ -228,18 +254,19 @@ func (b *stdioBridge) sessionForRequest(requestedID string, forceNew bool) (*std
 			delete(b.sessions, requestedID)
 			session = nil
 		}
-		if session == nil {
+		// A session owned by someone else is reported exactly like a missing
+		// one so callers cannot probe for other users' session IDs.
+		if session == nil || session.owner != owner {
 			return nil, fmt.Errorf("unknown stdio session %q", requestedID)
 		}
 		return session, nil
 	}
 
-	if requestedID == "" && !forceNew && len(b.sessions) == 1 {
-		for _, session := range b.sessions {
-			if !session.exited() {
-				return session, nil
-			}
-		}
+	// Only initialize may open a session. Anything else without a session ID
+	// would otherwise start an uninitialized child process that is never
+	// cleaned up.
+	if requestedID == "" && !forceNew {
+		return nil, fmt.Errorf("missing %s header; send initialize first", stdioSessionHeader)
 	}
 
 	sessionID, err := randomSessionID()
@@ -250,6 +277,7 @@ func (b *stdioBridge) sessionForRequest(requestedID string, forceNew bool) (*std
 	if err != nil {
 		return nil, err
 	}
+	session.owner = owner
 	b.sessions[sessionID] = session
 	return session, nil
 }
