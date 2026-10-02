@@ -429,7 +429,7 @@ func (m *Manager) DeleteGroup(groupID string) error {
 		user.GroupIDs = removeString(user.GroupIDs, groupID)
 		user.UpdatedAt = now.Unix()
 	}
-	return m.saveLocked()
+	return m.saveAndNotifyLocked()
 }
 
 func (m *Manager) SetUserGroups(userID string, groupIDs []string) error {
@@ -444,7 +444,7 @@ func (m *Manager) SetUserGroups(userID string, groupIDs []string) error {
 	}
 	user.GroupIDs = filterExistingGroupIDs(groupIDs, m.data.Groups)
 	user.UpdatedAt = now.Unix()
-	return m.saveLocked()
+	return m.saveAndNotifyLocked()
 }
 
 func (m *Manager) SetUserPassword(userID, password string) error {
@@ -488,7 +488,7 @@ func (m *Manager) SetUserAdmin(userID string, isAdmin bool) error {
 
 	user.IsAdmin = isAdmin
 	user.UpdatedAt = now.Unix()
-	return m.saveLocked()
+	return m.saveAndNotifyLocked()
 }
 
 func (m *Manager) DeleteUser(userID string) error {
@@ -536,7 +536,7 @@ func (m *Manager) DeleteUser(userID string) error {
 		delete(record.UserUpstreamBearers, userID)
 		m.deleteEmptyRouteSecretLocked(routeID)
 	}
-	return m.saveLocked()
+	return m.saveAndNotifyLocked()
 }
 
 func (m *Manager) ListUserDevices(userID string) []UserDevice {
@@ -584,7 +584,7 @@ func (m *Manager) RevokeUserDevice(userID, deviceID string) error {
 	if !removed {
 		return fmt.Errorf("device not found")
 	}
-	return m.saveLocked()
+	return m.saveAndNotifyLocked()
 }
 
 func (m *Manager) CreatePersonalAccessToken(userID, name string, ttl time.Duration) (string, PersonalAccessToken, error) {
@@ -657,7 +657,7 @@ func (m *Manager) RevokeUserPersonalAccessToken(userID, tokenID string) error {
 		return fmt.Errorf("token not found")
 	}
 	delete(m.data.PersonalTokens, tokenID)
-	return m.saveLocked()
+	return m.saveAndNotifyLocked()
 }
 
 func (m *Manager) createUser(email, password string, isAdmin bool, enforceAllowlist bool) (*userRecord, error) {
@@ -764,7 +764,7 @@ func (m *Manager) userDevicesLocked(userID string) []UserDevice {
 
 	devicesByID := map[string]*accumulator{}
 	for _, record := range m.data.RefreshTokens {
-		if record.UserID != userID {
+		if record.UserID != userID || record.RotatedAt > 0 {
 			continue
 		}
 		deviceID := grantDeviceID(record.UserID, record.ClientID, record.Resource)

@@ -27,25 +27,37 @@ const (
 	stdioRequestTimeout      = 5 * time.Minute
 	maxStdioBridgeBodyBytes  = 16 << 20
 	stdioSSEHeartbeat        = 25 * time.Second
+	stdioWaitDelay           = 5 * time.Second
 	jsonrpcInternalErrorCode = -32603
 	jsonrpcInvalidErrorCode  = -32600
 	jsonrpcMethodNotFound    = -32601
+	stdioBridgeErrorPrefix   = "stdio bridge error: "
 )
 
 type stdioBridge struct {
 	route          config.Route
 	secretResolver stdioSecretResolver
+	opts           stdioBridgeOptions
 
 	mu       sync.Mutex
 	sessions map[string]*stdioSession
+
+	stop     chan struct{}
+	stopOnce sync.Once
 }
 
 type stdioSecretResolver func(route config.Route) (map[string]string, error)
 
 type stdioSession struct {
-	id     string
-	owner  string
-	route  config.Route
+	id       string
+	owner    string
+	identity *auth.Identity
+	route    config.Route
+
+	// Guarded by stdioBridge.mu.
+	active       int
+	lastActivity time.Time
+
 	cancel context.CancelFunc
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
@@ -54,6 +66,9 @@ type stdioSession struct {
 	mu      sync.Mutex
 	pending map[string]chan stdioResponse
 	done    chan struct{}
+
+	stdoutWriter *io.PipeWriter
+	stdoutDone   chan struct{}
 }
 
 type stdioResponse struct {
@@ -67,15 +82,26 @@ type rpcEnvelope struct {
 }
 
 func newStdioBridge(route config.Route, resolver stdioSecretResolver) (http.Handler, func() error, error) {
+	bridge, err := newStdioBridgeWithOptions(route, resolver, stdioBridgeOptions{})
+	if err != nil {
+		return nil, nil, err
+	}
+	return bridge, bridge.Close, nil
+}
+
+func newStdioBridgeWithOptions(route config.Route, resolver stdioSecretResolver, opts stdioBridgeOptions) (*stdioBridge, error) {
 	if route.Stdio == nil {
-		return nil, nil, fmt.Errorf("route %q stdio config is required", route.ID)
+		return nil, fmt.Errorf("route %q stdio config is required", route.ID)
 	}
 	bridge := &stdioBridge{
 		route:          route,
 		secretResolver: resolver,
+		opts:           opts.withDefaults(),
 		sessions:       make(map[string]*stdioSession),
+		stop:           make(chan struct{}),
 	}
-	return bridge, bridge.Close, nil
+	go bridge.sweepLoop()
+	return bridge, nil
 }
 
 func (b *stdioBridge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -125,14 +151,12 @@ func (b *stdioBridge) handlePost(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	session, err := b.sessionForRequest(r.Header.Get(stdioSessionHeader), stdioSessionOwner(r), hasInitialize)
+	session, err := b.acquireSession(r.Header.Get(stdioSessionHeader), auth.IdentityFromContext(r.Context()), hasInitialize)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{
-			"error":             "stdio_session_error",
-			"error_description": err.Error(),
-		})
+		writeStdioSessionError(w, err)
 		return
 	}
+	defer b.releaseSession(session)
 	w.Header().Set(stdioSessionHeader, session.id)
 
 	responses := make([]json.RawMessage, 0, len(messages))
@@ -149,7 +173,7 @@ func (b *stdioBridge) handlePost(w http.ResponseWriter, r *http.Request) {
 		payload, err := session.SendRequest(ctx, id, message)
 		cancel()
 		if err != nil {
-			payload = buildJSONRPCError(id, jsonrpcInternalErrorCode, "stdio bridge error: "+err.Error())
+			payload = buildJSONRPCError(id, jsonrpcInternalErrorCode, stdioBridgeErrorPrefix+err.Error())
 		}
 		responses = append(responses, payload)
 	}
@@ -196,6 +220,18 @@ func (b *stdioBridge) handleDelete(w http.ResponseWriter, r *http.Request) {
 }
 
 func (b *stdioBridge) handleSSE(w http.ResponseWriter, r *http.Request) {
+	// A stream for a session keeps that session alive and ends with it.
+	var sessionDone <-chan struct{}
+	if requestedID := strings.TrimSpace(r.Header.Get(stdioSessionHeader)); requestedID != "" {
+		session, err := b.acquireSession(requestedID, auth.IdentityFromContext(r.Context()), false)
+		if err != nil {
+			writeStdioSessionError(w, err)
+			return
+		}
+		defer b.releaseSession(session)
+		sessionDone = session.done
+	}
+
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache, no-transform")
 	w.Header().Set("Connection", "keep-alive")
@@ -213,6 +249,8 @@ func (b *stdioBridge) handleSSE(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-r.Context().Done():
 			return
+		case <-sessionDone:
+			return
 		case <-ticker.C:
 			_, _ = io.WriteString(w, ": keepalive\n\n")
 			if flusher != nil {
@@ -222,36 +260,38 @@ func (b *stdioBridge) handleSSE(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// stdioSessionOwner returns the identity key a session is bound to: the
-// authenticated user ID, falling back to the email. Requests without an
-// identity map to "" and can only reach sessions created without one.
+// stdioSessionOwner returns the agent a session is bound to (user plus
+// credential, see auth.Identity.OwnerKey). Requests without an identity map
+// to "" and can only reach sessions created without one.
 func stdioSessionOwner(r *http.Request) string {
-	identity := auth.IdentityFromContext(r.Context())
-	if identity == nil {
-		return ""
-	}
-	if id := strings.TrimSpace(identity.UserID); id != "" {
-		return "user:" + id
-	}
-	if email := strings.TrimSpace(identity.Email); email != "" {
-		return "email:" + strings.ToLower(email)
-	}
-	return ""
+	return auth.IdentityFromContext(r.Context()).OwnerKey()
 }
 
-func (b *stdioBridge) sessionForRequest(requestedID, owner string, forceNew bool) (*stdioSession, error) {
+// acquireSession returns the caller's session (or a new one for
+// initialize) and marks it active until releaseSession. New sessions are
+// subject to the per-agent and per-route limits.
+func (b *stdioBridge) acquireSession(requestedID string, identity *auth.Identity, forceNew bool) (*stdioSession, error) {
 	requestedID = strings.TrimSpace(requestedID)
+	owner := identity.OwnerKey()
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	if requestedID != "" && !forceNew {
 		session := b.sessions[requestedID]
+		if session != nil && session.exited() {
+			// Forget sessions whose process died so clients get a clean
+			// "unknown session" and can re-initialize.
+			delete(b.sessions, requestedID)
+			session = nil
+		}
 		// A session owned by someone else is reported exactly like a missing
 		// one so callers cannot probe for other users' session IDs.
 		if session == nil || session.owner != owner {
-			return nil, fmt.Errorf("unknown stdio session %q", requestedID)
+			return nil, fmt.Errorf("%w %q", errStdioSessionUnknown, requestedID)
 		}
+		session.active++
+		session.lastActivity = time.Now()
 		return session, nil
 	}
 
@@ -260,6 +300,10 @@ func (b *stdioBridge) sessionForRequest(requestedID, owner string, forceNew bool
 	// cleaned up.
 	if requestedID == "" && !forceNew {
 		return nil, fmt.Errorf("missing %s header; send initialize first", stdioSessionHeader)
+	}
+
+	if err := b.makeRoomLocked(owner); err != nil {
+		return nil, err
 	}
 
 	sessionID, err := randomSessionID()
@@ -271,11 +315,22 @@ func (b *stdioBridge) sessionForRequest(requestedID, owner string, forceNew bool
 		return nil, err
 	}
 	session.owner = owner
+	session.identity = identity
+	session.active = 1
+	session.lastActivity = time.Now()
 	b.sessions[sessionID] = session
 	return session, nil
 }
 
+func (b *stdioBridge) releaseSession(session *stdioSession) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	session.active--
+	session.lastActivity = time.Now()
+}
+
 func (b *stdioBridge) Close() error {
+	b.stopOnce.Do(func() { close(b.stop) })
 	b.mu.Lock()
 	sessions := make([]*stdioSession, 0, len(b.sessions))
 	for _, session := range b.sessions {
@@ -325,11 +380,13 @@ func newStdioSession(sessionID string, route config.Route, resolver stdioSecretR
 		cancel()
 		return nil, fmt.Errorf("create stdin pipe: %w", err)
 	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		cancel()
-		return nil, fmt.Errorf("create stdout pipe: %w", err)
-	}
+	// Stdout goes through an io.Pipe instead of cmd.StdoutPipe: Wait then
+	// waits until everything the child wrote has been copied, so a response
+	// written right before the child exits is not lost. WaitDelay bounds
+	// that wait if a grandchild keeps the pipe open.
+	stdout, stdoutWriter := io.Pipe()
+	cmd.Stdout = stdoutWriter
+	cmd.WaitDelay = stdioWaitDelay
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		cancel()
@@ -348,6 +405,9 @@ func newStdioSession(sessionID string, route config.Route, resolver stdioSecretR
 		stdin:   stdin,
 		pending: make(map[string]chan stdioResponse),
 		done:    make(chan struct{}),
+
+		stdoutWriter: stdoutWriter,
+		stdoutDone:   make(chan struct{}),
 	}
 	go session.readStdout(stdout)
 	go session.readStderr(stderr)
@@ -410,6 +470,7 @@ func (s *stdioSession) writeMessage(payload []byte) error {
 }
 
 func (s *stdioSession) readStdout(stdout io.Reader) {
+	defer close(s.stdoutDone)
 	reader := bufio.NewReader(stdout)
 	for {
 		line, err := reader.ReadBytes('\n')
@@ -460,6 +521,9 @@ func (s *stdioSession) wait() {
 	if err != nil {
 		log.Printf("stdio bridge process exited route=%s session=%s err=%v", s.route.ID, s.id, err)
 	}
+	// Deliver every response the child wrote before failing pending calls.
+	_ = s.stdoutWriter.Close()
+	<-s.stdoutDone
 
 	s.mu.Lock()
 	pending := s.pending
@@ -485,6 +549,15 @@ func (s *stdioSession) Close() error {
 		}
 		<-s.done
 		return nil
+	}
+}
+
+func (s *stdioSession) exited() bool {
+	select {
+	case <-s.done:
+		return true
+	default:
+		return false
 	}
 }
 

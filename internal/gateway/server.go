@@ -25,6 +25,7 @@ type Server struct {
 	mu             sync.RWMutex
 	routes         []config.Route
 	runtime        map[string]routeRuntime
+	mcpSessions    *mcpSessionPool
 }
 
 func New(cfg *config.Config, authManager *auth.Manager) (*Server, error) {
@@ -39,6 +40,7 @@ func New(cfg *config.Config, authManager *auth.Manager) (*Server, error) {
 		cfg:         cfg,
 		authManager: authManager,
 		runtime:     make(map[string]routeRuntime, len(cfg.Routes)),
+		mcpSessions: newMCPSessionPool(),
 	}
 	if cfg.DockerManagement.Enabled {
 		dockerManager, err := newDockerManager(cfg.DockerManagement)
@@ -53,6 +55,7 @@ func New(cfg *config.Config, authManager *auth.Manager) (*Server, error) {
 		return nil, err
 	}
 	authManager.SetResourceAccessChecker(server.authorizeResourceAccess)
+	authManager.SetChangeListener(server.revalidateSessions)
 
 	return server, nil
 }
@@ -63,6 +66,7 @@ func Run(cfg *config.Config) error {
 		MasterKey:              cfg.Auth.MasterKey,
 		AccessTokenTTL:         cfg.Auth.AccessTokenTTL,
 		RefreshTokenTTL:        cfg.Auth.RefreshTokenTTL,
+		RefreshTokenReuseGrace: cfg.Auth.RefreshTokenReuseGrace,
 		AuthorizationCodeTTL:   cfg.Auth.AuthorizationCodeTTL,
 		SessionTTL:             cfg.Auth.SessionTTL,
 		PublicBaseURL:          cfg.PublicBaseURL,

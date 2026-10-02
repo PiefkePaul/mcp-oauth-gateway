@@ -66,6 +66,7 @@ Wichtig:
 - `MCP_GATEWAY_ALLOWED_EMAILS`
 - `MCP_GATEWAY_ALLOWED_EMAIL_DOMAINS`
 - `MCP_GATEWAY_ALLOWED_REDIRECT_ORIGINS`
+- `MCP_GATEWAY_REFRESH_TOKEN_REUSE_GRACE` (Standard `2m`)
 - `MCP_GATEWAY_ACCESS_LOG`
 - `MCP_GATEWAY_DOCKER_MANAGEMENT_ENABLED`
 - `MCP_GATEWAY_DOCKER_HOST`
@@ -82,9 +83,18 @@ Wichtig:
 - `MCP_GATEWAY_STDIO_MAX_ARTIFACT_MB`
 - `MCP_GATEWAY_STDIO_ALLOWED_DOWNLOAD_HOSTS`
 - `MCP_GATEWAY_STDIO_ALLOW_ANY_DOWNLOAD_HOST`
+- `MCP_GATEWAY_STDIO_SESSION_IDLE_TIMEOUT` (Standard `30m`)
+- `MCP_GATEWAY_STDIO_MAX_SESSIONS_PER_AGENT` (Standard `8`)
+- `MCP_GATEWAY_STDIO_MAX_SESSIONS_PER_ROUTE` (Standard `64`)
 - `MCP_GATEWAY_OPENAPI_STORE_DIR`
 
 Der Master-Key muss genau 32 Bytes nach Base64-, Base64URL- oder Hex-Decoding ergeben.
+
+### Agenten und Refresh-Tokens
+
+Jeder OAuth-Login (Authorization-Code-Flow) bildet einen eigenen Grant. Refresh-Tokens bleiben im selben Grant, sodass ein Client ueber Token-Rotation hinweg derselbe Agent bleibt. Zwei Rechner mit eigenem Login sind zwei Agenten; mehrere Prozesse, die sich einen Login teilen (z.B. mehrere Terminals auf einem Rechner), sind ein Agent. Jeder persoenliche Bearer-Token ist ein eigener Agent.
+
+Refresh-Tokens werden bei jeder Nutzung rotiert. Damit mehrere Prozesse mit demselben Login gleichzeitig erneuern koennen, bleibt ein rotiertes Refresh-Token fuer `MCP_GATEWAY_REFRESH_TOKEN_REUSE_GRACE` gueltig (Standard 2 Minuten). Jede Nutzung in diesem Fenster stellt neue Tokens im selben Grant aus; danach wird das alte Token abgelehnt.
 
 ## Deployment
 
@@ -171,6 +181,24 @@ Wichtig:
 - Der Gateway bridged JSON-RPC direkt zwischen Streamable HTTP und STDIO. Server-seitige Reverse-Requests wie Sampling werden aktuell bewusst abgelehnt.
 - Admins sollten nur vertrauenswuerdige Executables eintragen. Native STDIO-Kommandos laufen mit den Rechten des Gateway-Containers.
 
+### Session-Isolation
+
+Jede MCP-Session ist an die Route und den Agenten gebunden, der sie erzeugt hat (User plus OAuth-Login bzw. persoenlicher Bearer-Token, siehe "Agenten und Refresh-Tokens"). Das gilt fuer alle Transporte, auch fuer HTTP-Upstreams, die alle Gateway-User mit demselben Upstream-Bearer sehen:
+
+- Der Gateway gibt `Mcp-Session-Id` nur signiert als `<upstream-id>.<signatur>` an Clients heraus und reicht dem Upstream die urspruengliche ID weiter.
+- Eine Session-ID eines anderen Users oder eines anderen Agenten desselben Users wird mit HTTP 404 beantwortet und erreicht den Upstream nicht. Spezifikationskonforme Clients starten daraufhin eine neue Session.
+- Mehrere Prozesse mit demselben Login (z.B. zwei Terminals) bekommen trotzdem je eine eigene Session und koennen parallel arbeiten.
+- Nach einem Update auf diese Version sind bestehende Session-IDs einmalig ungueltig (404); Clients initialisieren neu.
+- Nicht abgedeckt: Legacy-HTTP+SSE-Upstreams, die die Session-ID in der URL (`?sessionId=`) statt im Header fuehren.
+
+STDIO-Prozesse sind zusaetzlich begrenzt:
+
+- Eine Session ohne Anfragen und ohne offenen SSE-Stream wird nach `MCP_GATEWAY_STDIO_SESSION_IDLE_TIMEOUT` beendet (404 beim naechsten Aufruf, der Client initialisiert neu).
+- Pro Agent und Route sind hoechstens `MCP_GATEWAY_STDIO_MAX_SESSIONS_PER_AGENT` Sessions offen. Eine weitere Session ersetzt die am laengsten untaetige des Agenten; sind alle aktiv, antwortet der Gateway mit 429.
+- Pro Route sind hoechstens `MCP_GATEWAY_STDIO_MAX_SESSIONS_PER_ROUTE` Sessions offen; danach 503. Sessions anderer Agenten werden dafuer nie beendet.
+- Wird ein Nutzer geloescht, ein Geraet oder Bearer-Token widerrufen oder verliert ein Nutzer durch Gruppen- oder Admin-Aenderungen den Zugriff, beendet der Gateway dessen STDIO-Sessions sofort. Zusaetzlich prueft er das regelmaessig (spaetestens jede Minute).
+- HTTP-Upstreams verwalten ihre Sessions selbst; der Gateway blockiert dort jede Anfrage ohne gueltigen Zugriff, beendet die Upstream-Session aber nicht aktiv.
+
 ### STDIO Installer
 
 Der optionale STDIO-Installer nimmt dir die NAS-Handarbeit ab: Im Deployments-Reiter kannst du ein Binary-Artefakt hochladen, per HTTPS-URL herunterladen oder aus einem GitHub-Release auswaehlen. Der Gateway installiert die ausgewaehlte Executable in einen persistenten Ordner unter `MCP_GATEWAY_STDIO_STORE_DIR`, erstellt eine STDIO-Route und speichert eingegebene Env-Werte im verschluesselten Auth-Store.
@@ -230,6 +258,7 @@ Jede MCP-Route stellt zusaetzlich eine generierte OpenAPI-3.1-Spezifikation bere
 - `GET /<route>/openapi.json` listet alle aktuell per `tools/list` gefundenen MCP-Tools als OpenAPI-Operationen.
 - `POST /<route>/openapi/tools/<operationId>` ruft das zugehoerige MCP-Tool per `tools/call` auf.
 - Tool-Calls sind mit derselben OAuth-/Bearer-Policy wie `/<route>/mcp` geschuetzt.
+- Der Adapter haelt pro Route und Agent eine initialisierte MCP-Session offen (bei STDIO-Routen also einen laufenden Prozess) und cached `tools/list` fuer 60 Sekunden. Unbekannte Tools loesen hoechstens alle 5 Sekunden einen Refresh aus. Sessions werden nach 10 Minuten Leerlauf, bei Routen-Aenderungen, ab 16 Sessions pro Nutzer und ab 256 Sessions insgesamt (jeweils die am laengsten unbenutzte) geschlossen. Mit `openapi_session_mode: per_request` (im Dashboard: "OpenAPI-Adapter Sessions") bekommt jeder OpenAPI-Aufruf eine eigene, danach geschlossene Session, z.B. fuer zustandsbehaftete Tools, deren Aufrufe sich nicht beeinflussen sollen. Lehnt der Upstream eine abgelaufene Session ab (HTTP 404/400), baut der Gateway einmalig eine neue Session auf und wiederholt den Aufruf.
 - Public-Routen veroeffentlichen die Spec im Katalog. Private oder restricted Routen geben die Spec nur fuer eingeloggte und berechtigte Nutzer aus.
 - Open WebUI haengt beim Verbindungstest teils selbst `/openapi.json` an. Trage dort bevorzugt die Route-Basis ein, z.B. `https://mcp.example.com/legal`; der Gateway akzeptiert zur Kompatibilitaet aber auch `/<route>/openapi.json/openapi.json`.
 

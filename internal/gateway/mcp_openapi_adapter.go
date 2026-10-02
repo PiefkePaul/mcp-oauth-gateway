@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/PiefkePaul/mcp-oauth-gateway/internal/auth"
 	"github.com/PiefkePaul/mcp-oauth-gateway/internal/config"
@@ -22,14 +25,77 @@ type mcpToolDefinition struct {
 	InputSchema map[string]any
 }
 
+// mcpRouteCaller speaks MCP over the route handler on behalf of the OpenAPI
+// adapter. It is safe for concurrent use so pooled sessions can serve
+// parallel tool calls.
 type mcpRouteCaller struct {
-	route       config.Route
-	handler     http.Handler
-	identity    *auth.Identity
-	authHeader  string
+	route      config.Route
+	handler    http.Handler
+	identity   *auth.Identity
+	authHeader string
+
+	nextID atomic.Int64
+	initMu sync.Mutex
+
+	mu          sync.Mutex
 	sessionID   string
 	initialized bool
-	nextID      int
+}
+
+type mcpCallCredentialsKey struct{}
+
+type mcpCallCredentials struct {
+	identity   *auth.Identity
+	authHeader string
+}
+
+// withMCPCallCredentials overrides the caller's identity and Authorization
+// header for a single call, so a pooled session always acts with the
+// credentials of the request that is currently using it.
+func withMCPCallCredentials(ctx context.Context, identity *auth.Identity, authHeader string) context.Context {
+	return context.WithValue(ctx, mcpCallCredentialsKey{}, mcpCallCredentials{
+		identity:   identity,
+		authHeader: strings.TrimSpace(authHeader),
+	})
+}
+
+// mcpSessionRejectedError means the MCP server refused the session ID, e.g.
+// because it expired or the server restarted. The request was not processed,
+// so it is safe to retry on a fresh session.
+type mcpSessionRejectedError struct {
+	status int
+	body   string
+}
+
+func (e *mcpSessionRejectedError) Error() string {
+	return fmt.Sprintf("MCP session rejected with HTTP status %d: %s", e.status, e.body)
+}
+
+type mcpJSONRPCError struct {
+	Code    int
+	Message string
+}
+
+func (e *mcpJSONRPCError) Error() string {
+	return fmt.Sprintf("MCP JSON-RPC error %d: %s", e.Code, e.Message)
+}
+
+// mcpSessionBroken reports whether err indicates that the session itself is
+// unusable (as opposed to an application-level error from the tool).
+func mcpSessionBroken(ctx context.Context, err error) bool {
+	if err == nil || ctx.Err() != nil {
+		return false
+	}
+	var rpcErr *mcpJSONRPCError
+	if errors.As(err, &rpcErr) {
+		return strings.HasPrefix(rpcErr.Message, stdioBridgeErrorPrefix)
+	}
+	return true
+}
+
+func mcpSessionRejected(err error) bool {
+	var rejected *mcpSessionRejectedError
+	return errors.As(err, &rejected)
 }
 
 func (s *Server) handleRouteOpenAPISpec(w http.ResponseWriter, r *http.Request, route config.Route, handler http.Handler) {
@@ -60,10 +126,12 @@ func (s *Server) handleRouteOpenAPISpec(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	caller := newMCPRouteCaller(route, handler, identity, r.Header.Get("Authorization"))
-	defer caller.close(r.Context())
-
-	tools, err := caller.listTools(r.Context())
+	var tools []mcpToolDefinition
+	err := s.withMCPSession(r.Context(), route, handler, identity, r.Header.Get("Authorization"), func(ctx context.Context, session *mcpPooledSession) error {
+		var err error
+		tools, err = session.listTools(ctx, false)
+		return err
+	})
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]any{
 			"error":             "mcp_tools_list_failed",
@@ -104,35 +172,44 @@ func (s *Server) handleRouteOpenAPIToolCall(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	caller := newMCPRouteCaller(route, handler, identity, r.Header.Get("Authorization"))
-	defer caller.close(r.Context())
-
-	tools, err := caller.listTools(r.Context())
-	if err != nil {
+	var (
+		result      map[string]any
+		toolMissing bool
+		listErr     error
+	)
+	callErr := s.withMCPSession(r.Context(), route, handler, identity, r.Header.Get("Authorization"), func(ctx context.Context, session *mcpPooledSession) error {
+		toolMissing, listErr = false, nil
+		tool, err := mcpSessionToolByOperationID(ctx, session, operationID)
+		if err != nil {
+			listErr = err
+			return err
+		}
+		if tool == nil {
+			toolMissing = true
+			return nil
+		}
+		result, err = session.caller.callTool(ctx, tool.Name, arguments)
+		return err
+	})
+	switch {
+	case listErr != nil:
 		writeJSON(w, http.StatusBadGateway, map[string]any{
 			"error":             "mcp_tools_list_failed",
-			"error_description": err.Error(),
+			"error_description": listErr.Error(),
 		})
-		return
-	}
-	tool, ok := mcpToolByOperationID(tools, operationID)
-	if !ok {
+	case toolMissing:
 		writeJSON(w, http.StatusNotFound, map[string]any{
 			"error":             "unknown_tool",
 			"error_description": "no MCP tool matches this OpenAPI operation",
 		})
-		return
-	}
-
-	result, err := caller.callTool(r.Context(), tool.Name, arguments)
-	if err != nil {
+	case callErr != nil:
 		writeJSON(w, http.StatusBadGateway, map[string]any{
 			"error":             "mcp_tool_call_failed",
-			"error_description": err.Error(),
+			"error_description": callErr.Error(),
 		})
-		return
+	default:
+		writeJSON(w, http.StatusOK, result)
 	}
-	writeJSON(w, http.StatusOK, result)
 }
 
 func (s *Server) authenticateRouteBearer(w http.ResponseWriter, r *http.Request, route config.Route) (*auth.Identity, bool) {
@@ -226,6 +303,27 @@ func (s *Server) buildMCPRouteOpenAPISpec(route config.Route, tools []mcpToolDef
 	}
 }
 
+// mcpSessionToolByOperationID resolves operationID against the session's
+// cached tool list and refreshes the list once if the tool is not found, so
+// newly added tools work without waiting for the cache to expire.
+func mcpSessionToolByOperationID(ctx context.Context, session *mcpPooledSession, operationID string) (*mcpToolDefinition, error) {
+	tools, err := session.listTools(ctx, false)
+	if err != nil {
+		return nil, err
+	}
+	if tool, ok := mcpToolByOperationID(tools, operationID); ok {
+		return &tool, nil
+	}
+	tools, err = session.listTools(ctx, true)
+	if err != nil {
+		return nil, err
+	}
+	if tool, ok := mcpToolByOperationID(tools, operationID); ok {
+		return &tool, nil
+	}
+	return nil, nil
+}
+
 func newMCPRouteCaller(route config.Route, handler http.Handler, identity *auth.Identity, authHeader string) *mcpRouteCaller {
 	return &mcpRouteCaller{
 		route:      route,
@@ -286,8 +384,32 @@ func (c *mcpRouteCaller) callTool(ctx context.Context, toolName string, argument
 	return payload, nil
 }
 
+func (c *mcpRouteCaller) currentSessionID() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.sessionID
+}
+
+func (c *mcpRouteCaller) isInitialized() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.initialized
+}
+
+func (c *mcpRouteCaller) credentials(ctx context.Context) (*auth.Identity, string) {
+	if creds, ok := ctx.Value(mcpCallCredentialsKey{}).(mcpCallCredentials); ok {
+		return creds.identity, creds.authHeader
+	}
+	return c.identity, c.authHeader
+}
+
 func (c *mcpRouteCaller) ensureInitialized(ctx context.Context) error {
-	if c.initialized {
+	if c.isInitialized() {
+		return nil
+	}
+	c.initMu.Lock()
+	defer c.initMu.Unlock()
+	if c.isInitialized() {
 		return nil
 	}
 	_, err := c.sendRequest(ctx, "initialize", map[string]any{
@@ -302,13 +424,14 @@ func (c *mcpRouteCaller) ensureInitialized(ctx context.Context) error {
 		return err
 	}
 	_ = c.sendNotification(ctx, "notifications/initialized", map[string]any{})
+	c.mu.Lock()
 	c.initialized = true
+	c.mu.Unlock()
 	return nil
 }
 
 func (c *mcpRouteCaller) sendRequest(ctx context.Context, method string, params any) (json.RawMessage, error) {
-	c.nextID++
-	id := c.nextID
+	id := c.nextID.Add(1)
 	request := map[string]any{
 		"jsonrpc": "2.0",
 		"id":      id,
@@ -318,9 +441,13 @@ func (c *mcpRouteCaller) sendRequest(ctx context.Context, method string, params 
 		request["params"] = params
 	}
 
+	sentSession := c.currentSessionID() != ""
 	status, headers, body, err := c.sendRaw(ctx, request)
 	if err != nil {
 		return nil, err
+	}
+	if sentSession && (status == http.StatusNotFound || status == http.StatusBadRequest) {
+		return nil, &mcpSessionRejectedError{status: status, body: strings.TrimSpace(string(body))}
 	}
 	if status < 200 || status >= 300 {
 		return nil, fmt.Errorf("MCP HTTP status %d: %s", status, strings.TrimSpace(string(body)))
@@ -342,13 +469,15 @@ func (c *mcpRouteCaller) sendRequest(ctx context.Context, method string, params 
 		return nil, fmt.Errorf("decode MCP JSON-RPC response: %w", err)
 	}
 	if response.Error != nil {
-		return nil, fmt.Errorf("MCP JSON-RPC error %d: %s", response.Error.Code, response.Error.Message)
+		return nil, &mcpJSONRPCError{Code: response.Error.Code, Message: response.Error.Message}
 	}
 	if len(response.Result) == 0 {
 		return nil, fmt.Errorf("MCP JSON-RPC response is missing result")
 	}
 	if sessionID := strings.TrimSpace(headers.Get(stdioSessionHeader)); sessionID != "" {
+		c.mu.Lock()
 		c.sessionID = sessionID
+		c.mu.Unlock()
 	}
 	return response.Result, nil
 }
@@ -424,14 +553,15 @@ func (c *mcpRouteCaller) sendRaw(ctx context.Context, payload any) (int, http.He
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("MCP-Protocol-Version", "2025-06-18")
-	if c.sessionID != "" {
-		req.Header.Set(stdioSessionHeader, c.sessionID)
+	if sessionID := c.currentSessionID(); sessionID != "" {
+		req.Header.Set(stdioSessionHeader, sessionID)
 	}
-	if c.authHeader != "" {
-		req.Header.Set("Authorization", c.authHeader)
+	identity, authHeader := c.credentials(ctx)
+	if authHeader != "" {
+		req.Header.Set("Authorization", authHeader)
 	}
-	if c.identity != nil {
-		req = req.WithContext(auth.WithIdentity(req.Context(), c.identity))
+	if identity != nil {
+		req = req.WithContext(auth.WithIdentity(req.Context(), identity))
 	}
 
 	rec := httptest.NewRecorder()
@@ -440,13 +570,18 @@ func (c *mcpRouteCaller) sendRaw(ctx context.Context, payload any) (int, http.He
 }
 
 func (c *mcpRouteCaller) close(ctx context.Context) {
-	if c.handler == nil || c.sessionID == "" {
+	sessionID := c.currentSessionID()
+	if c.handler == nil || sessionID == "" {
 		return
 	}
 	req := httptest.NewRequest(http.MethodDelete, c.route.PublicMCPPath(), nil).WithContext(ctx)
-	req.Header.Set(stdioSessionHeader, c.sessionID)
-	if c.identity != nil {
-		req = req.WithContext(auth.WithIdentity(req.Context(), c.identity))
+	req.Header.Set(stdioSessionHeader, sessionID)
+	identity, authHeader := c.credentials(ctx)
+	if authHeader != "" {
+		req.Header.Set("Authorization", authHeader)
+	}
+	if identity != nil {
+		req = req.WithContext(auth.WithIdentity(req.Context(), identity))
 	}
 	rec := httptest.NewRecorder()
 	c.handler.ServeHTTP(rec, req)
