@@ -764,7 +764,7 @@ func (m *Manager) userDevicesLocked(userID string) []UserDevice {
 
 	devicesByID := map[string]*accumulator{}
 	for _, record := range m.data.RefreshTokens {
-		if record.UserID != userID {
+		if record.UserID != userID || record.RotatedAt > 0 {
 			continue
 		}
 		deviceID := grantDeviceID(record.UserID, record.ClientID, record.Resource)

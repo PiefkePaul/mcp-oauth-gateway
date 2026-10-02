@@ -26,6 +26,7 @@ const (
 	defaultBuildMaxArtifactMB  = 100
 	defaultAccessTokenTTL      = time.Hour
 	defaultRefreshTokenTTL     = 30 * 24 * time.Hour
+	defaultRefreshReuseGrace   = 2 * time.Minute
 	defaultAuthorizationTTL    = 10 * time.Minute
 	defaultSessionTTL          = 30 * 24 * time.Hour
 	defaultAccountPortalTitle  = "MCP Gateway"
@@ -57,6 +58,7 @@ type AuthConfig struct {
 	MasterKey              []byte
 	AccessTokenTTL         time.Duration
 	RefreshTokenTTL        time.Duration
+	RefreshTokenReuseGrace time.Duration
 	AuthorizationCodeTTL   time.Duration
 	SessionTTL             time.Duration
 	AllowedRedirectOrigins []string
@@ -168,6 +170,7 @@ func Load() (*Config, error) {
 			StorePath:              getEnvOrDefault("MCP_GATEWAY_AUTH_STORE_PATH", defaultAuthStorePath),
 			AccessTokenTTL:         getDurationEnv("MCP_GATEWAY_ACCESS_TOKEN_TTL", defaultAccessTokenTTL),
 			RefreshTokenTTL:        getDurationEnv("MCP_GATEWAY_REFRESH_TOKEN_TTL", defaultRefreshTokenTTL),
+			RefreshTokenReuseGrace: getDurationEnv("MCP_GATEWAY_REFRESH_TOKEN_REUSE_GRACE", defaultRefreshReuseGrace),
 			AuthorizationCodeTTL:   getDurationEnv("MCP_GATEWAY_AUTHORIZATION_CODE_TTL", defaultAuthorizationTTL),
 			SessionTTL:             getDurationEnv("MCP_GATEWAY_SESSION_TTL", defaultSessionTTL),
 			AllowedRedirectOrigins: parseCSVEnv("MCP_GATEWAY_ALLOWED_REDIRECT_ORIGINS"),

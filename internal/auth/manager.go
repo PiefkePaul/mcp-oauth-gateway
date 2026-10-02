@@ -42,10 +42,14 @@ var (
 )
 
 type Config struct {
-	StorePath              string
-	MasterKey              []byte
-	AccessTokenTTL         time.Duration
-	RefreshTokenTTL        time.Duration
+	StorePath       string
+	MasterKey       []byte
+	AccessTokenTTL  time.Duration
+	RefreshTokenTTL time.Duration
+	// RefreshTokenReuseGrace keeps a rotated refresh token usable for a short
+	// time so clients that share one login across processes (e.g. several
+	// terminals) can refresh concurrently. Zero disables the grace period.
+	RefreshTokenReuseGrace time.Duration
 	AuthorizationCodeTTL   time.Duration
 	SessionTTL             time.Duration
 	PublicBaseURL          string
@@ -72,6 +76,37 @@ type Identity struct {
 	IsAdmin    bool
 	GroupIDs   []string
 	GroupNames []string
+
+	// Credential describes how the request authenticated. It distinguishes
+	// several agents of the same user, e.g. two machines logged in
+	// separately, so their MCP sessions can be kept apart.
+	CredentialKind string // CredentialOAuth, CredentialPersonalToken or CredentialWebSession
+	CredentialID   string // OAuth grant ID or personal token ID
+	ClientID       string // OAuth client ID, if any
+	DeviceID       string // OAuth device (user, client, resource), if any
+}
+
+const (
+	CredentialOAuth         = "oauth"
+	CredentialPersonalToken = "pat"
+	CredentialWebSession    = "web"
+)
+
+// OwnerKey identifies the agent behind a request: the user plus the
+// credential it used. All processes that share one OAuth login (one grant)
+// or one personal token map to the same key.
+func (i *Identity) OwnerKey() string {
+	if i == nil {
+		return ""
+	}
+	user := "user:" + i.UserID
+	if i.UserID == "" {
+		user = "email:" + strings.ToLower(strings.TrimSpace(i.Email))
+	}
+	if i.CredentialKind == "" {
+		return user
+	}
+	return user + "|" + i.CredentialKind + ":" + i.CredentialID
 }
 
 type ResourceAccessChecker func(identity *Identity, resource string) error
@@ -179,6 +214,7 @@ type authCodeRecord struct {
 type accessTokenRecord struct {
 	Token     string `json:"token"`
 	ClientID  string `json:"client_id"`
+	GrantID   string `json:"grant_id,omitempty"`
 	UserID    string `json:"user_id"`
 	Scope     string `json:"scope"`
 	Resource  string `json:"resource"`
@@ -189,11 +225,15 @@ type accessTokenRecord struct {
 type refreshTokenRecord struct {
 	Token     string `json:"token"`
 	ClientID  string `json:"client_id"`
+	GrantID   string `json:"grant_id,omitempty"`
 	UserID    string `json:"user_id"`
 	Scope     string `json:"scope"`
 	Resource  string `json:"resource"`
 	ExpiresAt int64  `json:"expires_at"`
 	IssuedAt  int64  `json:"issued_at"`
+	// RotatedAt is set once the token was exchanged for a new one. It stays
+	// valid until RotatedAt plus the reuse grace period.
+	RotatedAt int64 `json:"rotated_at,omitempty"`
 }
 
 type personalTokenRecord struct {
@@ -783,7 +823,12 @@ func (m *Manager) ValidateAccessToken(token, resource string) (*Identity, error)
 			return nil, ErrInvalidToken
 		}
 
-		return m.identityForUserLocked(user), nil
+		identity := m.identityForUserLocked(user)
+		identity.CredentialKind = CredentialOAuth
+		identity.ClientID = record.ClientID
+		identity.DeviceID = grantDeviceID(record.UserID, record.ClientID, record.Resource)
+		identity.CredentialID = oauthCredentialID(record.GrantID, identity.DeviceID)
+		return identity, nil
 	}
 
 	tokenHash := hashPersonalAccessToken(token)
@@ -807,7 +852,10 @@ func (m *Manager) ValidateAccessToken(token, resource string) (*Identity, error)
 			personalToken.LastUsedAt = now.Unix()
 			_ = m.saveLocked()
 		}
-		return m.identityForUserLocked(user), nil
+		identity := m.identityForUserLocked(user)
+		identity.CredentialKind = CredentialPersonalToken
+		identity.CredentialID = personalToken.ID
+		return identity, nil
 	}
 
 	return nil, ErrInvalidToken
@@ -1002,7 +1050,7 @@ func (m *Manager) cleanupLocked(now time.Time) {
 		}
 	}
 	for token, record := range m.data.RefreshTokens {
-		if record.ExpiresAt <= nowUnix {
+		if record.ExpiresAt <= nowUnix || (record.RotatedAt > 0 && !m.refreshReuseAllowed(record, now)) {
 			delete(m.data.RefreshTokens, token)
 		}
 	}
@@ -1586,7 +1634,7 @@ func (m *Manager) exchangeAuthorizationCode(clientID, clientSecret, clientAuthMe
 	}
 
 	delete(m.data.AuthCodes, code)
-	tokenSet := m.issueTokenSetLocked(now, record.UserID, client.ID, record.Scope, record.Resource)
+	tokenSet := m.issueTokenSetLocked(now, record.UserID, client.ID, randomToken(16), record.Scope, record.Resource)
 	if err := m.saveLocked(); err != nil {
 		return nil, err
 	}
@@ -1644,6 +1692,11 @@ func (m *Manager) refreshToken(clientID, clientSecret, clientAuthMethod, refresh
 	if !ok {
 		return nil, ErrInvalidGrant
 	}
+	if record.RotatedAt > 0 && !m.refreshReuseAllowed(record, now) {
+		delete(m.data.RefreshTokens, refreshToken)
+		_ = m.saveLocked()
+		return nil, ErrInvalidGrant
+	}
 	if record.ExpiresAt <= now.Unix() {
 		delete(m.data.RefreshTokens, refreshToken)
 		_ = m.saveLocked()
@@ -1656,8 +1709,18 @@ func (m *Manager) refreshToken(clientID, clientSecret, clientAuthMethod, refresh
 		return nil, ErrInvalidGrant
 	}
 
-	delete(m.data.RefreshTokens, refreshToken)
-	tokenSet := m.issueTokenSetLocked(now, record.UserID, client.ID, record.Scope, record.Resource)
+	if m.cfg.RefreshTokenReuseGrace > 0 {
+		// Keep the rotated token briefly so a second process sharing this
+		// login can still refresh; its grace period is not extended on reuse.
+		if record.RotatedAt == 0 {
+			record.RotatedAt = now.Unix()
+		}
+	} else {
+		delete(m.data.RefreshTokens, refreshToken)
+	}
+	// Legacy tokens without a grant ID keep an empty one; their sessions are
+	// then identified by device, which stays stable across refreshes.
+	tokenSet := m.issueTokenSetLocked(now, record.UserID, client.ID, record.GrantID, record.Scope, record.Resource)
 	if err := m.saveLocked(); err != nil {
 		return nil, err
 	}
@@ -1699,13 +1762,14 @@ func clientSecretValid(client *clientRecord, providedSecret, authMethod string) 
 	return client.Secret != "" && subtleConstantTimeEqual(client.Secret, providedSecret)
 }
 
-func (m *Manager) issueTokenSetLocked(now time.Time, userID, clientID, scope, resource string) *tokenResponse {
+func (m *Manager) issueTokenSetLocked(now time.Time, userID, clientID, grantID, scope, resource string) *tokenResponse {
 	accessToken := randomToken(32)
 	refreshToken := ""
 
 	m.data.AccessTokens[accessToken] = &accessTokenRecord{
 		Token:     accessToken,
 		ClientID:  clientID,
+		GrantID:   grantID,
 		UserID:    userID,
 		Scope:     scope,
 		Resource:  resource,
@@ -1718,6 +1782,7 @@ func (m *Manager) issueTokenSetLocked(now time.Time, userID, clientID, scope, re
 		m.data.RefreshTokens[refreshToken] = &refreshTokenRecord{
 			Token:     refreshToken,
 			ClientID:  clientID,
+			GrantID:   grantID,
 			UserID:    userID,
 			Scope:     scope,
 			Resource:  resource,
@@ -1922,7 +1987,25 @@ func (m *Manager) identityFromSession(r *http.Request) (*Identity, error) {
 	if !ok {
 		return nil, ErrNotAuthenticated
 	}
-	return m.identityForUserLocked(user), nil
+	identity := m.identityForUserLocked(user)
+	identity.CredentialKind = CredentialWebSession
+	return identity, nil
+}
+
+func (m *Manager) refreshReuseAllowed(record *refreshTokenRecord, now time.Time) bool {
+	if record.RotatedAt == 0 {
+		return true
+	}
+	return m.cfg.RefreshTokenReuseGrace > 0 && now.Before(time.Unix(record.RotatedAt, 0).Add(m.cfg.RefreshTokenReuseGrace))
+}
+
+// oauthCredentialID returns the grant ID, or for tokens issued before grant
+// IDs existed a stable ID derived from the device.
+func oauthCredentialID(grantID, deviceID string) string {
+	if grantID != "" {
+		return grantID
+	}
+	return "device:" + deviceID
 }
 
 func (m *Manager) identityForUserLocked(user *userRecord) *Identity {

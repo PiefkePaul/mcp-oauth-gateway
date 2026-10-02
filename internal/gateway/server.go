@@ -65,6 +65,7 @@ func Run(cfg *config.Config) error {
 		MasterKey:              cfg.Auth.MasterKey,
 		AccessTokenTTL:         cfg.Auth.AccessTokenTTL,
 		RefreshTokenTTL:        cfg.Auth.RefreshTokenTTL,
+		RefreshTokenReuseGrace: cfg.Auth.RefreshTokenReuseGrace,
 		AuthorizationCodeTTL:   cfg.Auth.AuthorizationCodeTTL,
 		SessionTTL:             cfg.Auth.SessionTTL,
 		PublicBaseURL:          cfg.PublicBaseURL,

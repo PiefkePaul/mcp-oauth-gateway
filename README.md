@@ -66,6 +66,7 @@ Wichtig:
 - `MCP_GATEWAY_ALLOWED_EMAILS`
 - `MCP_GATEWAY_ALLOWED_EMAIL_DOMAINS`
 - `MCP_GATEWAY_ALLOWED_REDIRECT_ORIGINS`
+- `MCP_GATEWAY_REFRESH_TOKEN_REUSE_GRACE` (Standard `2m`)
 - `MCP_GATEWAY_ACCESS_LOG`
 - `MCP_GATEWAY_DOCKER_MANAGEMENT_ENABLED`
 - `MCP_GATEWAY_DOCKER_HOST`
@@ -85,6 +86,12 @@ Wichtig:
 - `MCP_GATEWAY_OPENAPI_STORE_DIR`
 
 Der Master-Key muss genau 32 Bytes nach Base64-, Base64URL- oder Hex-Decoding ergeben.
+
+### Agenten und Refresh-Tokens
+
+Jeder OAuth-Login (Authorization-Code-Flow) bildet einen eigenen Grant. Refresh-Tokens bleiben im selben Grant, sodass ein Client ueber Token-Rotation hinweg derselbe Agent bleibt. Zwei Rechner mit eigenem Login sind zwei Agenten; mehrere Prozesse, die sich einen Login teilen (z.B. mehrere Terminals auf einem Rechner), sind ein Agent. Jeder persoenliche Bearer-Token ist ein eigener Agent.
+
+Refresh-Tokens werden bei jeder Nutzung rotiert. Damit mehrere Prozesse mit demselben Login gleichzeitig erneuern koennen, bleibt ein rotiertes Refresh-Token fuer `MCP_GATEWAY_REFRESH_TOKEN_REUSE_GRACE` gueltig (Standard 2 Minuten). Jede Nutzung in diesem Fenster stellt neue Tokens im selben Grant aus; danach wird das alte Token abgelehnt.
 
 ## Deployment
 
