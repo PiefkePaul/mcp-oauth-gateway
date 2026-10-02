@@ -224,3 +224,81 @@ func TestOwnerKeyWithoutCredentialFallsBackToUser(t *testing.T) {
 		t.Fatalf("nil identity must have an empty owner key, got %q", got)
 	}
 }
+
+func TestRevalidateIdentityTracksCredentialLifetime(t *testing.T) {
+	login := newCredentialTestLogin(t)
+	tokens := login.login(t)
+	identity := login.identity(t, tokens.AccessToken)
+
+	if _, ok := login.manager.RevalidateIdentity(identity); !ok {
+		t.Fatalf("a fresh OAuth grant must be valid")
+	}
+	other := login.identity(t, login.login(t).AccessToken)
+
+	if err := login.manager.RevokeUserDevice(login.userID, identity.DeviceID); err != nil {
+		t.Fatalf("revoke device: %v", err)
+	}
+	if _, ok := login.manager.RevalidateIdentity(identity); ok {
+		t.Fatalf("a revoked grant must be invalid")
+	}
+	// Revoking the device covers every login of that client and resource.
+	if _, ok := login.manager.RevalidateIdentity(other); ok {
+		t.Fatalf("all grants of the revoked device must be invalid")
+	}
+
+	bob, err := login.manager.CreateUser("bob@example.com", "super-secret-password", false)
+	if err != nil {
+		t.Fatalf("create bob: %v", err)
+	}
+	patIdentity := func(name string) (*Identity, string) {
+		value, record, err := login.manager.CreatePersonalAccessToken(bob.ID, name, 0)
+		if err != nil {
+			t.Fatalf("create token: %v", err)
+		}
+		identity, err := login.manager.ValidateAccessToken(value, credentialTestResource)
+		if err != nil {
+			t.Fatalf("validate token: %v", err)
+		}
+		return identity, record.ID
+	}
+	revokedPAT, revokedID := patIdentity("revoked")
+	keptPAT, _ := patIdentity("kept")
+	if _, ok := login.manager.RevalidateIdentity(revokedPAT); !ok {
+		t.Fatalf("an existing personal token must be valid")
+	}
+	if err := login.manager.RevokeUserPersonalAccessToken(bob.ID, revokedID); err != nil {
+		t.Fatalf("revoke token: %v", err)
+	}
+	if _, ok := login.manager.RevalidateIdentity(revokedPAT); ok {
+		t.Fatalf("a revoked personal token must be invalid")
+	}
+	if _, ok := login.manager.RevalidateIdentity(keptPAT); !ok {
+		t.Fatalf("another personal token of the same user must stay valid")
+	}
+	if err := login.manager.DeleteUser(bob.ID); err != nil {
+		t.Fatalf("delete bob: %v", err)
+	}
+	if _, ok := login.manager.RevalidateIdentity(keptPAT); ok {
+		t.Fatalf("a deleted user's identity must be invalid")
+	}
+}
+
+func TestChangeListenerFiresOnRevocation(t *testing.T) {
+	manager := newTestManager(t, "admin@example.com", "super-secret-password")
+	userID := manager.ListUsers()[0].ID
+	_, record, err := manager.CreatePersonalAccessToken(userID, "Script", 0)
+	if err != nil {
+		t.Fatalf("create token: %v", err)
+	}
+	fired := make(chan struct{}, 1)
+	manager.SetChangeListener(func() { fired <- struct{}{} })
+
+	if err := manager.RevokeUserPersonalAccessToken(userID, record.ID); err != nil {
+		t.Fatalf("revoke token: %v", err)
+	}
+	select {
+	case <-fired:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("change listener did not fire")
+	}
+}

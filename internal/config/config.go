@@ -49,8 +49,17 @@ type Config struct {
 	DockerManagement    DockerManagementConfig
 	BuildManagement     BuildManagementConfig
 	StdioInstaller      StdioInstallerConfig
+	StdioSessions       StdioSessionConfig
 	OpenAPIStoreDir     string
 	Routes              []Route
+}
+
+// StdioSessionConfig bounds native STDIO MCP processes. Zero values fall
+// back to the gateway defaults.
+type StdioSessionConfig struct {
+	IdleTimeout        time.Duration
+	MaxSessionsPerUser int // per agent (user plus login or token) and route
+	MaxSessionsRoute   int
 }
 
 type AuthConfig struct {
@@ -205,6 +214,11 @@ func Load() (*Config, error) {
 			MaxArtifactBytes:     int64(getIntEnv("MCP_GATEWAY_STDIO_MAX_ARTIFACT_MB", defaultBuildMaxArtifactMB)) << 20,
 			AllowedDownloadHosts: parseCSVEnv("MCP_GATEWAY_STDIO_ALLOWED_DOWNLOAD_HOSTS"),
 			AllowAnyDownloadHost: getBoolEnv("MCP_GATEWAY_STDIO_ALLOW_ANY_DOWNLOAD_HOST", false),
+		},
+		StdioSessions: StdioSessionConfig{
+			IdleTimeout:        getDurationEnv("MCP_GATEWAY_STDIO_SESSION_IDLE_TIMEOUT", 30*time.Minute),
+			MaxSessionsPerUser: getIntEnv("MCP_GATEWAY_STDIO_MAX_SESSIONS_PER_AGENT", 8),
+			MaxSessionsRoute:   getIntEnv("MCP_GATEWAY_STDIO_MAX_SESSIONS_PER_ROUTE", 64),
 		},
 		OpenAPIStoreDir: getEnvOrDefault("MCP_GATEWAY_OPENAPI_STORE_DIR", defaultOpenAPIStoreDir),
 	}

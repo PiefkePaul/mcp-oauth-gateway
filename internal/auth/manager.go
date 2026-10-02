@@ -69,6 +69,7 @@ type Manager struct {
 	mu                    sync.Mutex
 	data                  *storeData
 	resourceAccessChecker ResourceAccessChecker
+	changeListener        func()
 }
 
 type Identity struct {
@@ -1278,7 +1279,7 @@ func (m *Manager) deleteClientRegistration(clientID, authorizationHeader string)
 			delete(m.data.RefreshTokens, token)
 		}
 	}
-	return m.saveLocked()
+	return m.saveAndNotifyLocked()
 }
 
 func supportedTokenEndpointAuthMethod(method string) bool {
@@ -1991,6 +1992,82 @@ func (m *Manager) identityFromSession(r *http.Request) (*Identity, error) {
 	identity := m.identityForUserLocked(user)
 	identity.CredentialKind = CredentialWebSession
 	return identity, nil
+}
+
+// SetChangeListener registers fn to run whenever users, groups, admin
+// rights or credentials change in a way that can revoke access. fn runs on
+// its own goroutine, after the change was saved.
+func (m *Manager) SetChangeListener(fn func()) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.changeListener = fn
+}
+
+func (m *Manager) saveAndNotifyLocked() error {
+	if err := m.saveLocked(); err != nil {
+		return err
+	}
+	if listener := m.changeListener; listener != nil {
+		go listener()
+	}
+	return nil
+}
+
+// RevalidateIdentity reports whether the user and the credential behind
+// identity are still valid, and returns the user's current identity (admin
+// flag and groups may have changed) with the same credential.
+func (m *Manager) RevalidateIdentity(identity *Identity) (*Identity, bool) {
+	if identity == nil {
+		return nil, false
+	}
+	now := time.Now()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	user, ok := m.data.Users[identity.UserID]
+	if !ok {
+		return nil, false
+	}
+	if !m.credentialActiveLocked(identity, now) {
+		return nil, false
+	}
+	fresh := m.identityForUserLocked(user)
+	fresh.CredentialKind = identity.CredentialKind
+	fresh.CredentialID = identity.CredentialID
+	fresh.ClientID = identity.ClientID
+	fresh.DeviceID = identity.DeviceID
+	return fresh, true
+}
+
+func (m *Manager) credentialActiveLocked(identity *Identity, now time.Time) bool {
+	nowUnix := now.Unix()
+	switch identity.CredentialKind {
+	case CredentialPersonalToken:
+		record, ok := m.data.PersonalTokens[identity.CredentialID]
+		return ok && record.UserID == identity.UserID && (record.ExpiresAt == 0 || record.ExpiresAt > nowUnix)
+	case CredentialOAuth:
+		matches := func(userID, clientID, grantID, resource string) bool {
+			if userID != identity.UserID {
+				return false
+			}
+			return oauthCredentialID(grantID, grantDeviceID(userID, clientID, resource)) == identity.CredentialID
+		}
+		for _, record := range m.data.AccessTokens {
+			if record.ExpiresAt > nowUnix && matches(record.UserID, record.ClientID, record.GrantID, record.Resource) {
+				return true
+			}
+		}
+		for _, record := range m.data.RefreshTokens {
+			if record.ExpiresAt > nowUnix && m.refreshReuseAllowed(record, now) && matches(record.UserID, record.ClientID, record.GrantID, record.Resource) {
+				return true
+			}
+		}
+		return false
+	default:
+		// Browser sessions and identities without a credential are checked
+		// on every request; there is nothing more to revoke here.
+		return true
+	}
 }
 
 // DeriveKey returns a 32-byte key for label derived from the master key, so

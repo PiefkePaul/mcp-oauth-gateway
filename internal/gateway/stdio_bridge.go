@@ -37,17 +37,27 @@ const (
 type stdioBridge struct {
 	route          config.Route
 	secretResolver stdioSecretResolver
+	opts           stdioBridgeOptions
 
 	mu       sync.Mutex
 	sessions map[string]*stdioSession
+
+	stop     chan struct{}
+	stopOnce sync.Once
 }
 
 type stdioSecretResolver func(route config.Route) (map[string]string, error)
 
 type stdioSession struct {
-	id     string
-	owner  string
-	route  config.Route
+	id       string
+	owner    string
+	identity *auth.Identity
+	route    config.Route
+
+	// Guarded by stdioBridge.mu.
+	active       int
+	lastActivity time.Time
+
 	cancel context.CancelFunc
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
@@ -72,15 +82,26 @@ type rpcEnvelope struct {
 }
 
 func newStdioBridge(route config.Route, resolver stdioSecretResolver) (http.Handler, func() error, error) {
+	bridge, err := newStdioBridgeWithOptions(route, resolver, stdioBridgeOptions{})
+	if err != nil {
+		return nil, nil, err
+	}
+	return bridge, bridge.Close, nil
+}
+
+func newStdioBridgeWithOptions(route config.Route, resolver stdioSecretResolver, opts stdioBridgeOptions) (*stdioBridge, error) {
 	if route.Stdio == nil {
-		return nil, nil, fmt.Errorf("route %q stdio config is required", route.ID)
+		return nil, fmt.Errorf("route %q stdio config is required", route.ID)
 	}
 	bridge := &stdioBridge{
 		route:          route,
 		secretResolver: resolver,
+		opts:           opts.withDefaults(),
 		sessions:       make(map[string]*stdioSession),
+		stop:           make(chan struct{}),
 	}
-	return bridge, bridge.Close, nil
+	go bridge.sweepLoop()
+	return bridge, nil
 }
 
 func (b *stdioBridge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -130,19 +151,12 @@ func (b *stdioBridge) handlePost(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	session, err := b.sessionForRequest(r.Header.Get(stdioSessionHeader), stdioSessionOwner(r), hasInitialize)
-	if errors.Is(err, errStdioSessionUnknown) {
-		// 404 tells spec-compliant clients to start a new session.
-		writeSessionNotFound(w)
-		return
-	}
+	session, err := b.acquireSession(r.Header.Get(stdioSessionHeader), auth.IdentityFromContext(r.Context()), hasInitialize)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{
-			"error":             "stdio_session_error",
-			"error_description": err.Error(),
-		})
+		writeStdioSessionError(w, err)
 		return
 	}
+	defer b.releaseSession(session)
 	w.Header().Set(stdioSessionHeader, session.id)
 
 	responses := make([]json.RawMessage, 0, len(messages))
@@ -206,6 +220,18 @@ func (b *stdioBridge) handleDelete(w http.ResponseWriter, r *http.Request) {
 }
 
 func (b *stdioBridge) handleSSE(w http.ResponseWriter, r *http.Request) {
+	// A stream for a session keeps that session alive and ends with it.
+	var sessionDone <-chan struct{}
+	if requestedID := strings.TrimSpace(r.Header.Get(stdioSessionHeader)); requestedID != "" {
+		session, err := b.acquireSession(requestedID, auth.IdentityFromContext(r.Context()), false)
+		if err != nil {
+			writeStdioSessionError(w, err)
+			return
+		}
+		defer b.releaseSession(session)
+		sessionDone = session.done
+	}
+
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache, no-transform")
 	w.Header().Set("Connection", "keep-alive")
@@ -223,6 +249,8 @@ func (b *stdioBridge) handleSSE(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-r.Context().Done():
 			return
+		case <-sessionDone:
+			return
 		case <-ticker.C:
 			_, _ = io.WriteString(w, ": keepalive\n\n")
 			if flusher != nil {
@@ -232,8 +260,6 @@ func (b *stdioBridge) handleSSE(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-var errStdioSessionUnknown = errors.New("unknown stdio session")
-
 // stdioSessionOwner returns the agent a session is bound to (user plus
 // credential, see auth.Identity.OwnerKey). Requests without an identity map
 // to "" and can only reach sessions created without one.
@@ -241,8 +267,12 @@ func stdioSessionOwner(r *http.Request) string {
 	return auth.IdentityFromContext(r.Context()).OwnerKey()
 }
 
-func (b *stdioBridge) sessionForRequest(requestedID, owner string, forceNew bool) (*stdioSession, error) {
+// acquireSession returns the caller's session (or a new one for
+// initialize) and marks it active until releaseSession. New sessions are
+// subject to the per-agent and per-route limits.
+func (b *stdioBridge) acquireSession(requestedID string, identity *auth.Identity, forceNew bool) (*stdioSession, error) {
 	requestedID = strings.TrimSpace(requestedID)
+	owner := identity.OwnerKey()
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -260,6 +290,8 @@ func (b *stdioBridge) sessionForRequest(requestedID, owner string, forceNew bool
 		if session == nil || session.owner != owner {
 			return nil, fmt.Errorf("%w %q", errStdioSessionUnknown, requestedID)
 		}
+		session.active++
+		session.lastActivity = time.Now()
 		return session, nil
 	}
 
@@ -268,6 +300,10 @@ func (b *stdioBridge) sessionForRequest(requestedID, owner string, forceNew bool
 	// cleaned up.
 	if requestedID == "" && !forceNew {
 		return nil, fmt.Errorf("missing %s header; send initialize first", stdioSessionHeader)
+	}
+
+	if err := b.makeRoomLocked(owner); err != nil {
+		return nil, err
 	}
 
 	sessionID, err := randomSessionID()
@@ -279,11 +315,22 @@ func (b *stdioBridge) sessionForRequest(requestedID, owner string, forceNew bool
 		return nil, err
 	}
 	session.owner = owner
+	session.identity = identity
+	session.active = 1
+	session.lastActivity = time.Now()
 	b.sessions[sessionID] = session
 	return session, nil
 }
 
+func (b *stdioBridge) releaseSession(session *stdioSession) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	session.active--
+	session.lastActivity = time.Now()
+}
+
 func (b *stdioBridge) Close() error {
+	b.stopOnce.Do(func() { close(b.stop) })
 	b.mu.Lock()
 	sessions := make([]*stdioSession, 0, len(b.sessions))
 	for _, session := range b.sessions {

@@ -55,6 +55,7 @@ func New(cfg *config.Config, authManager *auth.Manager) (*Server, error) {
 		return nil, err
 	}
 	authManager.SetResourceAccessChecker(server.authorizeResourceAccess)
+	authManager.SetChangeListener(server.revalidateSessions)
 
 	return server, nil
 }

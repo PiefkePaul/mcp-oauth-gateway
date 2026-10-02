@@ -83,6 +83,9 @@ Wichtig:
 - `MCP_GATEWAY_STDIO_MAX_ARTIFACT_MB`
 - `MCP_GATEWAY_STDIO_ALLOWED_DOWNLOAD_HOSTS`
 - `MCP_GATEWAY_STDIO_ALLOW_ANY_DOWNLOAD_HOST`
+- `MCP_GATEWAY_STDIO_SESSION_IDLE_TIMEOUT` (Standard `30m`)
+- `MCP_GATEWAY_STDIO_MAX_SESSIONS_PER_AGENT` (Standard `8`)
+- `MCP_GATEWAY_STDIO_MAX_SESSIONS_PER_ROUTE` (Standard `64`)
 - `MCP_GATEWAY_OPENAPI_STORE_DIR`
 
 Der Master-Key muss genau 32 Bytes nach Base64-, Base64URL- oder Hex-Decoding ergeben.
@@ -187,6 +190,14 @@ Jede MCP-Session ist an die Route und den Agenten gebunden, der sie erzeugt hat 
 - Mehrere Prozesse mit demselben Login (z.B. zwei Terminals) bekommen trotzdem je eine eigene Session und koennen parallel arbeiten.
 - Nach einem Update auf diese Version sind bestehende Session-IDs einmalig ungueltig (404); Clients initialisieren neu.
 - Nicht abgedeckt: Legacy-HTTP+SSE-Upstreams, die die Session-ID in der URL (`?sessionId=`) statt im Header fuehren.
+
+STDIO-Prozesse sind zusaetzlich begrenzt:
+
+- Eine Session ohne Anfragen und ohne offenen SSE-Stream wird nach `MCP_GATEWAY_STDIO_SESSION_IDLE_TIMEOUT` beendet (404 beim naechsten Aufruf, der Client initialisiert neu).
+- Pro Agent und Route sind hoechstens `MCP_GATEWAY_STDIO_MAX_SESSIONS_PER_AGENT` Sessions offen. Eine weitere Session ersetzt die am laengsten untaetige des Agenten; sind alle aktiv, antwortet der Gateway mit 429.
+- Pro Route sind hoechstens `MCP_GATEWAY_STDIO_MAX_SESSIONS_PER_ROUTE` Sessions offen; danach 503. Sessions anderer Agenten werden dafuer nie beendet.
+- Wird ein Nutzer geloescht, ein Geraet oder Bearer-Token widerrufen oder verliert ein Nutzer durch Gruppen- oder Admin-Aenderungen den Zugriff, beendet der Gateway dessen STDIO-Sessions sofort. Zusaetzlich prueft er das regelmaessig (spaetestens jede Minute).
+- HTTP-Upstreams verwalten ihre Sessions selbst; der Gateway blockiert dort jede Anfrage ohne gueltigen Zugriff, beendet die Upstream-Session aber nicht aktiv.
 
 ### STDIO Installer
 
