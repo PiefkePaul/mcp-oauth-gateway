@@ -90,25 +90,34 @@ type StdioInstallerConfig struct {
 }
 
 type Route struct {
-	ID                     string            `yaml:"id"`
-	DisplayName            string            `yaml:"display_name"`
-	Transport              string            `yaml:"transport,omitempty"`
-	PathPrefix             string            `yaml:"path_prefix"`
-	Upstream               string            `yaml:"upstream,omitempty"`
-	UpstreamMCPPath        string            `yaml:"upstream_mcp_path,omitempty"`
-	ScopesSupported        []string          `yaml:"scopes_supported"`
-	PassAuthorization      bool              `yaml:"pass_authorization_header"`
-	ForwardHeaders         map[string]string `yaml:"forward_headers"`
-	UpstreamEnvironment    map[string]string `yaml:"upstream_environment"`
-	Access                 RouteAccess       `yaml:"access"`
-	Deployment             *RouteDeployment  `yaml:"deployment,omitempty"`
-	Stdio                  *RouteStdio       `yaml:"stdio,omitempty"`
-	OpenAPI                *RouteOpenAPI     `yaml:"openapi,omitempty"`
-	ResourceDocumentation  string            `yaml:"resource_documentation"`
-	Notes                  string            `yaml:"notes"`
-	NormalizedPathPrefix   string            `yaml:"-"`
-	NormalizedUpstreamPath string            `yaml:"-"`
+	ID                    string            `yaml:"id"`
+	DisplayName           string            `yaml:"display_name"`
+	Transport             string            `yaml:"transport,omitempty"`
+	PathPrefix            string            `yaml:"path_prefix"`
+	Upstream              string            `yaml:"upstream,omitempty"`
+	UpstreamMCPPath       string            `yaml:"upstream_mcp_path,omitempty"`
+	ScopesSupported       []string          `yaml:"scopes_supported"`
+	PassAuthorization     bool              `yaml:"pass_authorization_header"`
+	ForwardHeaders        map[string]string `yaml:"forward_headers"`
+	UpstreamEnvironment   map[string]string `yaml:"upstream_environment"`
+	Access                RouteAccess       `yaml:"access"`
+	Deployment            *RouteDeployment  `yaml:"deployment,omitempty"`
+	Stdio                 *RouteStdio       `yaml:"stdio,omitempty"`
+	OpenAPI               *RouteOpenAPI     `yaml:"openapi,omitempty"`
+	ResourceDocumentation string            `yaml:"resource_documentation"`
+	Notes                 string            `yaml:"notes"`
+	// OpenAPISessionMode controls the MCP-to-OpenAPI adapter: "pooled"
+	// (default) keeps one MCP session per agent, "per_request" opens a fresh
+	// session for every OpenAPI call.
+	OpenAPISessionMode     string `yaml:"openapi_session_mode,omitempty"`
+	NormalizedPathPrefix   string `yaml:"-"`
+	NormalizedUpstreamPath string `yaml:"-"`
 }
+
+const (
+	OpenAPISessionPooled     = "pooled"
+	OpenAPISessionPerRequest = "per_request"
+)
 
 type RouteDeployment struct {
 	Type          string   `yaml:"type"`
@@ -405,6 +414,12 @@ func normalizeRoute(route *Route) error {
 	}
 	if route.Transport != "http" && route.Transport != "stdio" && route.Transport != "openapi" {
 		return fmt.Errorf("route %q transport must be http, stdio or openapi", route.ID)
+	}
+	route.OpenAPISessionMode = strings.ToLower(strings.TrimSpace(route.OpenAPISessionMode))
+	switch route.OpenAPISessionMode {
+	case "", OpenAPISessionPooled, OpenAPISessionPerRequest:
+	default:
+		return fmt.Errorf("route %q openapi_session_mode must be %s or %s", route.ID, OpenAPISessionPooled, OpenAPISessionPerRequest)
 	}
 
 	pathPrefix := strings.TrimSpace(route.PathPrefix)

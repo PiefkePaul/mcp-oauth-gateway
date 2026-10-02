@@ -16,16 +16,21 @@ const (
 	mcpSessionToolsTTL     = time.Minute
 	mcpSessionToolsMinAge  = 5 * time.Second
 	mcpSessionMaxEntries   = 256
+	mcpSessionMaxPerUser   = 16
 	mcpSessionCloseTimeout = 10 * time.Second
 )
 
 // mcpSessionPool keeps initialized MCP sessions for the OpenAPI adapter, one
-// per route and agent (auth.Identity.OwnerKey), so OpenAPI tool calls do not pay for initialize,
-// tools/list and (for STDIO routes) a process start on every request.
+// per route and agent (auth.Identity.OwnerKey), so OpenAPI tool calls do not
+// pay for initialize, tools/list and (for STDIO routes) a process start on
+// every request.
 type mcpSessionPool struct {
 	idleTTL    time.Duration
 	toolsTTL   time.Duration
 	maxEntries int
+	// maxPerUser caps the sessions of one user across all of their agents,
+	// so one user with many tokens cannot crowd out everyone else.
+	maxPerUser int
 
 	mu      sync.Mutex
 	entries map[mcpSessionKey]*mcpPooledSession
@@ -39,6 +44,7 @@ type mcpSessionKey struct {
 type mcpPooledSession struct {
 	pool    *mcpSessionPool
 	key     mcpSessionKey
+	user    string
 	handler http.Handler
 	caller  *mcpRouteCaller
 
@@ -60,6 +66,7 @@ func newMCPSessionPool() *mcpSessionPool {
 		idleTTL:    mcpSessionIdleTTL,
 		toolsTTL:   mcpSessionToolsTTL,
 		maxEntries: mcpSessionMaxEntries,
+		maxPerUser: mcpSessionMaxPerUser,
 		entries:    make(map[mcpSessionKey]*mcpPooledSession),
 	}
 }
@@ -80,10 +87,12 @@ func (p *mcpSessionPool) acquire(route config.Route, handler http.Handler, ident
 		entry = nil
 	}
 	if entry == nil {
-		p.evictForInsertLocked()
+		user := mcpSessionPoolUser(identity)
+		p.evictForInsertLocked(user)
 		entry = &mcpPooledSession{
 			pool:    p,
 			key:     key,
+			user:    user,
 			handler: handler,
 			caller:  newMCPRouteCaller(route, handler, nil, ""),
 		}
@@ -154,23 +163,47 @@ func (p *mcpSessionPool) retireLocked(entry *mcpPooledSession) {
 	}
 }
 
-func (p *mcpSessionPool) evictForInsertLocked() {
-	if len(p.entries) < p.maxEntries {
-		return
+// evictForInsertLocked makes room for a new session of user: first within
+// the user's own sessions, then globally. Busy sessions are never evicted;
+// when all are busy the pool temporarily grows past its limits.
+func (p *mcpSessionPool) evictForInsertLocked(user string) {
+	userCount := 0
+	for _, entry := range p.entries {
+		if entry.user == user {
+			userCount++
+		}
 	}
+	if userCount >= p.maxPerUser {
+		if oldest := p.oldestIdleLocked(func(e *mcpPooledSession) bool { return e.user == user }); oldest != nil {
+			p.retireLocked(oldest)
+			return
+		}
+	}
+	if len(p.entries) >= p.maxEntries {
+		if oldest := p.oldestIdleLocked(func(*mcpPooledSession) bool { return true }); oldest != nil {
+			p.retireLocked(oldest)
+		}
+	}
+}
+
+func (p *mcpSessionPool) oldestIdleLocked(match func(*mcpPooledSession) bool) *mcpPooledSession {
 	var oldest *mcpPooledSession
 	for _, entry := range p.entries {
-		if entry.inFlight > 0 {
+		if entry.inFlight > 0 || !match(entry) {
 			continue
 		}
 		if oldest == nil || entry.lastUsed.Before(oldest.lastUsed) {
 			oldest = entry
 		}
 	}
-	// When every session is busy the pool temporarily grows past the limit.
-	if oldest != nil {
-		p.retireLocked(oldest)
+	return oldest
+}
+
+func mcpSessionPoolUser(identity *auth.Identity) string {
+	if identity == nil {
+		return ""
 	}
+	return (&auth.Identity{UserID: identity.UserID, Email: identity.Email}).OwnerKey()
 }
 
 func (p *mcpSessionPool) closeLocked(entry *mcpPooledSession) {
@@ -214,6 +247,17 @@ func (e *mcpPooledSession) listTools(ctx context.Context, forceRefresh bool) ([]
 // (so the request was not processed) fn is retried once on a fresh session.
 func (s *Server) withMCPSession(ctx context.Context, route config.Route, handler http.Handler, identity *auth.Identity, authHeader string, fn func(context.Context, *mcpPooledSession) error) error {
 	ctx = withMCPCallCredentials(ctx, identity, authHeader)
+	if route.OpenAPISessionMode == config.OpenAPISessionPerRequest {
+		// A fresh session for this call only, closed right after it.
+		session := &mcpPooledSession{pool: s.mcpSessions, caller: newMCPRouteCaller(route, handler, nil, "")}
+		defer func() {
+			// Close even if the client went away, so no process lingers.
+			closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), mcpSessionCloseTimeout)
+			defer cancel()
+			session.caller.close(closeCtx)
+		}()
+		return fn(ctx, session)
+	}
 	var err error
 	for attempt := 0; attempt < 2; attempt++ {
 		entry := s.mcpSessions.acquire(route, handler, identity, authHeader)

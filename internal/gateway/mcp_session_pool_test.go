@@ -353,3 +353,53 @@ done`
 		t.Fatalf("call after process exit: expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestMCPSessionPoolPerRequestModeUsesFreshSessions(t *testing.T) {
+	server := newTestServerWithRoutes(t, nil)
+	fake := newFakeMCPServer()
+	route := config.Route{ID: "fake", NormalizedPathPrefix: "/fake", OpenAPISessionMode: config.OpenAPISessionPerRequest}
+	identity := &auth.Identity{UserID: "u1"}
+
+	first := callPooledTool(t, server, route, fake, identity, "")
+	second := callPooledTool(t, server, route, fake, identity, "")
+
+	if toolResultText(first) == toolResultText(second) {
+		t.Fatalf("per_request mode must not reuse a session")
+	}
+	if got := fake.count("initialize"); got != 2 {
+		t.Fatalf("expected one initialize per call, got %d", got)
+	}
+	if got := len(fake.deletedSessions()); got != 2 {
+		t.Fatalf("expected every per-request session to be closed, got %d", got)
+	}
+	server.mcpSessions.mu.Lock()
+	pooled := len(server.mcpSessions.entries)
+	server.mcpSessions.mu.Unlock()
+	if pooled != 0 {
+		t.Fatalf("per_request mode must not populate the pool, got %d entries", pooled)
+	}
+}
+
+func TestMCPSessionPoolLimitsSessionsPerUser(t *testing.T) {
+	server := newTestServerWithRoutes(t, nil)
+	server.mcpSessions.maxPerUser = 2
+	fake := newFakeMCPServer()
+	route := config.Route{ID: "fake", NormalizedPathPrefix: "/fake"}
+
+	agent := func(token string) *auth.Identity {
+		return &auth.Identity{UserID: "u1", CredentialKind: auth.CredentialPersonalToken, CredentialID: token}
+	}
+	callPooledTool(t, server, route, fake, agent("a"), "")
+	callPooledTool(t, server, route, fake, agent("b"), "")
+	callPooledTool(t, server, route, fake, &auth.Identity{UserID: "u2"}, "")
+	if got := len(fake.deletedSessions()); got != 0 {
+		t.Fatalf("no eviction expected below the limit, got %d", got)
+	}
+
+	// A third agent of u1 evicts u1's least recently used session, not u2's.
+	callPooledTool(t, server, route, fake, agent("c"), "")
+	waitFor(t, func() bool { return len(fake.deletedSessions()) == 1 })
+	if deleted := fake.deletedSessions()[0]; deleted != "session-1" {
+		t.Fatalf("expected u1's oldest session to be evicted, got %q", deleted)
+	}
+}
