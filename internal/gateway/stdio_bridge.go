@@ -29,6 +29,7 @@ const (
 	jsonrpcInternalErrorCode = -32603
 	jsonrpcInvalidErrorCode  = -32600
 	jsonrpcMethodNotFound    = -32601
+	stdioBridgeErrorPrefix   = "stdio bridge error: "
 )
 
 type stdioBridge struct {
@@ -147,7 +148,7 @@ func (b *stdioBridge) handlePost(w http.ResponseWriter, r *http.Request) {
 		payload, err := session.SendRequest(ctx, id, message)
 		cancel()
 		if err != nil {
-			payload = buildJSONRPCError(id, jsonrpcInternalErrorCode, "stdio bridge error: "+err.Error())
+			payload = buildJSONRPCError(id, jsonrpcInternalErrorCode, stdioBridgeErrorPrefix+err.Error())
 		}
 		responses = append(responses, payload)
 	}
@@ -221,6 +222,12 @@ func (b *stdioBridge) sessionForRequest(requestedID string, forceNew bool) (*std
 
 	if requestedID != "" && !forceNew {
 		session := b.sessions[requestedID]
+		if session != nil && session.exited() {
+			// Forget sessions whose process died so clients get a clean
+			// "unknown session" and can re-initialize.
+			delete(b.sessions, requestedID)
+			session = nil
+		}
 		if session == nil {
 			return nil, fmt.Errorf("unknown stdio session %q", requestedID)
 		}
@@ -229,7 +236,9 @@ func (b *stdioBridge) sessionForRequest(requestedID string, forceNew bool) (*std
 
 	if requestedID == "" && !forceNew && len(b.sessions) == 1 {
 		for _, session := range b.sessions {
-			return session, nil
+			if !session.exited() {
+				return session, nil
+			}
 		}
 	}
 
@@ -455,6 +464,15 @@ func (s *stdioSession) Close() error {
 		}
 		<-s.done
 		return nil
+	}
+}
+
+func (s *stdioSession) exited() bool {
+	select {
+	case <-s.done:
+		return true
+	default:
+		return false
 	}
 }
 

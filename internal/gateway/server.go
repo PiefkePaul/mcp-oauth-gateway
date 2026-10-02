@@ -25,6 +25,7 @@ type Server struct {
 	mu             sync.RWMutex
 	routes         []config.Route
 	runtime        map[string]routeRuntime
+	mcpSessions    *mcpSessionPool
 }
 
 func New(cfg *config.Config, authManager *auth.Manager) (*Server, error) {
@@ -39,6 +40,7 @@ func New(cfg *config.Config, authManager *auth.Manager) (*Server, error) {
 		cfg:         cfg,
 		authManager: authManager,
 		runtime:     make(map[string]routeRuntime, len(cfg.Routes)),
+		mcpSessions: newMCPSessionPool(),
 	}
 	if cfg.DockerManagement.Enabled {
 		dockerManager, err := newDockerManager(cfg.DockerManagement)

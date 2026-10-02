@@ -27,6 +27,7 @@ func (s *Server) replaceRoutes(routes []config.Route) error {
 	s.cfg.Routes = cloneRoutes(routes)
 	s.mu.Unlock()
 	closeRouteRuntimes(oldRuntimes)
+	s.mcpSessions.closeAll()
 	return nil
 }
 
@@ -239,6 +240,7 @@ func (s *Server) persistRoutesLocked(routes []config.Route) error {
 	s.runtime = runtimes
 	s.cfg.Routes = cloneRoutes(cloned)
 	closeRouteRuntimes(oldRuntimes)
+	s.mcpSessions.closeAll()
 	return nil
 }
 
