@@ -27,6 +27,7 @@ const (
 	stdioRequestTimeout      = 5 * time.Minute
 	maxStdioBridgeBodyBytes  = 16 << 20
 	stdioSSEHeartbeat        = 25 * time.Second
+	stdioWaitDelay           = 5 * time.Second
 	jsonrpcInternalErrorCode = -32603
 	jsonrpcInvalidErrorCode  = -32600
 	jsonrpcMethodNotFound    = -32601
@@ -55,6 +56,9 @@ type stdioSession struct {
 	mu      sync.Mutex
 	pending map[string]chan stdioResponse
 	done    chan struct{}
+
+	stdoutWriter *io.PipeWriter
+	stdoutDone   chan struct{}
 }
 
 type stdioResponse struct {
@@ -329,11 +333,13 @@ func newStdioSession(sessionID string, route config.Route, resolver stdioSecretR
 		cancel()
 		return nil, fmt.Errorf("create stdin pipe: %w", err)
 	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		cancel()
-		return nil, fmt.Errorf("create stdout pipe: %w", err)
-	}
+	// Stdout goes through an io.Pipe instead of cmd.StdoutPipe: Wait then
+	// waits until everything the child wrote has been copied, so a response
+	// written right before the child exits is not lost. WaitDelay bounds
+	// that wait if a grandchild keeps the pipe open.
+	stdout, stdoutWriter := io.Pipe()
+	cmd.Stdout = stdoutWriter
+	cmd.WaitDelay = stdioWaitDelay
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		cancel()
@@ -352,6 +358,9 @@ func newStdioSession(sessionID string, route config.Route, resolver stdioSecretR
 		stdin:   stdin,
 		pending: make(map[string]chan stdioResponse),
 		done:    make(chan struct{}),
+
+		stdoutWriter: stdoutWriter,
+		stdoutDone:   make(chan struct{}),
 	}
 	go session.readStdout(stdout)
 	go session.readStderr(stderr)
@@ -414,6 +423,7 @@ func (s *stdioSession) writeMessage(payload []byte) error {
 }
 
 func (s *stdioSession) readStdout(stdout io.Reader) {
+	defer close(s.stdoutDone)
 	reader := bufio.NewReader(stdout)
 	for {
 		line, err := reader.ReadBytes('\n')
@@ -464,6 +474,9 @@ func (s *stdioSession) wait() {
 	if err != nil {
 		log.Printf("stdio bridge process exited route=%s session=%s err=%v", s.route.ID, s.id, err)
 	}
+	// Deliver every response the child wrote before failing pending calls.
+	_ = s.stdoutWriter.Close()
+	<-s.stdoutDone
 
 	s.mu.Lock()
 	pending := s.pending
