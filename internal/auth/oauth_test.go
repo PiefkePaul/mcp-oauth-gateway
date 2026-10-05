@@ -324,7 +324,7 @@ func TestGatewayWideAccessTokenCanBeValidatedForSpecificResource(t *testing.T) {
 	userID := manager.ListUsers()[0].ID
 
 	manager.mu.Lock()
-	tokenSet := manager.issueTokenSetLocked(time.Now(), userID, "client-id", "mcp", "")
+	tokenSet := manager.issueTokenSetLocked(time.Now(), userID, "client-id", "", "mcp", "")
 	manager.mu.Unlock()
 
 	identity, err := manager.ValidateAccessToken(tokenSet.AccessToken, "https://mcp.example.com/legal/mcp")
@@ -341,7 +341,7 @@ func TestRootResourceAccessTokenCanBeValidatedForSpecificResource(t *testing.T) 
 	userID := manager.ListUsers()[0].ID
 
 	manager.mu.Lock()
-	tokenSet := manager.issueTokenSetLocked(time.Now(), userID, "client-id", "mcp", "https://mcp.example.com")
+	tokenSet := manager.issueTokenSetLocked(time.Now(), userID, "client-id", "", "mcp", "https://mcp.example.com")
 	manager.mu.Unlock()
 
 	identity, err := manager.ValidateAccessToken(tokenSet.AccessToken, "https://mcp.example.com/camoufox/mcp")
@@ -482,7 +482,7 @@ func TestClientRegistrationManagementRejectsOAuthAccessToken(t *testing.T) {
 
 	userID := manager.ListUsers()[0].ID
 	manager.mu.Lock()
-	tokenSet := manager.issueTokenSetLocked(time.Now(), userID, client.ID, "mcp", "https://mcp.example.com/camoufox/mcp")
+	tokenSet := manager.issueTokenSetLocked(time.Now(), userID, client.ID, "", "mcp", "https://mcp.example.com/camoufox/mcp")
 	manager.mu.Unlock()
 
 	req := httptest.NewRequest(http.MethodGet, "https://mcp.example.com/register/"+client.ID, nil)

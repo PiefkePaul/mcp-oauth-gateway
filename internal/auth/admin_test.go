@@ -119,7 +119,7 @@ func TestUserDevicesCanBeListedAndRevoked(t *testing.T) {
 	}
 
 	manager.mu.Lock()
-	tokenSet := manager.issueTokenSetLocked(time.Now(), admin.ID, client.ID, "mcp", "https://mcp.example.com/camoufox/mcp")
+	tokenSet := manager.issueTokenSetLocked(time.Now(), admin.ID, client.ID, "", "mcp", "https://mcp.example.com/camoufox/mcp")
 	if err := manager.saveLocked(); err != nil {
 		t.Fatalf("save token set: %v", err)
 	}

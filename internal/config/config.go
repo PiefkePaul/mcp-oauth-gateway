@@ -26,6 +26,7 @@ const (
 	defaultBuildMaxArtifactMB  = 100
 	defaultAccessTokenTTL      = time.Hour
 	defaultRefreshTokenTTL     = 30 * 24 * time.Hour
+	defaultRefreshReuseGrace   = 2 * time.Minute
 	defaultAuthorizationTTL    = 10 * time.Minute
 	defaultSessionTTL          = 30 * 24 * time.Hour
 	defaultAccountPortalTitle  = "MCP Gateway"
@@ -48,8 +49,17 @@ type Config struct {
 	DockerManagement    DockerManagementConfig
 	BuildManagement     BuildManagementConfig
 	StdioInstaller      StdioInstallerConfig
+	StdioSessions       StdioSessionConfig
 	OpenAPIStoreDir     string
 	Routes              []Route
+}
+
+// StdioSessionConfig bounds native STDIO MCP processes. Zero values fall
+// back to the gateway defaults.
+type StdioSessionConfig struct {
+	IdleTimeout        time.Duration
+	MaxSessionsPerUser int // per agent (user plus login or token) and route
+	MaxSessionsRoute   int
 }
 
 type AuthConfig struct {
@@ -57,6 +67,7 @@ type AuthConfig struct {
 	MasterKey              []byte
 	AccessTokenTTL         time.Duration
 	RefreshTokenTTL        time.Duration
+	RefreshTokenReuseGrace time.Duration
 	AuthorizationCodeTTL   time.Duration
 	SessionTTL             time.Duration
 	AllowedRedirectOrigins []string
@@ -88,25 +99,34 @@ type StdioInstallerConfig struct {
 }
 
 type Route struct {
-	ID                     string            `yaml:"id"`
-	DisplayName            string            `yaml:"display_name"`
-	Transport              string            `yaml:"transport,omitempty"`
-	PathPrefix             string            `yaml:"path_prefix"`
-	Upstream               string            `yaml:"upstream,omitempty"`
-	UpstreamMCPPath        string            `yaml:"upstream_mcp_path,omitempty"`
-	ScopesSupported        []string          `yaml:"scopes_supported"`
-	PassAuthorization      bool              `yaml:"pass_authorization_header"`
-	ForwardHeaders         map[string]string `yaml:"forward_headers"`
-	UpstreamEnvironment    map[string]string `yaml:"upstream_environment"`
-	Access                 RouteAccess       `yaml:"access"`
-	Deployment             *RouteDeployment  `yaml:"deployment,omitempty"`
-	Stdio                  *RouteStdio       `yaml:"stdio,omitempty"`
-	OpenAPI                *RouteOpenAPI     `yaml:"openapi,omitempty"`
-	ResourceDocumentation  string            `yaml:"resource_documentation"`
-	Notes                  string            `yaml:"notes"`
-	NormalizedPathPrefix   string            `yaml:"-"`
-	NormalizedUpstreamPath string            `yaml:"-"`
+	ID                    string            `yaml:"id"`
+	DisplayName           string            `yaml:"display_name"`
+	Transport             string            `yaml:"transport,omitempty"`
+	PathPrefix            string            `yaml:"path_prefix"`
+	Upstream              string            `yaml:"upstream,omitempty"`
+	UpstreamMCPPath       string            `yaml:"upstream_mcp_path,omitempty"`
+	ScopesSupported       []string          `yaml:"scopes_supported"`
+	PassAuthorization     bool              `yaml:"pass_authorization_header"`
+	ForwardHeaders        map[string]string `yaml:"forward_headers"`
+	UpstreamEnvironment   map[string]string `yaml:"upstream_environment"`
+	Access                RouteAccess       `yaml:"access"`
+	Deployment            *RouteDeployment  `yaml:"deployment,omitempty"`
+	Stdio                 *RouteStdio       `yaml:"stdio,omitempty"`
+	OpenAPI               *RouteOpenAPI     `yaml:"openapi,omitempty"`
+	ResourceDocumentation string            `yaml:"resource_documentation"`
+	Notes                 string            `yaml:"notes"`
+	// OpenAPISessionMode controls the MCP-to-OpenAPI adapter: "pooled"
+	// (default) keeps one MCP session per agent, "per_request" opens a fresh
+	// session for every OpenAPI call.
+	OpenAPISessionMode     string `yaml:"openapi_session_mode,omitempty"`
+	NormalizedPathPrefix   string `yaml:"-"`
+	NormalizedUpstreamPath string `yaml:"-"`
 }
+
+const (
+	OpenAPISessionPooled     = "pooled"
+	OpenAPISessionPerRequest = "per_request"
+)
 
 type RouteDeployment struct {
 	Type          string   `yaml:"type"`
@@ -168,6 +188,7 @@ func Load() (*Config, error) {
 			StorePath:              getEnvOrDefault("MCP_GATEWAY_AUTH_STORE_PATH", defaultAuthStorePath),
 			AccessTokenTTL:         getDurationEnv("MCP_GATEWAY_ACCESS_TOKEN_TTL", defaultAccessTokenTTL),
 			RefreshTokenTTL:        getDurationEnv("MCP_GATEWAY_REFRESH_TOKEN_TTL", defaultRefreshTokenTTL),
+			RefreshTokenReuseGrace: getDurationEnv("MCP_GATEWAY_REFRESH_TOKEN_REUSE_GRACE", defaultRefreshReuseGrace),
 			AuthorizationCodeTTL:   getDurationEnv("MCP_GATEWAY_AUTHORIZATION_CODE_TTL", defaultAuthorizationTTL),
 			SessionTTL:             getDurationEnv("MCP_GATEWAY_SESSION_TTL", defaultSessionTTL),
 			AllowedRedirectOrigins: parseCSVEnv("MCP_GATEWAY_ALLOWED_REDIRECT_ORIGINS"),
@@ -193,6 +214,11 @@ func Load() (*Config, error) {
 			MaxArtifactBytes:     int64(getIntEnv("MCP_GATEWAY_STDIO_MAX_ARTIFACT_MB", defaultBuildMaxArtifactMB)) << 20,
 			AllowedDownloadHosts: parseCSVEnv("MCP_GATEWAY_STDIO_ALLOWED_DOWNLOAD_HOSTS"),
 			AllowAnyDownloadHost: getBoolEnv("MCP_GATEWAY_STDIO_ALLOW_ANY_DOWNLOAD_HOST", false),
+		},
+		StdioSessions: StdioSessionConfig{
+			IdleTimeout:        getDurationEnv("MCP_GATEWAY_STDIO_SESSION_IDLE_TIMEOUT", 30*time.Minute),
+			MaxSessionsPerUser: getIntEnv("MCP_GATEWAY_STDIO_MAX_SESSIONS_PER_AGENT", 8),
+			MaxSessionsRoute:   getIntEnv("MCP_GATEWAY_STDIO_MAX_SESSIONS_PER_ROUTE", 64),
 		},
 		OpenAPIStoreDir: getEnvOrDefault("MCP_GATEWAY_OPENAPI_STORE_DIR", defaultOpenAPIStoreDir),
 	}
@@ -402,6 +428,12 @@ func normalizeRoute(route *Route) error {
 	}
 	if route.Transport != "http" && route.Transport != "stdio" && route.Transport != "openapi" {
 		return fmt.Errorf("route %q transport must be http, stdio or openapi", route.ID)
+	}
+	route.OpenAPISessionMode = strings.ToLower(strings.TrimSpace(route.OpenAPISessionMode))
+	switch route.OpenAPISessionMode {
+	case "", OpenAPISessionPooled, OpenAPISessionPerRequest:
+	default:
+		return fmt.Errorf("route %q openapi_session_mode must be %s or %s", route.ID, OpenAPISessionPooled, OpenAPISessionPerRequest)
 	}
 
 	pathPrefix := strings.TrimSpace(route.PathPrefix)

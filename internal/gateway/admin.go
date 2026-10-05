@@ -196,6 +196,7 @@ type routeFormData struct {
 	PassAuthorization            bool
 	ResourceDocumentation        string
 	MCPHTTPSessionMode           string
+	OpenAPISessionMode           string
 	AccessVisibility             string
 	AccessMode                   string
 	AllowedUsers                 []string
@@ -1265,6 +1266,7 @@ func parseRouteForm(r *http.Request) (routeFormData, config.Route, error) {
 		PassAuthorization:     formCheckbox(r, "pass_authorization_header"),
 		ResourceDocumentation: strings.TrimSpace(r.FormValue("resource_documentation")),
 		MCPHTTPSessionMode:    strings.TrimSpace(r.FormValue("mcp_http_session_mode")),
+		OpenAPISessionMode:    strings.TrimSpace(r.FormValue("openapi_session_mode")),
 		AccessVisibility:      defaultIfEmpty(strings.TrimSpace(r.FormValue("access_visibility")), "public"),
 		AccessMode:            defaultIfEmpty(strings.TrimSpace(r.FormValue("access_mode")), "public"),
 		AllowedUsers:          valuesFromSelection(r.Form["allowed_users"]),
@@ -1323,6 +1325,7 @@ func parseRouteForm(r *http.Request) (routeFormData, config.Route, error) {
 			UpstreamEnvironment:   upstreamEnvironment,
 			ResourceDocumentation: formData.ResourceDocumentation,
 			Notes:                 formData.Notes,
+			OpenAPISessionMode:    formData.OpenAPISessionMode,
 			Access: config.RouteAccess{
 				Visibility:    formData.AccessVisibility,
 				Mode:          formData.AccessMode,
@@ -1361,6 +1364,7 @@ func parseRouteForm(r *http.Request) (routeFormData, config.Route, error) {
 			UpstreamEnvironment:   upstreamEnvironment,
 			ResourceDocumentation: formData.ResourceDocumentation,
 			Notes:                 formData.Notes,
+			OpenAPISessionMode:    formData.OpenAPISessionMode,
 			Access: config.RouteAccess{
 				Visibility:    formData.AccessVisibility,
 				Mode:          formData.AccessMode,
@@ -1401,6 +1405,7 @@ func parseRouteForm(r *http.Request) (routeFormData, config.Route, error) {
 		},
 		ResourceDocumentation: formData.ResourceDocumentation,
 		Notes:                 formData.Notes,
+		OpenAPISessionMode:    formData.OpenAPISessionMode,
 	}
 
 	return formData, route, nil
@@ -1542,6 +1547,7 @@ func newRouteFormData(route config.Route, originalID string) routeFormData {
 		PassAuthorization:     route.PassAuthorization,
 		ResourceDocumentation: route.ResourceDocumentation,
 		MCPHTTPSessionMode:    strings.TrimSpace(route.UpstreamEnvironment["MCP_HTTP_SESSION_MODE"]),
+		OpenAPISessionMode:    route.OpenAPISessionMode,
 		AccessVisibility:      defaultIfEmpty(route.Access.Visibility, "public"),
 		AccessMode:            route.Access.EffectiveMode(),
 		AllowedUsers:          append([]string(nil), route.Access.AllowedUsers...),
@@ -2444,6 +2450,14 @@ const adminDashboardTemplate = `
                       <option value="admin" {{if eq .SelectedRoute.AccessMode "admin"}}selected{{end}}>Nur Admins</option>
                     </select>
                   </div>
+                </div>
+                <div class="field">
+                  <label for="openapi_session_mode">OpenAPI-Adapter Sessions</label>
+                  <select id="openapi_session_mode" name="openapi_session_mode">
+                    <option value="" {{if not .SelectedRoute.OpenAPISessionMode}}selected{{end}}>Pro Agent wiederverwenden (Standard)</option>
+                    <option value="per_request" {{if eq .SelectedRoute.OpenAPISessionMode "per_request"}}selected{{end}}>Neue Session pro Aufruf</option>
+                  </select>
+                  <p class="hint" style="margin-top:.2rem;">Gilt nur fuer <code>/openapi/tools/...</code>. "Neue Session pro Aufruf" isoliert jeden Aufruf vollstaendig, ist aber langsamer (bei STDIO ein Prozessstart pro Aufruf).</p>
                 </div>
                 <div class="field">
                   <label for="resource_documentation">Resource Documentation URL</label>

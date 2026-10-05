@@ -386,3 +386,46 @@ func newTestServerWithRoutes(t *testing.T, routes []config.Route) *Server {
 
 	return handler
 }
+
+func TestRouteFormRoundTripsOpenAPISessionMode(t *testing.T) {
+	form := url.Values{
+		"display_name":         {"Tools"},
+		"transport":            {"stdio"},
+		"path_prefix":          {"/tools"},
+		"stdio_command":        {"/bin/true"},
+		"openapi_session_mode": {"per_request"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/admin/routes/save", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if err := req.ParseForm(); err != nil {
+		t.Fatalf("parse form: %v", err)
+	}
+	formData, route, err := parseRouteForm(req)
+	if err != nil {
+		t.Fatalf("parse route form: %v", err)
+	}
+	route.ID = "tools"
+	if err := config.NormalizeRoute(&route); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if route.OpenAPISessionMode != config.OpenAPISessionPerRequest {
+		t.Fatalf("expected per_request from the form, got %q", route.OpenAPISessionMode)
+	}
+	if got := newRouteFormData(route, route.ID).OpenAPISessionMode; got != config.OpenAPISessionPerRequest {
+		t.Fatalf("editing the route must show the stored mode, got %q", got)
+	}
+
+	// The editor renders with the option selected.
+	server := newTestServerWithRoutes(t, []config.Route{route})
+	rec := httptest.NewRecorder()
+	server.renderAdminDashboard(rec, httptest.NewRequest(http.MethodGet, "/admin?route=tools", nil), &auth.Identity{UserID: "admin", IsAdmin: true}, formData, "", "", http.StatusOK)
+	if !strings.Contains(rec.Body.String(), `<option value="per_request" selected>`) {
+		t.Fatalf("expected the per_request option to be selected in the editor")
+	}
+
+	invalid := route
+	invalid.OpenAPISessionMode = "sometimes"
+	if err := config.NormalizeRoute(&invalid); err == nil {
+		t.Fatalf("expected an invalid openapi_session_mode to be rejected")
+	}
+}

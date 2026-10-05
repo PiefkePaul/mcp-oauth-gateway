@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/PiefkePaul/mcp-oauth-gateway/internal/auth"
 	"github.com/PiefkePaul/mcp-oauth-gateway/internal/config"
 )
 
@@ -12,6 +13,9 @@ type routeRuntime struct {
 	Route   config.Route
 	Handler http.Handler
 	Close   func() error
+	// Revalidate closes sessions whose agent lost access, if the transport
+	// keeps sessions of its own.
+	Revalidate func()
 }
 
 func (s *Server) replaceRoutes(routes []config.Route) error {
@@ -27,6 +31,7 @@ func (s *Server) replaceRoutes(routes []config.Route) error {
 	s.cfg.Routes = cloneRoutes(routes)
 	s.mu.Unlock()
 	closeRouteRuntimes(oldRuntimes)
+	s.mcpSessions.closeAll()
 	return nil
 }
 
@@ -239,6 +244,7 @@ func (s *Server) persistRoutesLocked(routes []config.Route) error {
 	s.runtime = runtimes
 	s.cfg.Routes = cloneRoutes(cloned)
 	closeRouteRuntimes(oldRuntimes)
+	s.mcpSessions.closeAll()
 	return nil
 }
 
@@ -246,16 +252,26 @@ func (s *Server) buildRouteRuntime(routes []config.Route) (map[string]routeRunti
 	runtimes := make(map[string]routeRuntime, len(routes))
 	for _, route := range cloneRoutes(routes) {
 		var (
-			handler http.Handler
-			closeFn func() error
-			err     error
+			handler    http.Handler
+			closeFn    func() error
+			revalidate func()
+			err        error
 		)
 		switch route.Transport {
 		case "stdio":
-			stdioHandler, stdioClose, stdioErr := newStdioBridge(route, s.resolveStdioSecrets)
-			handler = stdioHandler
-			closeFn = stdioClose
-			err = stdioErr
+			routeID := route.ID
+			var bridge *stdioBridge
+			bridge, err = newStdioBridgeWithOptions(route, s.resolveStdioSecrets, stdioBridgeOptions{
+				IdleTimeout: s.cfg.StdioSessions.IdleTimeout,
+				MaxPerAgent: s.cfg.StdioSessions.MaxSessionsPerUser,
+				MaxPerRoute: s.cfg.StdioSessions.MaxSessionsRoute,
+				Authorize: func(identity *auth.Identity) bool {
+					return s.sessionStillAuthorized(routeID, identity)
+				},
+			})
+			if bridge != nil {
+				handler, closeFn, revalidate = bridge, bridge.Close, bridge.sweep
+			}
 		case "openapi":
 			handler, err = newOpenAPIBridge(route)
 		default:
@@ -266,12 +282,44 @@ func (s *Server) buildRouteRuntime(routes []config.Route) (map[string]routeRunti
 			return nil, err
 		}
 		runtimes[route.ID] = routeRuntime{
-			Route:   route,
-			Handler: handler,
-			Close:   closeFn,
+			Route:      route,
+			Handler:    newSessionBinding(route.ID, s.authManager.DeriveKey(sessionBindingKeyLabel), handler),
+			Close:      closeFn,
+			Revalidate: revalidate,
 		}
 	}
 	return runtimes, nil
+}
+
+// sessionStillAuthorized reports whether the agent behind identity may still
+// use the route: the user and credential still exist and the route's
+// current access rules still admit the user.
+func (s *Server) sessionStillAuthorized(routeID string, identity *auth.Identity) bool {
+	fresh, ok := s.authManager.RevalidateIdentity(identity)
+	if !ok {
+		return false
+	}
+	route, ok := s.routeByID(routeID)
+	if !ok {
+		return false
+	}
+	return routeAccessAllowed(route, fresh)
+}
+
+// revalidateSessions closes sessions whose agent lost access. It runs after
+// user, group or credential changes.
+func (s *Server) revalidateSessions() {
+	s.mu.RLock()
+	revalidators := make([]func(), 0, len(s.runtime))
+	for _, runtime := range s.runtime {
+		if runtime.Revalidate != nil {
+			revalidators = append(revalidators, runtime.Revalidate)
+		}
+	}
+	s.mu.RUnlock()
+	for _, revalidate := range revalidators {
+		revalidate()
+	}
 }
 
 func (s *Server) resolveStdioSecrets(route config.Route) (map[string]string, error) {
