@@ -167,6 +167,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "/admin/routes/save":
 		s.handleAdminRouteSave(w, r)
 		return
+	case "/admin/routes/restart":
+		s.handleAdminRouteRestart(w, r)
+		return
 	case "/admin/routes/delete":
 		s.handleAdminRouteDelete(w, r)
 		return

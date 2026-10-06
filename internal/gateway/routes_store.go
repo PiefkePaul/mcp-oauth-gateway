@@ -1,8 +1,12 @@
 package gateway
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 
 	"github.com/PiefkePaul/mcp-oauth-gateway/internal/auth"
@@ -16,23 +20,26 @@ type routeRuntime struct {
 	// Revalidate closes sessions whose agent lost access, if the transport
 	// keeps sessions of its own.
 	Revalidate func()
+	// fingerprint identifies everything the handler was built from; a route
+	// change that keeps it keeps the runtime and its running sessions.
+	fingerprint string
 }
 
 func (s *Server) replaceRoutes(routes []config.Route) error {
-	runtimes, err := s.buildRouteRuntime(routes)
-	if err != nil {
-		return err
-	}
-
 	s.mu.Lock()
-	oldRuntimes := s.runtime
-	s.routes = cloneRoutes(routes)
-	s.runtime = runtimes
-	s.cfg.Routes = cloneRoutes(routes)
-	s.mu.Unlock()
-	closeRouteRuntimes(oldRuntimes)
-	s.mcpSessions.closeAll()
-	return nil
+	defer s.mu.Unlock()
+	return s.installRoutesLocked(cloneRoutes(routes), nil, false)
+}
+
+// restartRoute rebuilds one route's runtime even if its configuration is
+// unchanged, e.g. after its executable was replaced. Its sessions end.
+func (s *Server) restartRoute(routeID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.runtime[routeID]; !ok {
+		return fmt.Errorf("route not found")
+	}
+	return s.installRoutesLocked(cloneRoutes(s.routes), map[string]bool{routeID: true}, false)
 }
 
 func (s *Server) routesSnapshot() []config.Route {
@@ -235,29 +242,65 @@ func (s *Server) persistRoutesLocked(routes []config.Route) error {
 	if err := config.ValidateRoutes(cloned); err != nil {
 		return err
 	}
+	return s.installRoutesLocked(cloned, nil, true)
+}
 
-	runtimes, err := s.buildRouteRuntime(cloned)
+// installRoutesLocked swaps in routes. Routes whose runtime fingerprint is
+// unchanged keep their runtime, so editing e.g. one route's access rules or
+// display name does not restart every STDIO process; only new, changed,
+// removed or force-restarted routes are rebuilt or closed.
+func (s *Server) installRoutesLocked(routes []config.Route, forceRestart map[string]bool, persist bool) error {
+	runtimes, built, err := s.buildRouteRuntimeReusing(routes, s.runtime, forceRestart)
 	if err != nil {
 		return err
 	}
-
-	if err := config.SaveRoutesFile(s.cfg.RoutesPath, cloned); err != nil {
-		closeRouteRuntimes(runtimes)
-		return err
+	if persist {
+		if err := config.SaveRoutesFile(s.cfg.RoutesPath, routes); err != nil {
+			closeRouteRuntimes(built)
+			return err
+		}
 	}
 
-	oldRuntimes := s.runtime
-	s.routes = cloned
+	stale := make(map[string]routeRuntime)
+	for id, old := range s.runtime {
+		if current, ok := runtimes[id]; !ok || current.Handler != old.Handler {
+			stale[id] = old
+		}
+	}
+	s.routes = routes
 	s.runtime = runtimes
-	s.cfg.Routes = cloneRoutes(cloned)
-	closeRouteRuntimes(oldRuntimes)
-	s.mcpSessions.closeAll()
+	s.cfg.Routes = cloneRoutes(routes)
+	closeRouteRuntimes(stale)
+	staleIDs := make([]string, 0, len(stale))
+	for id := range stale {
+		staleIDs = append(staleIDs, id)
+	}
+	s.mcpSessions.closeRoutes(staleIDs)
+	// Kept runtimes may have new access rules; close sessions that lost
+	// access. Runs after the caller releases the routes lock.
+	go s.revalidateSessions()
 	return nil
 }
 
 func (s *Server) buildRouteRuntime(routes []config.Route) (map[string]routeRuntime, error) {
-	runtimes := make(map[string]routeRuntime, len(routes))
+	runtimes, _, err := s.buildRouteRuntimeReusing(routes, nil, nil)
+	return runtimes, err
+}
+
+// buildRouteRuntimeReusing returns runtimes for routes, reusing those in
+// previous whose fingerprint is unchanged unless forced. built holds only
+// the newly built runtimes, the ones a caller must close if it discards the
+// result.
+func (s *Server) buildRouteRuntimeReusing(routes []config.Route, previous map[string]routeRuntime, forceRestart map[string]bool) (runtimes, built map[string]routeRuntime, err error) {
+	runtimes = make(map[string]routeRuntime, len(routes))
+	built = make(map[string]routeRuntime, len(routes))
 	for _, route := range cloneRoutes(routes) {
+		fingerprint := s.routeRuntimeFingerprint(route)
+		if prev, ok := previous[route.ID]; ok && !forceRestart[route.ID] && prev.fingerprint == fingerprint {
+			prev.Route = route
+			runtimes[route.ID] = prev
+			continue
+		}
 		var (
 			handler    http.Handler
 			closeFn    func() error
@@ -285,17 +328,64 @@ func (s *Server) buildRouteRuntime(routes []config.Route) (map[string]routeRunti
 			handler, err = s.newReverseProxy(route)
 		}
 		if err != nil {
-			closeRouteRuntimes(runtimes)
-			return nil, err
+			closeRouteRuntimes(built)
+			return nil, nil, err
 		}
-		runtimes[route.ID] = routeRuntime{
-			Route:      route,
-			Handler:    newSessionBinding(route.ID, s.authManager.DeriveKey(sessionBindingKeyLabel), handler),
-			Close:      closeFn,
-			Revalidate: revalidate,
+		runtime := routeRuntime{
+			Route:       route,
+			Handler:     newSessionBinding(route.ID, s.authManager.DeriveKey(sessionBindingKeyLabel), handler),
+			Close:       closeFn,
+			Revalidate:  revalidate,
+			fingerprint: fingerprint,
+		}
+		runtimes[route.ID] = runtime
+		built[route.ID] = runtime
+	}
+	return runtimes, built, nil
+}
+
+// routeRuntimeFingerprint covers every route setting a handler is built
+// from. Settings that are read per request from the current route (access
+// rules, scopes, OpenAPI session mode) or that are pure metadata are left
+// out, so changing them keeps running sessions. New Route fields are
+// included by default, which errs on the side of restarting.
+func (s *Server) routeRuntimeFingerprint(route config.Route) string {
+	route.DisplayName = ""
+	route.ResourceDocumentation = ""
+	route.Notes = ""
+	route.Access = config.RouteAccess{}
+	route.Deployment = nil
+	route.UpstreamEnvironment = nil
+	route.ScopesSupported = nil
+	route.OpenAPISessionMode = ""
+	raw, err := json.Marshal(route)
+	if err != nil {
+		// Never reuse a runtime whose configuration cannot be compared.
+		return "unhashable:" + err.Error()
+	}
+	sum := sha256.New()
+	sum.Write(raw)
+	// STDIO processes read their secrets only at start: a changed secret
+	// value must restart the route.
+	if route.Stdio != nil && len(route.Stdio.EnvSecretRefs) != 0 {
+		secrets, err := s.resolveStdioSecrets(route)
+		if err != nil {
+			sum.Write([]byte("secret-error:" + err.Error()))
+		} else {
+			names := make([]string, 0, len(secrets))
+			for name := range secrets {
+				names = append(names, name)
+			}
+			sort.Strings(names)
+			for _, name := range names {
+				sum.Write([]byte{0})
+				sum.Write([]byte(name))
+				sum.Write([]byte{0})
+				sum.Write([]byte(secrets[name]))
+			}
 		}
 	}
-	return runtimes, nil
+	return hex.EncodeToString(sum.Sum(nil))
 }
 
 // sessionStillAuthorized reports whether the agent behind identity may still
