@@ -279,6 +279,11 @@ func (s *Server) handleAdminRouteSave(w http.ResponseWriter, r *http.Request) {
 		}
 		formData.ID = route.ID
 	}
+	if formData.OriginalID != "" {
+		if existing, ok := s.routeByID(formData.OriginalID); ok {
+			preserveRouteFieldsNotInForm(existing, &route)
+		}
+	}
 	if route.Transport == "openapi" {
 		specPath, err := s.storeOpenAPISpecUpload(r, route.ID)
 		if err != nil {
@@ -316,6 +321,28 @@ func (s *Server) handleAdminRouteSave(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/admin?new=1&notice="+url.QueryEscape(notice), http.StatusFound)
 	default:
 		http.Redirect(w, r, adminRedirectURL(next, notice, ""), http.StatusFound)
+	}
+}
+
+// preserveRouteFieldsNotInForm carries over settings the route editor does
+// not show, so saving a route does not silently drop them: the STDIO
+// installer's secret references and managed deployment metadata. They are
+// kept only while the transport stays the same.
+func preserveRouteFieldsNotInForm(existing config.Route, route *config.Route) {
+	if existing.Transport != route.Transport {
+		return
+	}
+	if route.Deployment == nil && existing.Deployment != nil {
+		deployment := *existing.Deployment
+		deployment.Networks = append([]string(nil), existing.Deployment.Networks...)
+		route.Deployment = &deployment
+	}
+	if route.Stdio != nil && existing.Stdio != nil && len(route.Stdio.EnvSecretRefs) == 0 && len(existing.Stdio.EnvSecretRefs) != 0 {
+		refs := make(map[string]string, len(existing.Stdio.EnvSecretRefs))
+		for name, ref := range existing.Stdio.EnvSecretRefs {
+			refs[name] = ref
+		}
+		route.Stdio.EnvSecretRefs = refs
 	}
 }
 

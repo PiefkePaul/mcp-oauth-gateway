@@ -194,8 +194,14 @@ func (s *Server) validateUpsertRoute(originalID string, route config.Route) erro
 	if err := config.ValidateRoutes(nextRoutes); err != nil {
 		return err
 	}
-	_, err := s.buildRouteRuntime(nextRoutes)
-	return err
+	// Build the runtimes only to validate them; close them again so probe
+	// STDIO bridges do not keep their sweep loops running.
+	runtimes, err := s.buildRouteRuntime(nextRoutes)
+	if err != nil {
+		return err
+	}
+	closeRouteRuntimes(runtimes)
+	return nil
 }
 
 func (s *Server) deleteRoute(routeID string) error {
@@ -236,6 +242,7 @@ func (s *Server) persistRoutesLocked(routes []config.Route) error {
 	}
 
 	if err := config.SaveRoutesFile(s.cfg.RoutesPath, cloned); err != nil {
+		closeRouteRuntimes(runtimes)
 		return err
 	}
 
