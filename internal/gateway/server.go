@@ -506,15 +506,20 @@ func (s *Server) newReverseProxy(route config.Route) (http.Handler, error) {
 			}
 
 			identity := auth.IdentityFromContext(pr.In.Context())
-			if identity != nil {
-				for headerName, templateValue := range route.HeaderTemplates() {
-					value := expandHeaderTemplate(templateValue, route, identity)
-					if strings.TrimSpace(value) == "" {
-						pr.Out.Header.Del(headerName)
-						continue
-					}
-					pr.Out.Header.Set(headerName, value)
+			for headerName, templateValue := range route.HeaderTemplates() {
+				// Without an identity (health checks, anonymous OpenAPI
+				// specs) only headers that do not name the user are sent,
+				// e.g. a static upstream API key.
+				if identity == nil && headerTemplateNeedsIdentity(templateValue) {
+					pr.Out.Header.Del(headerName)
+					continue
 				}
+				value := expandHeaderTemplate(templateValue, route, identity)
+				if strings.TrimSpace(value) == "" {
+					pr.Out.Header.Del(headerName)
+					continue
+				}
+				pr.Out.Header.Set(headerName, value)
 			}
 			if upstreamBearer, ok := s.authManager.ResolveRouteUpstreamBearer(route.ID, identity); ok {
 				pr.Out.Header.Set("Authorization", "Bearer "+upstreamBearer)
@@ -604,13 +609,34 @@ func joinRawQuery(baseQuery, requestQuery string) string {
 }
 
 func expandHeaderTemplate(templateValue string, route config.Route, identity *auth.Identity) string {
+	email, userID := "", ""
+	if identity != nil {
+		email, userID = identity.Email, identity.UserID
+	}
 	replacer := strings.NewReplacer(
-		"{email}", identity.Email,
+		"{email}", email,
 		"{route_id}", route.ID,
 		"{route_path}", route.NormalizedPathPrefix,
-		"{user_id}", identity.UserID,
+		"{user_id}", userID,
 	)
 	return replacer.Replace(templateValue)
+}
+
+// headerTemplateNeedsIdentity reports whether a forward header names the
+// calling user and therefore cannot be filled without one.
+func headerTemplateNeedsIdentity(templateValue string) bool {
+	return strings.Contains(templateValue, "{email}") || strings.Contains(templateValue, "{user_id}")
+}
+
+// routeAuthDependsOnUser reports whether the route has forward headers that
+// name the user, so an anonymous request may lack what the upstream needs.
+func routeAuthDependsOnUser(route config.Route) bool {
+	for _, templateValue := range route.ForwardHeaders {
+		if headerTemplateNeedsIdentity(templateValue) {
+			return true
+		}
+	}
+	return false
 }
 
 func bearerToken(headerValue string) (string, error) {

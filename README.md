@@ -276,7 +276,7 @@ Der Gateway prueft jede Route mit einem echten MCP-Durchlauf (`initialize` und `
 - Im Hintergrund laufen alle Checks alle `MCP_GATEWAY_HEALTHCHECK_INTERVAL` (erste Runde ca. 15 Sekunden nach dem Start, hoechstens 4 parallel, 15 Sekunden Timeout pro Route). Abschalten mit `MCP_GATEWAY_HEALTHCHECK_ENABLED=false`.
 - Im Admin-Dashboard zeigen die Routen-Uebersicht und der Route-Editor Status, Zeitpunkt, Tool-Anzahl/Latenz bzw. die Fehlerursache. "Jetzt pruefen" und "Alle pruefen" starten Checks manuell.
 - Der oeffentliche Katalog (`/`, `/?format=json`, `/<route>`) zeigt nur Status, Zeitpunkt, Latenz und Tool-Anzahl, keine Fehlerdetails, da diese interne Hosts nennen koennen.
-- Der Check nutzt den globalen Upstream-Bearer. Hat eine Route nur nutzerspezifische Bearer, meldet er "Eingeschraenkt pruefbar" statt "Gestoert".
+- Der Check laeuft ohne Nutzer: Er sendet den globalen Upstream-Bearer und alle `forward_headers` ohne Nutzer-Platzhalter (z.B. einen statischen API-Key), aber keine Header mit `{email}`/`{user_id}`. Haengt die Upstream-Anmeldung nur an nutzerspezifischen Bearern oder solchen Headern, meldet er "Eingeschraenkt pruefbar" statt "Gestoert".
 - STDIO-Routen starten fuer jeden Check kurz einen eigenen Prozess.
 - Die Ergebnisse liegen nur im Speicher und sind nach einem Neustart bis zur ersten Runde "Noch nicht geprueft".
 
