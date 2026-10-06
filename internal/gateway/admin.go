@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/PiefkePaul/mcp-oauth-gateway/internal/auth"
 	"github.com/PiefkePaul/mcp-oauth-gateway/internal/config"
@@ -298,6 +299,13 @@ func (s *Server) handleAdminRouteSave(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Validate the upstream bearer input before anything is saved.
+	bearerForm, err := parseUpstreamBearerForm(r)
+	if err != nil {
+		s.renderAdminDashboard(w, r, identity, formData, "", err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	if err := s.upsertRoute(formData.OriginalID, route); err != nil {
 		s.renderAdminDashboard(w, r, identity, formData, "", err.Error(), http.StatusBadRequest)
 		return
@@ -306,12 +314,15 @@ func (s *Server) handleAdminRouteSave(w http.ResponseWriter, r *http.Request) {
 		s.renderAdminDashboard(w, r, identity, formData, "", err.Error(), http.StatusBadRequest)
 		return
 	}
-	if err := s.saveRouteUpstreamBearerForm(r, route.ID); err != nil {
+	if err := s.applyUpstreamBearerForm(bearerForm, route.ID); err != nil {
 		s.renderAdminDashboard(w, r, identity, formData, "", err.Error(), http.StatusBadRequest)
 		return
 	}
 
 	notice := "Route saved successfully"
+	if bearerForm.unquoted {
+		notice += "; quotes around the Upstream Bearer were removed"
+	}
 	switch next := strings.TrimSpace(r.FormValue("next_route")); next {
 	case "":
 		http.Redirect(w, r, adminRedirectURL(route.ID, notice, ""), http.StatusFound)
@@ -354,18 +365,27 @@ const (
 	routeEditorNewSentinel    = "__new__"
 )
 
-func (s *Server) saveRouteUpstreamBearerForm(r *http.Request, routeID string) error {
-	token := strings.TrimSpace(r.FormValue("upstream_bearer_token"))
-	clearGlobal := formCheckbox(r, "clear_upstream_bearer")
-	if token != "" {
-		if err := s.authManager.SetRouteUpstreamBearer(routeID, token); err != nil {
-			return err
-		}
-	} else if clearGlobal {
-		if err := s.authManager.SetRouteUpstreamBearer(routeID, ""); err != nil {
-			return err
-		}
+type upstreamBearerUserInput struct {
+	userID string
+	token  string
+	clear  bool
+}
+
+type upstreamBearerFormInput struct {
+	token       string
+	clearGlobal bool
+	users       []upstreamBearerUserInput
+	unquoted    bool
+}
+
+func parseUpstreamBearerForm(r *http.Request) (upstreamBearerFormInput, error) {
+	var input upstreamBearerFormInput
+	token, unquoted, err := normalizeUpstreamBearer(r.FormValue("upstream_bearer_token"))
+	if err != nil {
+		return input, err
 	}
+	input.token, input.unquoted = token, unquoted
+	input.clearGlobal = formCheckbox(r, "clear_upstream_bearer")
 
 	clearUsers := map[string]bool{}
 	for _, userID := range r.Form["clear_user_upstream_bearer"] {
@@ -378,22 +398,74 @@ func (s *Server) saveRouteUpstreamBearerForm(r *http.Request, routeID string) er
 		if userID == "" {
 			continue
 		}
-		token := ""
+		raw := ""
 		if idx < len(userTokens) {
-			token = strings.TrimSpace(userTokens[idx])
+			raw = userTokens[idx]
 		}
+		token, unquoted, err := normalizeUpstreamBearer(raw)
+		if err != nil {
+			return input, err
+		}
+		input.unquoted = input.unquoted || unquoted
+		input.users = append(input.users, upstreamBearerUserInput{userID: userID, token: token, clear: clearUsers[userID]})
+	}
+	return input, nil
+}
+
+func (s *Server) applyUpstreamBearerForm(input upstreamBearerFormInput, routeID string) error {
+	if input.token != "" {
+		if err := s.authManager.SetRouteUpstreamBearer(routeID, input.token); err != nil {
+			return err
+		}
+	} else if input.clearGlobal {
+		if err := s.authManager.SetRouteUpstreamBearer(routeID, ""); err != nil {
+			return err
+		}
+	}
+	for _, user := range input.users {
 		switch {
-		case token != "":
-			if err := s.authManager.SetRouteUserUpstreamBearer(routeID, userID, token); err != nil {
+		case user.token != "":
+			if err := s.authManager.SetRouteUserUpstreamBearer(routeID, user.userID, user.token); err != nil {
 				return err
 			}
-		case clearUsers[userID]:
-			if err := s.authManager.SetRouteUserUpstreamBearer(routeID, userID, ""); err != nil {
+		case user.clear:
+			if err := s.authManager.SetRouteUserUpstreamBearer(routeID, user.userID, ""); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+// normalizeUpstreamBearer cleans up a pasted upstream bearer: it drops a
+// leading "Bearer " and one pair of surrounding quotes, as copied from a
+// compose file or shell. Quotes or whitespace left inside are rejected,
+// since they cannot be part of a bearer token (RFC 6750) and would only make
+// the upstream reject every request. An empty input means "no change".
+func normalizeUpstreamBearer(raw string) (token string, unquoted bool, err error) {
+	token = strings.TrimSpace(raw)
+	if token == "" {
+		return "", false, nil
+	}
+	if len(token) > 7 && strings.EqualFold(token[:7], "bearer ") {
+		token = strings.TrimSpace(token[7:])
+	}
+	if len(token) >= 2 {
+		first, last := token[0], token[len(token)-1]
+		if (first == '"' || first == '\'') && first == last {
+			token = strings.TrimSpace(token[1 : len(token)-1])
+			unquoted = true
+		}
+	}
+	if token == "" {
+		return "", false, fmt.Errorf("the Upstream Bearer is empty after removing quotes")
+	}
+	for _, r := range token {
+		if r == '"' || r == '\'' || unicode.IsSpace(r) || unicode.IsControl(r) {
+			return "", false, fmt.Errorf("the Upstream Bearer must not contain quotes or whitespace; paste the token value only")
+		}
+	}
+	return token, unquoted, nil
 }
 
 func (s *Server) storeOpenAPISpecUpload(r *http.Request, routeID string) (string, error) {
@@ -1485,6 +1557,11 @@ func (s *Server) parseDeploymentForm(r *http.Request) (deploymentFormData, confi
 		StdioEnv:              normalizeMultiline(r.FormValue("stdio_env")),
 		StdioWorkingDir:       strings.TrimSpace(r.FormValue("stdio_working_dir")),
 		Notes:                 strings.TrimSpace(r.FormValue("notes")),
+	}
+	if token, _, err := normalizeUpstreamBearer(formData.UpstreamBearerToken); err != nil {
+		return formData, config.Route{}, nil, err
+	} else {
+		formData.UpstreamBearerToken = token
 	}
 	if formData.Transport != "http" && formData.Transport != "stdio" {
 		return formData, config.Route{}, nil, fmt.Errorf("transport must be http or stdio")

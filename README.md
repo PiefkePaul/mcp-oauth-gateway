@@ -306,6 +306,10 @@ Wenn ein MCP-Upstream selbst einen Bearer erwartet, z.B. `ghcr.io/czlonkowski/n8
 Authorization: Bearer <interner-upstream-token>
 ```
 
+Beim Speichern entfernt das Dashboard ein vorangestelltes `Bearer ` und umschliessende Anfuehrungszeichen (wie sie beim Kopieren aus einer Compose-Datei entstehen) und weist Werte mit Anfuehrungszeichen oder Leerzeichen im Inneren zurueck.
+
+Lehnt ein Upstream die Zugangsdaten des Gateways mit 401 ab, antwortet der Gateway dem Client mit 502 `upstream_unauthorized` statt die 401 durchzureichen, und loggt `gateway upstream rejected credentials route=...`. Eine durchgereichte 401 wuerde OAuth-Clients wie Claude glauben lassen, ihr eigenes Gateway-Token sei ungueltig, und sie in Endlosschleifen erneuter Anmeldungen schicken. Routen mit `pass_authorization_header: true` reichen die 401 des Upstreams weiterhin durch. Hinweis: Steht Cloudflare vor dem Gateway, ersetzt es den Text jeder 502 durch eine eigene Fehlerseite; die Ursache steht dann im Gateway-Log.
+
 Nutzerspezifische Upstream-Bearer haben Vorrang vor dem globalen Route-Bearer. So kann ein gemeinsamer Gateway-OAuth vor mehreren MCPs liegen, waehrend einzelne Upstreams weiterhin ihre eigenen Secrets behalten.
 
 Bei `ghcr.io/czlonkowski/n8n-mcp` ist der interne Container-Port standardmaessig `3000`, nicht `8080`. Die Route sollte deshalb typischerweise `upstream: http://n8n-mcp:3000` und `upstream_mcp_path: /mcp` nutzen. Der n8n-MCP-Container selbst braucht denselben Wert als `AUTH_TOKEN`, den du im Gateway als Upstream Bearer speicherst.
