@@ -28,6 +28,7 @@ type Server struct {
 	routes         []config.Route
 	runtime        map[string]routeRuntime
 	mcpSessions    *mcpSessionPool
+	health         *healthStore
 }
 
 func New(cfg *config.Config, authManager *auth.Manager) (*Server, error) {
@@ -43,6 +44,7 @@ func New(cfg *config.Config, authManager *auth.Manager) (*Server, error) {
 		authManager: authManager,
 		runtime:     make(map[string]routeRuntime, len(cfg.Routes)),
 		mcpSessions: newMCPSessionPool(),
+		health:      newHealthStore(),
 	}
 	if cfg.DockerManagement.Enabled {
 		dockerManager, err := newDockerManager(cfg.DockerManagement)
@@ -107,6 +109,10 @@ func Run(cfg *config.Config) error {
 		len(cfg.Routes),
 	)
 
+	if cfg.HealthCheck.Enabled {
+		handler.startHealthChecks(cfg.HealthCheck.Interval)
+	}
+
 	return httpServer.ListenAndServe()
 }
 
@@ -168,6 +174,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	case "/admin/routes/save":
 		s.handleAdminRouteSave(w, r)
+		return
+	case "/admin/routes/check":
+		s.handleAdminRouteCheck(w, r)
+		return
+	case "/admin/routes/check-all":
+		s.handleAdminRouteCheckAll(w, r)
 		return
 	case "/admin/routes/restart":
 		s.handleAdminRouteRestart(w, r)
@@ -300,6 +312,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 			"protected_resource_metadata_url": s.absoluteURL(route.ProtectedResourceMetadataPath()),
 			"scopes_supported":                route.ScopeList(),
 			"upstream":                        route.Upstream,
+			"health":                          healthJSON(s.health.get(route.ID)),
 		}
 		if strings.TrimSpace(route.ResourceDocumentation) != "" {
 			payload["resource_documentation"] = route.ResourceDocumentation
@@ -368,6 +381,7 @@ func (s *Server) handleRouteInfo(w http.ResponseWriter, r *http.Request, route c
 		"account_portal_url":              s.absoluteURL("/account"),
 		"scopes_supported":                route.ScopeList(),
 		"upstream":                        route.Upstream,
+		"health":                          healthJSON(s.health.get(route.ID)),
 	}
 	if strings.TrimSpace(route.ResourceDocumentation) != "" {
 		payload["resource_documentation"] = route.ResourceDocumentation

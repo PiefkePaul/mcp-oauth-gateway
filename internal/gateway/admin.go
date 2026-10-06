@@ -48,6 +48,7 @@ type dashboardData struct {
 	Groups              []dashboardGroupView
 	SelectedUser        *dashboardUserDetailView
 	SelectedRoute       routeFormData
+	SelectedHealth      healthView
 	DeploymentForm      deploymentFormData
 	BuildForm           artifactBuildFormData
 	StdioInstallForm    stdioInstallFormData
@@ -70,6 +71,7 @@ type dashboardRouteView struct {
 	UpstreamEnvironmentCount int
 	UpstreamBearerConfigured bool
 	UserUpstreamBearerCount  int
+	Health                   healthView
 }
 
 type dashboardDeploymentView struct {
@@ -323,9 +325,12 @@ func (s *Server) handleAdminRouteSave(w http.ResponseWriter, r *http.Request) {
 	if bearerForm.unquoted {
 		notice += "; quotes around the Upstream Bearer were removed"
 	}
+	// Verify the route right away so misconfigurations show up on save.
+	checkNotice, checkError := healthCheckMessages(route.ID, s.checkRoute(r.Context(), route.ID))
+	notice += "; " + checkNotice
 	switch next := strings.TrimSpace(r.FormValue("next_route")); next {
 	case "":
-		http.Redirect(w, r, adminRedirectURL(route.ID, notice, ""), http.StatusFound)
+		http.Redirect(w, r, adminRedirectURL(route.ID, notice, checkError), http.StatusFound)
 	case routeEditorBrowseSentinel:
 		http.Redirect(w, r, adminRedirectURL("", notice, ""), http.StatusFound)
 	case routeEditorNewSentinel:
@@ -498,6 +503,77 @@ func (s *Server) storeOpenAPISpecUpload(r *http.Request, routeID string) (string
 		return "", fmt.Errorf("store OpenAPI spec: %w", err)
 	}
 	return targetPath, nil
+}
+
+const deploymentHealthCheckDelay = 10 * time.Second
+
+// healthCheckMessages turns a check result into the dashboard notice and,
+// for failures, an error text shown next to it.
+func healthCheckMessages(routeID string, result routeHealth) (notice, errText string) {
+	switch result.Status {
+	case healthStatusOK:
+		return fmt.Sprintf("MCP reachable (%d tools, %d ms)", result.ToolCount, result.Latency.Milliseconds()), ""
+	case healthStatusWarning:
+		return "MCP check limited", fmt.Sprintf("MCP check for %s: %s", routeID, result.Error)
+	default:
+		return "MCP check failed", fmt.Sprintf("MCP check for %s failed: %s", routeID, result.Error)
+	}
+}
+
+func (s *Server) handleAdminRouteCheck(w http.ResponseWriter, r *http.Request) {
+	identity, ok := s.requireAdminPost(w, r)
+	if !ok {
+		return
+	}
+	routeID := strings.TrimSpace(r.FormValue("route_id"))
+	if _, found := s.routeByID(routeID); !found {
+		s.renderAdminDashboard(w, r, identity, newEmptyRouteFormData(), "", "route not found", http.StatusBadRequest)
+		return
+	}
+	notice, errText := healthCheckMessages(routeID, s.checkRoute(r.Context(), routeID))
+	http.Redirect(w, r, adminRedirectURL(routeID, notice, errText), http.StatusFound)
+}
+
+func (s *Server) handleAdminRouteCheckAll(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requireAdminPost(w, r); !ok {
+		return
+	}
+	ok, total := s.checkAllRoutes(r.Context())
+	notice := fmt.Sprintf("%d of %d MCP servers reachable", ok, total)
+	errText := ""
+	if ok < total {
+		failed := make([]string, 0, total-ok)
+		for _, route := range s.routesSnapshot() {
+			if s.health.get(route.ID).Status != healthStatusOK {
+				failed = append(failed, route.ID)
+			}
+		}
+		errText = "Not reachable or not fully checkable: " + strings.Join(failed, ", ")
+	}
+	http.Redirect(w, r, adminRedirectURL("", notice, errText), http.StatusFound)
+}
+
+// requireAdminPost checks admin rights, the POST method, the form and the
+// CSRF token, writing the error response itself when one fails.
+func (s *Server) requireAdminPost(w http.ResponseWriter, r *http.Request) (identity *auth.Identity, ok bool) {
+	identity, ok = s.requireAdmin(w, r)
+	if !ok {
+		return nil, false
+	}
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "unsupported method", http.StatusMethodNotAllowed)
+		return nil, false
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "invalid form", http.StatusBadRequest)
+		return nil, false
+	}
+	if !s.authManager.ValidateCSRF(r) {
+		http.Error(w, "invalid CSRF token", http.StatusBadRequest)
+		return nil, false
+	}
+	return identity, true
 }
 
 func (s *Server) handleAdminRouteRestart(w http.ResponseWriter, r *http.Request) {
@@ -927,7 +1003,12 @@ func (s *Server) handleAdminDeploymentCreate(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
-	http.Redirect(w, r, adminRedirectURLWithTab("deployments", route.ID, "Deployment created successfully", ""), http.StatusFound)
+	// The container needs a moment to start; check it in the background.
+	go func(routeID string) {
+		time.Sleep(deploymentHealthCheckDelay)
+		s.checkRoute(context.Background(), routeID)
+	}(route.ID)
+	http.Redirect(w, r, adminRedirectURLWithTab("deployments", route.ID, "Deployment created successfully; its reachability is checked in a few seconds", ""), http.StatusFound)
 }
 
 func (s *Server) handleAdminDeploymentStart(w http.ResponseWriter, r *http.Request) {
@@ -1142,8 +1223,9 @@ func (s *Server) handleAdminStdioInstall(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	notice := fmt.Sprintf("STDIO MCP %s installed with executable %s", route.ID, result.ExecutablePath)
-	http.Redirect(w, r, adminRedirectURLWithTab("build", route.ID, notice, ""), http.StatusFound)
+	checkNotice, checkError := healthCheckMessages(route.ID, s.checkRoute(r.Context(), route.ID))
+	notice := fmt.Sprintf("STDIO MCP %s installed with executable %s; %s", route.ID, result.ExecutablePath, checkNotice)
+	http.Redirect(w, r, adminRedirectURLWithTab("build", route.ID, notice, checkError), http.StatusFound)
 }
 
 func (s *Server) handleAdminDeploymentAction(w http.ResponseWriter, r *http.Request, action string) {
@@ -1272,6 +1354,7 @@ func (s *Server) renderAdminDashboard(w http.ResponseWriter, r *http.Request, id
 			UpstreamEnvironmentCount: countNonSessionEnv(route.UpstreamEnvironment),
 			UpstreamBearerConfigured: globalBearer,
 			UserUpstreamBearerCount:  len(userBearers),
+			Health:                   s.healthViewFor(route.ID, true),
 		})
 	}
 	deploymentViews, dockerErr := s.dashboardDeploymentViews(r.Context(), routes)
@@ -1317,6 +1400,7 @@ func (s *Server) renderAdminDashboard(w http.ResponseWriter, r *http.Request, id
 		Groups:              groupViews,
 		SelectedUser:        selectedUser,
 		SelectedRoute:       selected,
+		SelectedHealth:      s.healthViewFor(selected.OriginalID, true),
 		DeploymentForm:      newDeploymentFormData(s.cfg.DockerManagement),
 		BuildForm:           newArtifactBuildFormData(s.cfg.BuildManagement),
 		StdioInstallForm:    newStdioInstallFormData(),
@@ -2368,7 +2452,13 @@ const adminDashboardTemplate = `
         <h2>MCP Routes</h2>
         <p class="hint">Oeffentliche Routen erscheinen im Katalog. Private Routen bleiben verborgen und sind nur per direkter URL fuer berechtigte Nutzer sichtbar.</p>
       </div>
-      <a class="btn btn-primary btn-sm dirty-guard" data-next="__new__" href="/admin?new=1">+ Neue Route</a>
+      <div style="display:flex; gap:.5rem;">
+        <form method="post" action="/admin/routes/check-all" style="margin:0;">
+          <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+          <button type="submit" class="btn btn-sm" title="Prueft jetzt alle MCP-Server (initialize und tools/list).">Alle pruefen</button>
+        </form>
+        <a class="btn btn-primary btn-sm dirty-guard" data-next="__new__" href="/admin?new=1">+ Neue Route</a>
+      </div>
     </div>
 
     {{if .ShowRouteEditor}}
@@ -2398,9 +2488,16 @@ const adminDashboardTemplate = `
               <span class="hint" id="rf-dirty-hint" hidden>&#9679; Ungespeicherte Aenderungen</span>
             </div>
             {{if .SelectedRoute.OriginalID}}
-              {{if eq .SelectedRoute.AccessMode "admin"}}<span class="pill pill-danger">Nur Admins</span>{{else if eq .SelectedRoute.AccessMode "restricted"}}<span class="pill pill-warning">Eingeschraenkt</span>{{else}}<span class="pill pill-neutral">Alle Nutzer</span>{{end}}
+              <div style="display:flex; gap:.4rem; align-items:center; flex-wrap:wrap; justify-content:flex-end;">
+                <span class="pill {{.SelectedHealth.Pill}}" title="{{.SelectedHealth.Detail}}">{{.SelectedHealth.Label}}</span>
+                {{if eq .SelectedRoute.AccessMode "admin"}}<span class="pill pill-danger">Nur Admins</span>{{else if eq .SelectedRoute.AccessMode "restricted"}}<span class="pill pill-warning">Eingeschraenkt</span>{{else}}<span class="pill pill-neutral">Alle Nutzer</span>{{end}}
+                <button type="submit" form="routeCheckForm" class="btn btn-sm" title="Prueft diesen MCP-Server jetzt (initialize und tools/list).">Jetzt pruefen</button>
+              </div>
             {{end}}
           </div>
+          {{if and .SelectedRoute.OriginalID .SelectedHealth.Since}}
+            <p class="hint" style="margin:.2rem 1rem 0;">Letzte Pruefung {{.SelectedHealth.Since}}{{if .SelectedHealth.Detail}}: {{.SelectedHealth.Detail}}{{end}}</p>
+          {{end}}
           <div class="panel-body">
             {{if .Error}}<div class="callout danger">{{.Error}}</div>{{end}}
             <p class="hint">Die Route-ID ist optional. Wenn sie leer bleibt, erzeugt der Gateway sie aus dem Display Name oder Path Prefix.</p>
@@ -2660,6 +2757,10 @@ const adminDashboardTemplate = `
             <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
             <input type="hidden" name="route_id" value="{{.SelectedRoute.OriginalID}}">
           </form>
+          <form id="routeCheckForm" method="post" action="/admin/routes/check" style="display:none;">
+            <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+            <input type="hidden" name="route_id" value="{{.SelectedRoute.OriginalID}}">
+          </form>
           <form id="routeRestartForm" method="post" action="/admin/routes/restart" style="display:none;">
             <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
             <input type="hidden" name="route_id" value="{{.SelectedRoute.OriginalID}}">
@@ -2670,13 +2771,17 @@ const adminDashboardTemplate = `
     {{else}}
     <div class="table-card" style="margin-top:1rem;">
       <table>
-        <thead><tr><th>Route</th><th>Zugriff</th><th>Session</th><th></th></tr></thead>
+        <thead><tr><th>Route</th><th>Status</th><th>Zugriff</th><th>Session</th><th></th></tr></thead>
         <tbody>
           {{range .Routes}}
             <tr>
               <td>
                 <div class="row-title">{{.DisplayName}}</div>
                 <div class="row-sub mono">{{.PathPrefix}} <span class="transport-chip">{{.Transport}}</span></div>
+              </td>
+              <td>
+                <span class="pill {{.Health.Pill}}" title="{{.Health.Detail}}">{{.Health.Label}}</span>
+                {{if .Health.Since}}<div class="row-sub hint" title="{{.Health.Detail}}">{{.Health.Since}}{{if .Health.Detail}} &middot; {{.Health.Detail}}{{end}}</div>{{end}}
               </td>
               <td>
                 {{if eq .AccessMode "admin"}}<span class="pill pill-danger">Nur Admins</span>{{else if eq .AccessMode "restricted"}}<span class="pill pill-warning">Eingeschraenkt</span>{{else}}<span class="pill pill-neutral">Alle Nutzer</span>{{end}}
@@ -2686,7 +2791,7 @@ const adminDashboardTemplate = `
               <td style="text-align:right;"><a class="btn btn-sm btn-ghost" href="/admin?route={{.ID}}">Bearbeiten</a></td>
             </tr>
           {{else}}
-            <tr><td colspan="4" class="hint">Noch keine MCP-Routen angelegt.</td></tr>
+            <tr><td colspan="5" class="hint">Noch keine MCP-Routen angelegt.</td></tr>
           {{end}}
         </tbody>
       </table>

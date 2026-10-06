@@ -38,6 +38,7 @@ type publicRouteView struct {
 	Scopes          string
 	AccessLabel     string
 	SessionMode     string
+	Health          healthView
 }
 
 func (s *Server) renderPublicDashboard(w http.ResponseWriter, r *http.Request) {
@@ -147,6 +148,7 @@ func publicRouteFromConfig(s *Server, route config.Route) publicRouteView {
 		Scopes:          strings.Join(route.ScopeList(), ", "),
 		AccessLabel:     accessLabel,
 		SessionMode:     strings.TrimSpace(route.UpstreamEnvironment["MCP_HTTP_SESSION_MODE"]),
+		Health:          s.healthViewFor(route.ID, false),
 	}
 }
 
@@ -229,6 +231,7 @@ const publicDashboardTemplate = `
         <div class="rrc-id">
           <h3>{{.DisplayName}}</h3>
           <div class="path">{{.MCPURL}}</div>
+          <div style="margin-top:.35rem;"><span class="pill {{.Health.Pill}}"{{if .Health.Since}} title="Geprueft {{.Health.Since}}"{{end}}>{{.Health.Label}}</span></div>
         </div>
         <p class="rrc-desc">{{if .Description}}{{.Description}}{{else}}<span class="hint">Route <code>{{.ID}}</code></span>{{end}}</p>
         <div class="rrc-meta"><span class="k">Scopes</span><span class="tt" data-full="{{.Scopes}}"><code>{{.Scopes}}</code></span></div>

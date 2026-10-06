@@ -50,8 +50,15 @@ type Config struct {
 	BuildManagement     BuildManagementConfig
 	StdioInstaller      StdioInstallerConfig
 	StdioSessions       StdioSessionConfig
+	HealthCheck         HealthCheckConfig
 	OpenAPIStoreDir     string
 	Routes              []Route
+}
+
+// HealthCheckConfig controls the background reachability check of routes.
+type HealthCheckConfig struct {
+	Enabled  bool
+	Interval time.Duration
 }
 
 // StdioSessionConfig bounds native STDIO MCP processes. Zero values fall
@@ -214,6 +221,10 @@ func Load() (*Config, error) {
 			MaxArtifactBytes:     int64(getIntEnv("MCP_GATEWAY_STDIO_MAX_ARTIFACT_MB", defaultBuildMaxArtifactMB)) << 20,
 			AllowedDownloadHosts: parseCSVEnv("MCP_GATEWAY_STDIO_ALLOWED_DOWNLOAD_HOSTS"),
 			AllowAnyDownloadHost: getBoolEnv("MCP_GATEWAY_STDIO_ALLOW_ANY_DOWNLOAD_HOST", false),
+		},
+		HealthCheck: HealthCheckConfig{
+			Enabled:  getBoolEnv("MCP_GATEWAY_HEALTHCHECK_ENABLED", true),
+			Interval: getDurationEnv("MCP_GATEWAY_HEALTHCHECK_INTERVAL", 5*time.Minute),
 		},
 		StdioSessions: StdioSessionConfig{
 			IdleTimeout:        getDurationEnv("MCP_GATEWAY_STDIO_SESSION_IDLE_TIMEOUT", 30*time.Minute),
