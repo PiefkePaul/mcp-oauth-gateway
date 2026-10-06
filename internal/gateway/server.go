@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -504,6 +506,9 @@ func (s *Server) newReverseProxy(route config.Route) (http.Handler, error) {
 				pr.Out.Header.Set("Authorization", "Bearer "+upstreamBearer)
 			}
 		},
+		ModifyResponse: func(resp *http.Response) error {
+			return s.rewriteUpstreamUnauthorized(route, resp)
+		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			log.Printf("gateway proxy error route=%s path=%s err=%v", route.ID, r.URL.Path, err)
 			writeJSON(w, http.StatusBadGateway, map[string]any{
@@ -512,6 +517,37 @@ func (s *Server) newReverseProxy(route config.Route) (http.Handler, error) {
 			})
 		},
 	}, nil
+}
+
+// upstreamUnauthorizedBody explains a 401 from the upstream. It is sent as
+// 502 because the client's own credentials were accepted by the gateway.
+const upstreamUnauthorizedBody = `{"error":"upstream_unauthorized","error_description":"the upstream MCP server rejected the credentials the gateway sent; check the route's Upstream Bearer (and that it has no surrounding quotes)"}` + "\n"
+
+// rewriteUpstreamUnauthorized turns an upstream 401 into a 502. Passing the
+// 401 through would look to the client as if its gateway token were invalid,
+// sending OAuth clients into endless re-authorization loops, while the real
+// problem is the credential the gateway uses for the upstream. Routes that
+// pass the client's Authorization header through keep the upstream's 401.
+func (s *Server) rewriteUpstreamUnauthorized(route config.Route, resp *http.Response) error {
+	if resp.StatusCode != http.StatusUnauthorized || route.PassAuthorization {
+		return nil
+	}
+	bearerConfigured, userBearers := s.authManager.RouteUpstreamBearerConfigured(route.ID)
+	log.Printf("gateway upstream rejected credentials route=%s status=401 upstream_bearer_configured=%t user_upstream_bearers=%d", route.ID, bearerConfigured, len(userBearers))
+
+	_ = resp.Body.Close()
+	resp.StatusCode = http.StatusBadGateway
+	resp.Status = fmt.Sprintf("%d %s", http.StatusBadGateway, http.StatusText(http.StatusBadGateway))
+	resp.Header = http.Header{}
+	resp.Header.Set("Content-Type", "application/json")
+	resp.Header.Set("Cache-Control", "no-store")
+	resp.Header.Set("X-Content-Type-Options", "nosniff")
+	resp.Body = io.NopCloser(strings.NewReader(upstreamUnauthorizedBody))
+	resp.ContentLength = int64(len(upstreamUnauthorizedBody))
+	resp.Header.Set("Content-Length", strconv.Itoa(len(upstreamUnauthorizedBody)))
+	resp.TransferEncoding = nil
+	resp.Trailer = nil
+	return nil
 }
 
 func rewriteUpstreamPath(requestPath, publicBasePath, upstreamBasePath string) string {
