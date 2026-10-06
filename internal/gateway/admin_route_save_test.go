@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -170,4 +171,30 @@ func TestAdminRouteSaveDropsSTDIOSecretRefsWhenSwitchingTransport(t *testing.T) 
 	if saved.Transport != "http" || saved.Stdio != nil {
 		t.Fatalf("switching to http must drop STDIO settings, got %+v", saved)
 	}
+}
+
+func TestValidateUpsertRouteDoesNotLeakRuntimes(t *testing.T) {
+	server := newAdminSaveTestServer(t, []config.Route{{
+		ID:          "tool",
+		DisplayName: "Tool",
+		Transport:   "stdio",
+		PathPrefix:  "/tool",
+		Stdio:       &config.RouteStdio{Command: "/bin/cat"},
+	}})
+	candidate := config.Route{
+		ID:          "other",
+		DisplayName: "Other",
+		Transport:   "stdio",
+		PathPrefix:  "/other",
+		Stdio:       &config.RouteStdio{Command: "/bin/cat"},
+	}
+
+	before := runtime.NumGoroutine()
+	for i := 0; i < 50; i++ {
+		if err := server.validateUpsertRoute("", candidate); err != nil {
+			t.Fatalf("validate: %v", err)
+		}
+	}
+	// Each validation builds two STDIO bridges; their sweep loops must stop.
+	waitFor(t, func() bool { return runtime.NumGoroutine() <= before+5 })
 }
