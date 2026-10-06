@@ -131,12 +131,22 @@ func (p *mcpSessionPool) invalidate(entry *mcpPooledSession) {
 	p.retireLocked(entry)
 }
 
-// closeAll drops every pooled session, e.g. after the routes were rebuilt.
-func (p *mcpSessionPool) closeAll() {
+// closeRoutes drops the pooled sessions of routes that were rebuilt or
+// removed.
+func (p *mcpSessionPool) closeRoutes(routeIDs []string) {
+	if len(routeIDs) == 0 {
+		return
+	}
+	drop := make(map[string]bool, len(routeIDs))
+	for _, id := range routeIDs {
+		drop[id] = true
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for _, entry := range p.entries {
-		p.retireLocked(entry)
+		if drop[entry.key.routeID] {
+			p.retireLocked(entry)
+		}
 	}
 }
 

@@ -428,6 +428,32 @@ func (s *Server) storeOpenAPISpecUpload(r *http.Request, routeID string) (string
 	return targetPath, nil
 }
 
+func (s *Server) handleAdminRouteRestart(w http.ResponseWriter, r *http.Request) {
+	identity, ok := s.requireAdmin(w, r)
+	if !ok {
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "unsupported method", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "invalid form", http.StatusBadRequest)
+		return
+	}
+	if !s.authManager.ValidateCSRF(r) {
+		http.Error(w, "invalid CSRF token", http.StatusBadRequest)
+		return
+	}
+	routeID := strings.TrimSpace(r.FormValue("route_id"))
+	if err := s.restartRoute(routeID); err != nil {
+		s.renderAdminDashboard(w, r, identity, newEmptyRouteFormData(), "", err.Error(), http.StatusBadRequest)
+		return
+	}
+	http.Redirect(w, r, adminRedirectURL(routeID, "Route restarted; its sessions were closed", ""), http.StatusFound)
+}
+
 func (s *Server) handleAdminRouteDelete(w http.ResponseWriter, r *http.Request) {
 	identity, ok := s.requireAdmin(w, r)
 	if !ok {
@@ -2540,7 +2566,10 @@ const adminDashboardTemplate = `
 
             <div style="display:flex; justify-content:space-between; gap:.6rem; margin-top:1.1rem;">
               {{if .SelectedRoute.OriginalID}}
-                <button type="submit" form="routeDeleteForm" class="btn btn-danger btn-sm">Route loeschen</button>
+                <div style="display:flex; gap:.5rem;">
+                  <button type="submit" form="routeDeleteForm" class="btn btn-danger btn-sm">Route loeschen</button>
+                  <button type="submit" form="routeRestartForm" class="btn btn-sm" title="Beendet alle Sessions dieser Route und startet sie neu, z.B. nach einem Austausch der Executable.">Neu starten</button>
+                </div>
               {{else}}<span></span>{{end}}
               <div style="display:flex; gap:.5rem;">
                 <a class="btn btn-sm discard-link" href="/admin?{{if .SelectedRoute.OriginalID}}route={{.SelectedRoute.OriginalID}}{{else}}new=1{{end}}">Verwerfen</a>
@@ -2551,6 +2580,10 @@ const adminDashboardTemplate = `
         </form>
         {{if .SelectedRoute.OriginalID}}
           <form id="routeDeleteForm" method="post" action="/admin/routes/delete" style="display:none;">
+            <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+            <input type="hidden" name="route_id" value="{{.SelectedRoute.OriginalID}}">
+          </form>
+          <form id="routeRestartForm" method="post" action="/admin/routes/restart" style="display:none;">
             <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
             <input type="hidden" name="route_id" value="{{.SelectedRoute.OriginalID}}">
           </form>

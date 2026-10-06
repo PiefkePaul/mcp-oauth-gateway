@@ -293,6 +293,8 @@ Dort kannst du:
 Wichtig:
 
 - Das Dashboard aendert die Gateway-Routen live und schreibt sie nach `routes.yaml` zurueck.
+- Beim Speichern wird nur neu gestartet, was sich wirklich geaendert hat: Aendern sich nur Anzeigename, Beschreibung, Doku-Link, Notizen, Scopes, Zugriffsregeln, OpenAPI-Session-Modus oder Deployment-Metadaten, laufen bestehende Sessions und STDIO-Prozesse weiter. Verliert ein Nutzer durch geaenderte Zugriffsregeln den Zugriff, werden nur seine Sessions beendet. Aenderungen an Transport, Upstream, Pfaden, Headern, STDIO-Kommando, -Argumenten, -Umgebung oder an den Werten der Installer-Secrets starten nur diese Route neu. Andere Routen sind nie betroffen.
+- "Neu starten" im Route-Editor beendet alle Sessions der Route und startet sie neu, z.B. nachdem eine Executable unter gleichem Pfad ersetzt wurde.
 - Upstream-Umgebungsvariablen werden bei HTTP-Routen als Deployment-Metadaten gespeichert. Bei manuell gepflegten STDIO-Routen werden `stdio.env`-Werte an den gestarteten Prozess uebergeben; vom Installer erfasste Env-Secrets werden verschluesselt gespeichert und per `stdio.env_secret_refs` referenziert.
 - Full Export kann interne Tokens in `forward_headers`, `upstream_environment` oder manuellem `stdio.env` enthalten. Installer-Secrets und Upstream-Bearer aus dem Dashboard bleiben im verschluesselten Auth-Store und werden nicht als Klartext exportiert.
 
