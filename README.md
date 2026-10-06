@@ -85,6 +85,8 @@ Wichtig:
 - `MCP_GATEWAY_STDIO_MAX_ARTIFACT_MB`
 - `MCP_GATEWAY_STDIO_ALLOWED_DOWNLOAD_HOSTS`
 - `MCP_GATEWAY_STDIO_ALLOW_ANY_DOWNLOAD_HOST`
+- `MCP_GATEWAY_HEALTHCHECK_ENABLED` (Standard `true`)
+- `MCP_GATEWAY_HEALTHCHECK_INTERVAL` (Standard `5m`)
 - `MCP_GATEWAY_STDIO_SESSION_IDLE_TIMEOUT` (Standard `30m`)
 - `MCP_GATEWAY_STDIO_MAX_SESSIONS_PER_AGENT` (Standard `8`)
 - `MCP_GATEWAY_STDIO_MAX_SESSIONS_PER_ROUTE` (Standard `64`)
@@ -265,6 +267,18 @@ Jede MCP-Route stellt zusaetzlich eine generierte OpenAPI-3.1-Spezifikation bere
 - Open WebUI haengt beim Verbindungstest teils selbst `/openapi.json` an. Trage dort bevorzugt die Route-Basis ein, z.B. `https://mcp.example.com/legal`; der Gateway akzeptiert zur Kompatibilitaet aber auch `/<route>/openapi.json/openapi.json`.
 
 Damit koennen Clients, die MCP noch nicht sauber aufrufen, aber OpenAPI importieren koennen, dieselben Gateway-Routen verwenden.
+
+## Erreichbarkeits-Checks
+
+Der Gateway prueft jede Route mit einem echten MCP-Durchlauf (`initialize` und `tools/list`) ueber denselben Weg wie ein Client, inklusive Upstream-Bearer und Session-Bindung. Die Probe-Session wird danach wieder geschlossen.
+
+- Beim Speichern einer Route und nach einer STDIO-Installation laeuft der Check sofort; ein Fehler erscheint direkt im Dashboard (die Route wird trotzdem gespeichert). Neue Docker-Deployments werden nach 10 Sekunden im Hintergrund geprueft.
+- Im Hintergrund laufen alle Checks alle `MCP_GATEWAY_HEALTHCHECK_INTERVAL` (erste Runde ca. 15 Sekunden nach dem Start, hoechstens 4 parallel, 15 Sekunden Timeout pro Route). Abschalten mit `MCP_GATEWAY_HEALTHCHECK_ENABLED=false`.
+- Im Admin-Dashboard zeigen die Routen-Uebersicht und der Route-Editor Status, Zeitpunkt, Tool-Anzahl/Latenz bzw. die Fehlerursache. "Jetzt pruefen" und "Alle pruefen" starten Checks manuell.
+- Der oeffentliche Katalog (`/`, `/?format=json`, `/<route>`) zeigt nur Status, Zeitpunkt, Latenz und Tool-Anzahl, keine Fehlerdetails, da diese interne Hosts nennen koennen.
+- Der Check nutzt den globalen Upstream-Bearer. Hat eine Route nur nutzerspezifische Bearer, meldet er "Eingeschraenkt pruefbar" statt "Gestoert".
+- STDIO-Routen starten fuer jeden Check kurz einen eigenen Prozess.
+- Die Ergebnisse liegen nur im Speicher und sind nach einem Neustart bis zur ersten Runde "Noch nicht geprueft".
 
 ## Dashboard
 
