@@ -58,11 +58,11 @@ func RouteEnvSecretRef(routeID, name string) string {
 }
 
 func (m *Manager) EnsureCSRFToken(w http.ResponseWriter, r *http.Request) string {
-	return ensureCSRFCookie(w, r)
+	return m.ensureCSRFCookie(w, r)
 }
 
 func (m *Manager) ValidateCSRF(r *http.Request) bool {
-	return validateCSRFCookie(r)
+	return m.validateCSRFCookie(r)
 }
 
 func (m *Manager) CurrentIdentity(r *http.Request) (*Identity, error) {
@@ -469,6 +469,9 @@ func (m *Manager) SetUserPassword(userID, password string) error {
 
 	user.PasswordHash = string(hash)
 	user.UpdatedAt = now.Unix()
+	// An admin reset usually means the old password leaked or was lost:
+	// sign the user out of every browser session.
+	m.deleteUserSessionsLocked(userID, "")
 	return m.saveLocked()
 }
 
