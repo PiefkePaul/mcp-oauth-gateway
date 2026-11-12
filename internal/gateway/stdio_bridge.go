@@ -348,6 +348,20 @@ func (b *stdioBridge) Close() error {
 	return closeErr
 }
 
+// stdioChildBaseEnv is the gateway's environment without its own settings.
+// Those include the auth store master key and the bootstrap password, which
+// an MCP server process, often a third-party binary, must never inherit.
+func stdioChildBaseEnv(environ []string) []string {
+	filtered := make([]string, 0, len(environ))
+	for _, entry := range environ {
+		if strings.HasPrefix(entry, "MCP_GATEWAY_") {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	return filtered
+}
+
 func newStdioSession(sessionID string, route config.Route, resolver stdioSecretResolver) (*stdioSession, error) {
 	if route.Stdio == nil {
 		return nil, fmt.Errorf("stdio config is required")
@@ -373,7 +387,7 @@ func newStdioSession(sessionID string, route config.Route, resolver stdioSecretR
 	if route.Stdio.WorkingDir != "" {
 		cmd.Dir = route.Stdio.WorkingDir
 	}
-	cmd.Env = append(os.Environ(), envMapToList(env)...)
+	cmd.Env = append(stdioChildBaseEnv(os.Environ()), envMapToList(env)...)
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {

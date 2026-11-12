@@ -179,3 +179,63 @@ func TestAdminManualChecksAndOverview(t *testing.T) {
 		t.Fatalf("the admin overview must show the status and details")
 	}
 }
+
+// apiKeyUpstream accepts requests that carry the static API key and records
+// whether a user header arrived.
+func apiKeyUpstream(t *testing.T, sawUserHeader *bool) http.Handler {
+	fake := newFakeMCPServer()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-User") != "" {
+			*sawUserHeader = true
+		}
+		if r.Header.Get("Authorization") != "Bearer static-api-key" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		fake.ServeHTTP(w, r)
+	})
+}
+
+func TestCheckRouteSendsStaticForwardHeaders(t *testing.T) {
+	sawUserHeader := false
+	backend := httptest.NewServer(apiKeyUpstream(t, &sawUserHeader))
+	t.Cleanup(backend.Close)
+	route := config.Route{
+		ID:              "terminal",
+		DisplayName:     "Terminal",
+		PathPrefix:      "/terminal",
+		Upstream:        backend.URL,
+		UpstreamMCPPath: "/mcp",
+		ForwardHeaders: map[string]string{
+			"Authorization": "Bearer static-api-key",
+			"X-User":        "{email}",
+		},
+	}
+	server := newAdminSaveTestServer(t, []config.Route{route})
+
+	result := server.checkRoute(context.Background(), "terminal")
+	if result.Status != healthStatusOK {
+		t.Fatalf("a static forward header must reach the upstream, got %+v", result)
+	}
+	if sawUserHeader {
+		t.Fatalf("a user-specific header must not be sent without a user")
+	}
+}
+
+func TestCheckRouteWarnsWhenUpstreamAuthNeedsTheUser(t *testing.T) {
+	backend := httptest.NewServer(unauthorizedUpstream())
+	t.Cleanup(backend.Close)
+	route := config.Route{
+		ID:              "personal",
+		DisplayName:     "Personal",
+		PathPrefix:      "/personal",
+		Upstream:        backend.URL,
+		UpstreamMCPPath: "/mcp",
+		ForwardHeaders:  map[string]string{"X-Api-User": "{email}"},
+	}
+	server := newAdminSaveTestServer(t, []config.Route{route})
+
+	if result := server.checkRoute(context.Background(), "personal"); result.Status != healthStatusWarning {
+		t.Fatalf("expected a warning when the upstream needs user headers, got %+v", result)
+	}
+}

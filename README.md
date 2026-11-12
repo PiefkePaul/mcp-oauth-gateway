@@ -68,6 +68,8 @@ Wichtig:
 - `MCP_GATEWAY_ALLOWED_EMAILS`
 - `MCP_GATEWAY_ALLOWED_EMAIL_DOMAINS`
 - `MCP_GATEWAY_ALLOWED_REDIRECT_ORIGINS`
+- `MCP_GATEWAY_TRUSTED_PROXIES` (optional, IPs/CIDRs der Reverse Proxies; leer = Loopback und private Netze)
+- `MCP_GATEWAY_CLIENT_IP_HEADER` (optional, z.B. `CF-Connecting-IP` hinter Cloudflare)
 - `MCP_GATEWAY_REFRESH_TOKEN_REUSE_GRACE` (Standard `2m`)
 - `MCP_GATEWAY_ACCESS_LOG`
 - `MCP_GATEWAY_DOCKER_MANAGEMENT_ENABLED`
@@ -99,6 +101,20 @@ Der Master-Key muss genau 32 Bytes nach Base64-, Base64URL- oder Hex-Decoding er
 Jeder OAuth-Login (Authorization-Code-Flow) bildet einen eigenen Grant. Refresh-Tokens bleiben im selben Grant, sodass ein Client ueber Token-Rotation hinweg derselbe Agent bleibt. Zwei Rechner mit eigenem Login sind zwei Agenten; mehrere Prozesse, die sich einen Login teilen (z.B. mehrere Terminals auf einem Rechner), sind ein Agent. Jeder persoenliche Bearer-Token ist ein eigener Agent.
 
 Refresh-Tokens werden bei jeder Nutzung rotiert. Damit mehrere Prozesse mit demselben Login gleichzeitig erneuern koennen, bleibt ein rotiertes Refresh-Token fuer `MCP_GATEWAY_REFRESH_TOKEN_REUSE_GRACE` gueltig (Standard 2 Minuten). Jede Nutzung in diesem Fenster stellt neue Tokens im selben Grant aus; danach wird das alte Token abgelehnt.
+
+## Sicherheit
+
+Der Gateway steht typischerweise offen im Internet und schuetzt Server, die viel duerfen. Ein Admin-Konto kann ueber STDIO-Routen und Managed Deployments Programme starten; mit gemountetem `docker.sock` entspricht das Root auf dem Host. Entsprechend:
+
+- **Login-Schutz:** Nach 5 falschen Passwoertern fuer dasselbe Konto vom selben Client ist dieser 5 Minuten gesperrt. Dazu kommen Obergrenzen pro Konto (30 Fehlversuche in 15 Minuten, egal von wo) und pro Client (50). Fehlversuche, Sperren und erfolgreiche Logins stehen im Log (`login failed`, `login throttled`, `login succeeded`).
+- **Client-Adresse hinter Proxies:** Damit die Sperre den Angreifer trifft und nicht alle Nutzer, muss der Gateway die echte Client-Adresse kennen. `X-Forwarded-For` wird nur von vertrauenswuerdigen Proxies geglaubt (`MCP_GATEWAY_TRUSTED_PROXIES`, Standard: Loopback und private Netze). Hinter Cloudflare zusaetzlich `MCP_GATEWAY_CLIENT_IP_HEADER=CF-Connecting-IP` setzen, sonst zaehlt die Adresse des Cloudflare-Knotens.
+- **OAuth-Zustimmung:** Die Seite zeigt, an welchen Host der Zugang uebergeben wird. Der Client-Name ist frei waehlbar und kein Beweis. Unbekannte Ziele ablehnen.
+- **Client-Registrierung:** `/register` ist offen (das verlangt MCP), aber begrenzt: 30 Registrierungen pro Minute und Client, hoechstens 2000 Clients; ungenutzte Clients werden bei Bedarf entfernt. Unbekannte Client-IDs an `/authorize` werden erst gespeichert, wenn ein Nutzer angemeldet ist.
+- **Sessions:** Eine Passwortaenderung meldet alle anderen Browser-Sessions ab, ein Admin-Reset alle. OAuth-Tokens und Bearer Tokens bleiben gueltig und werden unter "Geraete" bzw. "Bearer Tokens" widerrufen.
+- **Zugangsdaten in `forward_headers`:** Werte von Headern, deren Name `authorization`, `token`, `secret`, `password`, `key` oder `cookie` enthaelt, wandern beim Speichern und beim Start in den verschluesselten Auth-Store. In `routes.yaml`, im Export und im Dashboard steht dann nur `{gateway-secret}`. Wer eine `routes.yaml` mit diesem Marker auf einen Gateway mit anderem Auth-Store importiert, muss den Wert neu eintragen.
+- **STDIO-Prozesse** erben die Umgebung des Gateways ohne dessen eigene `MCP_GATEWAY_*`-Variablen, also ohne Master-Key und Bootstrap-Passwort.
+- **Oeffentliche Endpunkte** (`/?format=json`, `/<route>`, `/healthz`) nennen keine Upstream-Adressen und keine Betriebsdetails mehr; Admins sehen die Upstream-Adresse weiterhin.
+- **Empfehlungen fuer den Betrieb:** `docker.sock` nur mounten, wenn Managed Deployments wirklich genutzt werden. Den Container-Port nicht zusaetzlich am Host veroeffentlichen, wenn ein Reverse Proxy davor steht. Upstream-MCP-Server nur im internen Netz des Gateways erreichbar machen. Routen zu maechtigen Servern (Portainer, Shell, GitHub) auf `mode: admin` oder `restricted` stellen. Images auf feste Versionen statt `latest` pinnen. Master-Key und Bootstrap-Passwort nie in Wikis oder Tickets ablegen.
 
 ## Deployment
 
@@ -276,7 +292,7 @@ Der Gateway prueft jede Route mit einem echten MCP-Durchlauf (`initialize` und `
 - Im Hintergrund laufen alle Checks alle `MCP_GATEWAY_HEALTHCHECK_INTERVAL` (erste Runde ca. 15 Sekunden nach dem Start, hoechstens 4 parallel, 15 Sekunden Timeout pro Route). Abschalten mit `MCP_GATEWAY_HEALTHCHECK_ENABLED=false`.
 - Im Admin-Dashboard zeigen die Routen-Uebersicht und der Route-Editor Status, Zeitpunkt, Tool-Anzahl/Latenz bzw. die Fehlerursache. "Jetzt pruefen" und "Alle pruefen" starten Checks manuell.
 - Der oeffentliche Katalog (`/`, `/?format=json`, `/<route>`) zeigt nur Status, Zeitpunkt, Latenz und Tool-Anzahl, keine Fehlerdetails, da diese interne Hosts nennen koennen.
-- Der Check nutzt den globalen Upstream-Bearer. Hat eine Route nur nutzerspezifische Bearer, meldet er "Eingeschraenkt pruefbar" statt "Gestoert".
+- Der Check laeuft ohne Nutzer: Er sendet den globalen Upstream-Bearer und alle `forward_headers` ohne Nutzer-Platzhalter (z.B. einen statischen API-Key), aber keine Header mit `{email}`/`{user_id}`. Haengt die Upstream-Anmeldung nur an nutzerspezifischen Bearern oder solchen Headern, meldet er "Eingeschraenkt pruefbar" statt "Gestoert".
 - STDIO-Routen starten fuer jeden Check kurz einen eigenen Prozess.
 - Die Ergebnisse liegen nur im Speicher und sind nach einem Neustart bis zur ersten Runde "Noch nicht geprueft".
 
@@ -310,7 +326,7 @@ Wichtig:
 - Beim Speichern wird nur neu gestartet, was sich wirklich geaendert hat: Aendern sich nur Anzeigename, Beschreibung, Doku-Link, Notizen, Scopes, Zugriffsregeln, OpenAPI-Session-Modus oder Deployment-Metadaten, laufen bestehende Sessions und STDIO-Prozesse weiter. Verliert ein Nutzer durch geaenderte Zugriffsregeln den Zugriff, werden nur seine Sessions beendet. Aenderungen an Transport, Upstream, Pfaden, Headern, STDIO-Kommando, -Argumenten, -Umgebung oder an den Werten der Installer-Secrets starten nur diese Route neu. Andere Routen sind nie betroffen.
 - "Neu starten" im Route-Editor beendet alle Sessions der Route und startet sie neu, z.B. nachdem eine Executable unter gleichem Pfad ersetzt wurde.
 - Upstream-Umgebungsvariablen werden bei HTTP-Routen als Deployment-Metadaten gespeichert. Bei manuell gepflegten STDIO-Routen werden `stdio.env`-Werte an den gestarteten Prozess uebergeben; vom Installer erfasste Env-Secrets werden verschluesselt gespeichert und per `stdio.env_secret_refs` referenziert.
-- Full Export kann interne Tokens in `forward_headers`, `upstream_environment` oder manuellem `stdio.env` enthalten. Installer-Secrets und Upstream-Bearer aus dem Dashboard bleiben im verschluesselten Auth-Store und werden nicht als Klartext exportiert.
+- Full Export kann interne Tokens in `upstream_environment` oder manuellem `stdio.env` enthalten. Installer-Secrets, Upstream-Bearer und Zugangsdaten in `forward_headers` (siehe Sicherheit) bleiben im verschluesselten Auth-Store und werden nicht als Klartext exportiert.
 
 ### Upstream Bearer Auth
 

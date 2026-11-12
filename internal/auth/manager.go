@@ -15,6 +15,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -32,6 +33,15 @@ import (
 const (
 	sessionCookieName = "mcp_gateway_session"
 	csrfCookieName    = "mcp_gateway_csrf"
+
+	// Limits for dynamic client registration, which is open to anyone.
+	maxClientMetadataBytes  = 64 << 10
+	maxRegisteredClients    = 2000
+	maxClientRedirectURIs   = 10
+	maxClientMetadataLength = 2048
+	// Clients that never obtained a token may be dropped after this time
+	// to make room for new registrations.
+	unusedClientGracePeriod = time.Hour
 )
 
 var (
@@ -61,10 +71,18 @@ type Config struct {
 	AllowedEmails          []string
 	AllowedEmailDomains    []string
 	AllowedRedirectOrigins []string
+	// TrustedProxies are the peers whose forwarding headers are believed
+	// when working out a client address for throttling. Empty means
+	// loopback and private networks.
+	TrustedProxies []netip.Prefix
+	// ClientIPHeader optionally names a header set by a trusted proxy that
+	// carries the client address, e.g. CF-Connecting-IP.
+	ClientIPHeader string
 }
 
 type Manager struct {
-	cfg Config
+	cfg     Config
+	limiter *attemptLimiter
 
 	mu                    sync.Mutex
 	data                  *storeData
@@ -254,6 +272,7 @@ type routeSecretRecord struct {
 	Env                 map[string]string `json:"env,omitempty"`
 	UpstreamBearer      string            `json:"upstream_bearer,omitempty"`
 	UserUpstreamBearers map[string]string `json:"user_upstream_bearers,omitempty"`
+	ForwardHeaders      map[string]string `json:"forward_headers,omitempty"`
 	UpdatedAt           int64             `json:"updated_at"`
 }
 
@@ -278,7 +297,8 @@ type authorizeParams struct {
 
 func NewManager(cfg Config) (*Manager, error) {
 	manager := &Manager{
-		cfg: cfg,
+		cfg:     cfg,
+		limiter: newAttemptLimiter(),
 		data: &storeData{
 			Users:          make(map[string]*userRecord),
 			Groups:         make(map[string]*groupRecord),
@@ -375,8 +395,17 @@ func (m *Manager) HandleClientRegistration(w http.ResponseWriter, r *http.Reques
 	}
 	setNoStoreHeaders(w)
 
+	// Registration is open to anyone, so bound how fast one client can fill
+	// the store.
+	registrationKey := "dcr-ip:" + m.clientIP(r)
+	if m.limiter.blockedFor(registrationKey) > 0 || m.limiter.record(registrationKey, registrationIPLimit, registrationIPWindow, registrationIPWindow) {
+		w.Header().Set("Retry-After", strconv.Itoa(int(registrationIPWindow.Seconds())))
+		writeOAuthError(w, http.StatusTooManyRequests, "temporarily_unavailable", "too many client registrations; try again later")
+		return
+	}
+
 	var payload clientMetadataRequest
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxClientMetadataBytes)).Decode(&payload); err != nil {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_client_metadata", "invalid JSON payload")
 		return
 	}
@@ -410,7 +439,7 @@ func (m *Manager) HandleClientConfiguration(w http.ResponseWriter, r *http.Reque
 		writeJSON(w, http.StatusOK, m.clientInformationResponse(r, client))
 	case http.MethodPut:
 		var payload clientMetadataRequest
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxClientMetadataBytes)).Decode(&payload); err != nil {
 			writeOAuthError(w, http.StatusBadRequest, "invalid_client_metadata", "invalid JSON payload")
 			return
 		}
@@ -527,7 +556,7 @@ func (m *Manager) HandleAccountRegister(w http.ResponseWriter, r *http.Request) 
 
 	switch r.Method {
 	case http.MethodGet:
-		csrfToken := ensureCSRFCookie(w, r)
+		csrfToken := m.ensureCSRFCookie(w, r)
 		renderHTML(w, registerTemplate, map[string]any{
 			"CSRFToken": csrfToken,
 			"Next":      r.URL.Query().Get("next"),
@@ -538,7 +567,7 @@ func (m *Manager) HandleAccountRegister(w http.ResponseWriter, r *http.Request) 
 			http.Error(w, "invalid form", http.StatusBadRequest)
 			return
 		}
-		if !validateCSRFCookie(r) {
+		if !m.validateCSRFCookie(r) {
 			http.Error(w, "invalid CSRF token", http.StatusBadRequest)
 			return
 		}
@@ -550,7 +579,7 @@ func (m *Manager) HandleAccountRegister(w http.ResponseWriter, r *http.Request) 
 		user, err := m.registerUser(email, password)
 		if err != nil {
 			renderHTML(w, registerTemplate, map[string]any{
-				"CSRFToken": ensureCSRFCookie(w, r),
+				"CSRFToken": m.ensureCSRFCookie(w, r),
 				"Next":      next,
 				"Error":     err.Error(),
 				"Email":     email,
@@ -576,7 +605,7 @@ func (m *Manager) HandleAccountLogin(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		renderHTML(w, loginTemplate, map[string]any{
-			"CSRFToken": ensureCSRFCookie(w, r),
+			"CSRFToken": m.ensureCSRFCookie(w, r),
 			"Next":      r.URL.Query().Get("next"),
 			"Title":     m.cfg.PortalTitle,
 		})
@@ -585,7 +614,7 @@ func (m *Manager) HandleAccountLogin(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid form", http.StatusBadRequest)
 			return
 		}
-		if !validateCSRFCookie(r) {
+		if !m.validateCSRFCookie(r) {
 			http.Error(w, "invalid CSRF token", http.StatusBadRequest)
 			return
 		}
@@ -593,18 +622,35 @@ func (m *Manager) HandleAccountLogin(w http.ResponseWriter, r *http.Request) {
 		email := r.FormValue("email")
 		password := r.FormValue("password")
 		next := sanitizeNext(r.FormValue("next"))
+		throttleEmail := normalizeEmail(email)
+		clientIP := m.clientIP(r)
 
-		user, err := m.authenticateUser(email, password)
-		if err != nil {
-			renderHTML(w, loginTemplate, map[string]any{
-				"CSRFToken": ensureCSRFCookie(w, r),
+		renderLoginError := func(status int, message string) {
+			renderHTMLStatus(w, status, loginTemplate, map[string]any{
+				"CSRFToken": m.ensureCSRFCookie(w, r),
 				"Next":      next,
-				"Error":     "Invalid email or password",
+				"Error":     message,
 				"Email":     email,
 				"Title":     m.cfg.PortalTitle,
 			})
+		}
+		if blocked := m.loginBlockedFor(throttleEmail, clientIP); blocked > 0 {
+			minutes := int(blocked/time.Minute) + 1
+			w.Header().Set("Retry-After", strconv.Itoa(int(blocked.Seconds())+1))
+			log.Printf("login throttled email=%q client=%s retry_after=%s", throttleEmail, clientIP, blocked.Round(time.Second))
+			renderLoginError(http.StatusTooManyRequests, fmt.Sprintf("Zu viele Fehlversuche. Bitte in %d Minuten erneut versuchen.", minutes))
 			return
 		}
+
+		user, err := m.authenticateUser(email, password)
+		if err != nil {
+			m.recordLoginFailure(throttleEmail, clientIP)
+			log.Printf("login failed email=%q client=%s", throttleEmail, clientIP)
+			renderLoginError(http.StatusOK, "Invalid email or password")
+			return
+		}
+		m.recordLoginSuccess(throttleEmail, clientIP)
+		log.Printf("login succeeded email=%q client=%s admin=%t", user.Email, clientIP, user.IsAdmin)
 		if err := m.startSession(w, r, user.ID); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -625,7 +671,7 @@ func (m *Manager) HandleAccountLogout(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unsupported method", http.StatusMethodNotAllowed)
 		return
 	}
-	if !validateCSRFCookie(r) {
+	if !m.validateCSRFCookie(r) {
 		http.Error(w, "invalid CSRF token", http.StatusBadRequest)
 		return
 	}
@@ -638,7 +684,7 @@ func (m *Manager) HandleAccountLogout(w http.ResponseWriter, r *http.Request) {
 		Path:     "/",
 		HttpOnly: true,
 		MaxAge:   -1,
-		Secure:   requestIsSecure(r),
+		Secure:   m.cookieSecure(r),
 		SameSite: http.SameSiteLaxMode,
 	})
 	http.Redirect(w, r, "/account/login", http.StatusFound)
@@ -675,7 +721,7 @@ func (m *Manager) HandleAccountPassword(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "invalid form", http.StatusBadRequest)
 		return
 	}
-	if !validateCSRFCookie(r) {
+	if !m.validateCSRFCookie(r) {
 		http.Error(w, "invalid CSRF token", http.StatusBadRequest)
 		return
 	}
@@ -685,7 +731,11 @@ func (m *Manager) HandleAccountPassword(w http.ResponseWriter, r *http.Request) 
 		m.renderAccount(w, r, identity, "", "New password confirmation does not match")
 		return
 	}
-	if err := m.changeUserPassword(identity.UserID, r.FormValue("current_password"), newPassword); err != nil {
+	keepSession := ""
+	if cookie, err := r.Cookie(sessionCookieName); err == nil {
+		keepSession = cookie.Value
+	}
+	if err := m.changeUserPassword(identity.UserID, r.FormValue("current_password"), newPassword, keepSession); err != nil {
 		m.renderAccount(w, r, identity, "", err.Error())
 		return
 	}
@@ -708,7 +758,7 @@ func (m *Manager) HandleAccountDeviceDelete(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "invalid form", http.StatusBadRequest)
 		return
 	}
-	if !validateCSRFCookie(r) {
+	if !m.validateCSRFCookie(r) {
 		http.Error(w, "invalid CSRF token", http.StatusBadRequest)
 		return
 	}
@@ -735,7 +785,7 @@ func (m *Manager) HandleAccountTokenCreate(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "invalid form", http.StatusBadRequest)
 		return
 	}
-	if !validateCSRFCookie(r) {
+	if !m.validateCSRFCookie(r) {
 		http.Error(w, "invalid CSRF token", http.StatusBadRequest)
 		return
 	}
@@ -772,7 +822,7 @@ func (m *Manager) HandleAccountTokenDelete(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "invalid form", http.StatusBadRequest)
 		return
 	}
-	if !validateCSRFCookie(r) {
+	if !m.validateCSRFCookie(r) {
 		http.Error(w, "invalid CSRF token", http.StatusBadRequest)
 		return
 	}
@@ -790,7 +840,7 @@ func (m *Manager) renderAccount(w http.ResponseWriter, r *http.Request, identity
 		token = newBearerToken[0]
 	}
 	renderHTML(w, accountTemplate, map[string]any{
-		"CSRFToken":      ensureCSRFCookie(w, r),
+		"CSRFToken":      m.ensureCSRFCookie(w, r),
 		"Email":          identity.Email,
 		"IsAdmin":        identity.IsAdmin,
 		"GroupNames":     identity.GroupNames,
@@ -998,7 +1048,7 @@ func (m *Manager) load() error {
 }
 
 func (m *Manager) saveLocked() error {
-	if err := os.MkdirAll(filepath.Dir(m.cfg.StorePath), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(m.cfg.StorePath), 0o700); err != nil {
 		return fmt.Errorf("failed to create auth store directory: %w", err)
 	}
 
@@ -1090,6 +1140,9 @@ func (m *Manager) registerClientFromMetadata(payload clientMetadataRequest) (*cl
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.cleanupLocked(now)
+	if err := m.makeRoomForClientLocked(now); err != nil {
+		return nil, err
+	}
 	m.data.Clients[client.ID] = client
 	if err := m.saveLocked(); err != nil {
 		return nil, err
@@ -1097,14 +1150,54 @@ func (m *Manager) registerClientFromMetadata(payload clientMetadataRequest) (*cl
 	return client, nil
 }
 
+// makeRoomForClientLocked keeps the number of registered clients bounded.
+// At the limit it first drops clients that never obtained a token and are
+// older than the grace period; if none can go, registration is refused.
+func (m *Manager) makeRoomForClientLocked(now time.Time) error {
+	if len(m.data.Clients) < maxRegisteredClients {
+		return nil
+	}
+	inUse := make(map[string]bool, len(m.data.Clients))
+	for _, record := range m.data.AuthCodes {
+		inUse[record.ClientID] = true
+	}
+	for _, record := range m.data.AccessTokens {
+		inUse[record.ClientID] = true
+	}
+	for _, record := range m.data.RefreshTokens {
+		inUse[record.ClientID] = true
+	}
+	cutoff := now.Add(-unusedClientGracePeriod).Unix()
+	removed := 0
+	for id, client := range m.data.Clients {
+		if !inUse[id] && client.UpdatedAt < cutoff {
+			delete(m.data.Clients, id)
+			removed++
+		}
+	}
+	if removed > 0 {
+		log.Printf("oauth client registry pruned unused_clients=%d remaining=%d", removed, len(m.data.Clients))
+	}
+	if len(m.data.Clients) >= maxRegisteredClients {
+		return fmt.Errorf("too many registered clients; try again later")
+	}
+	return nil
+}
+
 func (m *Manager) normalizeClientMetadata(payload clientMetadataRequest) (*clientRecord, error) {
 	name := strings.TrimSpace(payload.ClientName)
 	if strings.TrimSpace(name) == "" {
 		name = "MCP Client"
 	}
+	if len(name) > 200 {
+		return nil, fmt.Errorf("client_name is too long")
+	}
 	redirectURIs := dedupeStrings(payload.RedirectURIs)
 	if len(redirectURIs) == 0 {
 		return nil, fmt.Errorf("redirect_uris must not be empty")
+	}
+	if len(redirectURIs) > maxClientRedirectURIs {
+		return nil, fmt.Errorf("at most %d redirect_uris are allowed", maxClientRedirectURIs)
 	}
 	for _, redirectURI := range redirectURIs {
 		if err := m.validateRedirectURI(redirectURI); err != nil {
@@ -1158,9 +1251,20 @@ func (m *Manager) normalizeClientMetadata(payload clientMetadataRequest) (*clien
 	if client.Scope == "" {
 		client.Scope = "mcp"
 	}
+	for _, value := range append([]string{client.Scope, client.SoftwareID, client.SoftwareVersion}, client.Contacts...) {
+		if len(value) > maxClientMetadataLength {
+			return nil, fmt.Errorf("client metadata value is too long")
+		}
+	}
+	if len(client.Contacts) > 10 {
+		return nil, fmt.Errorf("too many contacts")
+	}
 	for _, rawURI := range []string{client.ClientURI, client.LogoURI, client.TOSURI, client.PolicyURI, client.JwksURI} {
 		if rawURI == "" {
 			continue
+		}
+		if len(rawURI) > maxClientMetadataLength {
+			return nil, fmt.Errorf("metadata URI is too long")
 		}
 		if err := validateAbsoluteResource(rawURI); err != nil {
 			return nil, fmt.Errorf("metadata URI must be absolute: %s", rawURI)
@@ -1336,13 +1440,18 @@ func validateClientIDForLazyRegistration(clientID string) error {
 }
 
 func (m *Manager) handleAuthorizeGet(w http.ResponseWriter, r *http.Request) {
-	params, client, err := m.parseAuthorizeRequest(r.URL.Query())
+	identity, _ := m.identityFromSession(r)
+
+	// Unknown client IDs are accepted lazily (see registerLazyAuthorizeClient),
+	// but only a signed-in user makes that registration permanent. Without a
+	// session the request is validated and nothing is stored, so anonymous
+	// requests cannot fill the client registry.
+	params, client, err := m.parseAuthorizeRequest(identity != nil, r.URL.Query())
 	if err != nil {
 		writeAuthorizationRequestError(w, err)
 		return
 	}
 
-	identity, _ := m.identityFromSession(r)
 	if identity == nil {
 		// Some clients, including Open WebUI, preflight the authorization URL
 		// server-side without a user session. We still validate the OAuth request
@@ -1357,9 +1466,11 @@ func (m *Manager) handleAuthorizeGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	csrfToken := ensureCSRFCookie(w, r)
+	csrfToken := m.ensureCSRFCookie(w, r)
 	renderHTML(w, authorizeTemplate, map[string]any{
 		"ClientName":          client.Name,
+		"RedirectHost":        redirectDisplayHost(params.RedirectURI),
+		"RedirectIsLocal":     redirectIsLoopback(params.RedirectURI),
 		"Resource":            params.Resource,
 		"Scope":               params.Scope,
 		"State":               params.State,
@@ -1381,7 +1492,7 @@ func (m *Manager) handleAuthorizePost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid form", http.StatusBadRequest)
 		return
 	}
-	if !validateCSRFCookie(r) {
+	if !m.validateCSRFCookie(r) {
 		http.Error(w, "invalid CSRF token", http.StatusBadRequest)
 		return
 	}
@@ -1397,7 +1508,7 @@ func (m *Manager) handleAuthorizePost(w http.ResponseWriter, r *http.Request) {
 		values.Set(key, r.FormValue(key))
 	}
 
-	params, _, err := m.parseAuthorizeRequest(values)
+	params, _, err := m.parseAuthorizeRequest(true, values)
 	if err != nil {
 		writeAuthorizationRequestError(w, err)
 		return
@@ -1436,7 +1547,9 @@ func (m *Manager) handleAuthorizePost(w http.ResponseWriter, r *http.Request) {
 	completeBrowserRedirect(w, target, "Authorization complete")
 }
 
-func (m *Manager) parseAuthorizeRequest(values url.Values) (*authorizeParams, *clientRecord, error) {
+// parseAuthorizeRequest validates an authorization request. With
+// persistLazyClient false, an unknown client is validated but not stored.
+func (m *Manager) parseAuthorizeRequest(persistLazyClient bool, values url.Values) (*authorizeParams, *clientRecord, error) {
 	params := &authorizeParams{
 		ClientID:            strings.TrimSpace(values.Get("client_id")),
 		RedirectURI:         strings.TrimSpace(values.Get("redirect_uri")),
@@ -1463,7 +1576,11 @@ func (m *Manager) parseAuthorizeRequest(values url.Values) (*authorizeParams, *c
 		}
 	}
 
-	client, err := m.clientForAuthorizeRequest(params)
+	if len(params.State) > maxClientMetadataLength || len(params.Scope) > maxClientMetadataLength || len(params.Resource) > maxClientMetadataLength || len(params.CodeChallenge) > 256 {
+		return nil, nil, fmt.Errorf("authorization request parameter is too long")
+	}
+
+	client, err := m.clientForAuthorizeRequest(params, persistLazyClient)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1480,7 +1597,7 @@ func (m *Manager) parseAuthorizeRequest(values url.Values) (*authorizeParams, *c
 	return params, client, nil
 }
 
-func (m *Manager) clientForAuthorizeRequest(params *authorizeParams) (*clientRecord, error) {
+func (m *Manager) clientForAuthorizeRequest(params *authorizeParams, persistLazyClient bool) (*clientRecord, error) {
 	client, err := m.lookupClient(params.ClientID)
 	if err == nil {
 		return client, nil
@@ -1488,7 +1605,7 @@ func (m *Manager) clientForAuthorizeRequest(params *authorizeParams) (*clientRec
 	if !errors.Is(err, ErrInvalidClient) {
 		return nil, err
 	}
-	return m.registerLazyAuthorizeClient(params)
+	return m.registerLazyAuthorizeClient(params, persistLazyClient)
 }
 
 func (m *Manager) lookupClient(clientID string) (*clientRecord, error) {
@@ -1503,7 +1620,7 @@ func (m *Manager) lookupClient(clientID string) (*clientRecord, error) {
 	return client, nil
 }
 
-func (m *Manager) registerLazyAuthorizeClient(params *authorizeParams) (*clientRecord, error) {
+func (m *Manager) registerLazyAuthorizeClient(params *authorizeParams, persist bool) (*clientRecord, error) {
 	if err := validateClientIDForLazyRegistration(params.ClientID); err != nil {
 		return nil, err
 	}
@@ -1531,6 +1648,12 @@ func (m *Manager) registerLazyAuthorizeClient(params *authorizeParams) (*clientR
 	m.cleanupLocked(now)
 	if existing, ok := m.data.Clients[params.ClientID]; ok {
 		return existing, nil
+	}
+	if !persist {
+		return client, nil
+	}
+	if err := m.makeRoomForClientLocked(now); err != nil {
+		return nil, err
 	}
 	m.data.Clients[client.ID] = client
 	if err := m.saveLocked(); err != nil {
@@ -1882,25 +2005,59 @@ func (m *Manager) emailAllowed(email string) bool {
 func (m *Manager) authenticateUser(email, password string) (*userRecord, error) {
 	email = normalizeEmail(email)
 
+	// The password check is slow on purpose. It runs outside the store lock
+	// so a burst of logins cannot stall token validation for every MCP
+	// request, and it also runs for unknown accounts so the response time
+	// does not reveal which emails exist.
+	m.mu.Lock()
+	m.cleanupLocked(time.Now())
+	userID, passwordHash := "", ""
+	if id, ok := m.data.EmailIndex[email]; ok {
+		if user, ok := m.data.Users[id]; ok {
+			userID, passwordHash = id, user.PasswordHash
+		}
+	}
+	m.mu.Unlock()
+
+	if userID == "" {
+		_ = bcrypt.CompareHashAndPassword(dummyPasswordHash(), []byte(password))
+		return nil, ErrNotAuthenticated
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(password)); err != nil {
+		return nil, ErrNotAuthenticated
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.cleanupLocked(time.Now())
-
-	userID, ok := m.data.EmailIndex[email]
-	if !ok {
-		return nil, ErrNotAuthenticated
-	}
 	user, ok := m.data.Users[userID]
-	if !ok {
-		return nil, ErrNotAuthenticated
-	}
-	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password)); err != nil {
+	if !ok || user.PasswordHash != passwordHash {
+		// Deleted or password changed while the hash was being checked.
 		return nil, ErrNotAuthenticated
 	}
 	return user, nil
 }
 
-func (m *Manager) changeUserPassword(userID, currentPassword, newPassword string) error {
+var (
+	dummyPasswordHashOnce  sync.Once
+	dummyPasswordHashValue []byte
+)
+
+// dummyPasswordHash is compared against when the account does not exist.
+func dummyPasswordHash() []byte {
+	dummyPasswordHashOnce.Do(func() {
+		hash, err := bcrypt.GenerateFromPassword([]byte(randomToken(24)), bcrypt.DefaultCost)
+		if err != nil {
+			panic(err)
+		}
+		dummyPasswordHashValue = hash
+	})
+	return dummyPasswordHashValue
+}
+
+// changeUserPassword sets a new password and signs the user out everywhere
+// except the browser session keepSession, so a stolen session does not
+// survive the password change.
+func (m *Manager) changeUserPassword(userID, currentPassword, newPassword, keepSession string) error {
 	if strings.TrimSpace(currentPassword) == "" {
 		return fmt.Errorf("current password is required")
 	}
@@ -1927,7 +2084,16 @@ func (m *Manager) changeUserPassword(userID, currentPassword, newPassword string
 	}
 	user.PasswordHash = string(hash)
 	user.UpdatedAt = now.Unix()
+	m.deleteUserSessionsLocked(userID, keepSession)
 	return m.saveLocked()
+}
+
+func (m *Manager) deleteUserSessionsLocked(userID, keepSession string) {
+	for token, session := range m.data.Sessions {
+		if session.UserID == userID && token != keepSession {
+			delete(m.data.Sessions, token)
+		}
+	}
 }
 
 func (m *Manager) startSession(w http.ResponseWriter, r *http.Request, userID string) error {
@@ -1951,7 +2117,7 @@ func (m *Manager) startSession(w http.ResponseWriter, r *http.Request, userID st
 		Value:    session.Token,
 		Path:     "/",
 		HttpOnly: true,
-		Secure:   requestIsSecure(r),
+		Secure:   m.cookieSecure(r),
 		SameSite: http.SameSiteLaxMode,
 		Expires:  time.Unix(session.ExpiresAt, 0),
 	})
@@ -2119,6 +2285,9 @@ func (m *Manager) checkResourceAccess(identity *Identity, resource string) error
 }
 
 func (m *Manager) validateRedirectURI(raw string) error {
+	if len(raw) > maxClientMetadataLength {
+		return fmt.Errorf("redirect_uri is too long")
+	}
 	parsed, err := url.Parse(raw)
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
 		return fmt.Errorf("invalid redirect_uri: %s", raw)
@@ -2144,6 +2313,28 @@ func (m *Manager) redirectOriginAllowed(parsed *url.URL) bool {
 		if strings.EqualFold(strings.TrimRight(allowed, "/"), strings.TrimRight(origin, "/")) {
 			return true
 		}
+	}
+	return false
+}
+
+// redirectDisplayHost is the host the authorization code is sent to, shown
+// on the consent page so the user can spot a client they did not start.
+func redirectDisplayHost(redirectURI string) string {
+	parsed, err := url.Parse(redirectURI)
+	if err != nil || parsed.Host == "" {
+		return redirectURI
+	}
+	return parsed.Host
+}
+
+func redirectIsLoopback(redirectURI string) bool {
+	parsed, err := url.Parse(redirectURI)
+	if err != nil {
+		return false
+	}
+	switch parsed.Hostname() {
+	case "localhost", "127.0.0.1", "::1":
+		return true
 	}
 	return false
 }
@@ -2260,7 +2451,7 @@ func dedupeStrings(values []string) []string {
 	return out
 }
 
-func ensureCSRFCookie(w http.ResponseWriter, r *http.Request) string {
+func (m *Manager) ensureCSRFCookie(w http.ResponseWriter, r *http.Request) string {
 	if cookie, err := r.Cookie(csrfCookieName); err == nil && strings.TrimSpace(cookie.Value) != "" {
 		return cookie.Value
 	}
@@ -2271,19 +2462,74 @@ func ensureCSRFCookie(w http.ResponseWriter, r *http.Request) string {
 		Value:    token,
 		Path:     "/",
 		HttpOnly: false,
-		Secure:   requestIsSecure(r),
+		Secure:   m.cookieSecure(r),
 		SameSite: http.SameSiteLaxMode,
 	})
 	return token
 }
 
-func validateCSRFCookie(r *http.Request) bool {
+func (m *Manager) validateCSRFCookie(r *http.Request) bool {
+	if !m.requestFromOwnOrigin(r) {
+		return false
+	}
 	cookie, err := r.Cookie(csrfCookieName)
-	if err != nil {
+	if err != nil || strings.TrimSpace(cookie.Value) == "" {
 		return false
 	}
 	formToken := strings.TrimSpace(r.FormValue("csrf_token"))
 	return subtleConstantTimeEqual(cookie.Value, formToken)
+}
+
+// requestFromOwnOrigin rejects form posts that a browser marks as coming
+// from another site. The CSRF cookie alone is a double-submit token: a
+// sibling subdomain that can set cookies for the parent domain could plant
+// its own token, so the browser's own origin signals are checked as well.
+// Requests without these headers (non-browser clients) are left to the
+// token check.
+func (m *Manager) requestFromOwnOrigin(r *http.Request) bool {
+	switch strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))) {
+	case "cross-site", "same-site":
+		return false
+	}
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return true
+	}
+	parsed, err := url.Parse(origin)
+	if err != nil || parsed.Host == "" {
+		return false
+	}
+	// The gateway may be reached under its public URL or directly, e.g. on
+	// a LAN address; both are its own origin.
+	if strings.EqualFold(parsed.Host, r.Host) {
+		return true
+	}
+	if base := strings.TrimSpace(m.cfg.PublicBaseURL); base != "" {
+		if baseURL, err := url.Parse(base); err == nil && strings.EqualFold(parsed.Scheme, baseURL.Scheme) && strings.EqualFold(parsed.Host, baseURL.Host) {
+			return true
+		}
+	}
+	return false
+}
+
+// cookieSecure reports whether cookies get the Secure flag. Behind an HTTPS
+// public URL they always do, whatever a forwarding header claims. The one
+// exception is a request that reached the gateway directly over plain HTTP
+// under another host, e.g. http://nas:40013 on the LAN: a Secure cookie
+// would never be sent back there and would lock such direct access out.
+func (m *Manager) cookieSecure(r *http.Request) bool {
+	if requestIsSecure(r) {
+		return true
+	}
+	base := strings.TrimSpace(m.cfg.PublicBaseURL)
+	if !strings.HasPrefix(strings.ToLower(base), "https://") {
+		return false
+	}
+	baseURL, err := url.Parse(base)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(baseURL.Host, r.Host)
 }
 
 func sanitizeNext(next string) string {
@@ -2291,10 +2537,13 @@ func sanitizeNext(next string) string {
 	if next == "" {
 		return ""
 	}
-	if strings.HasPrefix(next, "http://") || strings.HasPrefix(next, "https://") {
+	// Only same-site paths: browsers read "//host" and "/\\host" as another
+	// host, which would turn the login into an open redirect.
+	if !strings.HasPrefix(next, "/") || strings.HasPrefix(next, "//") || strings.ContainsAny(next, "\\\r\n\t") {
 		return ""
 	}
-	if !strings.HasPrefix(next, "/") {
+	parsed, err := url.Parse(next)
+	if err != nil || parsed.Scheme != "" || parsed.Host != "" || parsed.User != nil {
 		return ""
 	}
 	return next
@@ -2380,6 +2629,10 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 }
 
 func renderHTML(w http.ResponseWriter, tmpl string, data map[string]any) {
+	renderHTMLStatus(w, http.StatusOK, tmpl, data)
+}
+
+func renderHTMLStatus(w http.ResponseWriter, status int, tmpl string, data map[string]any) {
 	t := template.Must(template.New("page").Parse(layoutTemplate + tmpl))
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
@@ -2387,6 +2640,7 @@ func renderHTML(w http.ResponseWriter, tmpl string, data map[string]any) {
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; form-action 'self'; base-uri 'none'; img-src 'self' data:; frame-ancestors 'none'")
+	w.WriteHeader(status)
 	_ = t.Execute(w, data)
 }
 
@@ -2401,9 +2655,20 @@ func renderRedirectHTML(w http.ResponseWriter, title, targetURL string) {
 	_ = t.Execute(w, map[string]any{
 		"Title":         title,
 		"TargetURL":     template.URL(targetURL),
-		"TargetURLJS":   template.JS(strconv.Quote(targetURL)),
+		"TargetURLJS":   template.JS(jsStringLiteral(targetURL)),
 		"TargetDisplay": targetURL,
 	})
+}
+
+// jsStringLiteral encodes value as a JavaScript string that is safe inside
+// an inline script: encoding/json escapes <, > and & so the value cannot
+// close the script element.
+func jsStringLiteral(value string) string {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return `""`
+	}
+	return string(encoded)
 }
 
 func setNoStoreHeaders(w http.ResponseWriter) {
@@ -2620,10 +2885,13 @@ const authorizeTemplate = `
 <div class="panel">
   <div class="panel-body stack-sm">
     <div><strong>{{.ClientName}}</strong> m&ouml;chte auf folgende Ressource zugreifen:</div>
-    <code style="word-break:break-all;">{{.Resource}}</code>
+    {{if .Resource}}<code style="word-break:break-all;">{{.Resource}}</code>{{else}}<div><strong>Alle MCP-Server dieses Gateways</strong>, die dein Account nutzen darf (gatewayweiter Zugriff).</div>{{end}}
     <div class="hint">Angeforderte Scopes: <code>{{.Scope}}</code></div>
+    <div>Der Zugang wird &uuml;bergeben an: <strong class="mono" style="word-break:break-all;">{{.RedirectHost}}</strong>{{if .RedirectIsLocal}} <span class="hint">(Programm auf diesem Ger&auml;t)</span>{{end}}</div>
+    <div class="hint mono" style="word-break:break-all;">{{.RedirectURI}}</div>
   </div>
 </div>
+<div class="callout {{if .RedirectIsLocal}}success{{else}}danger{{end}}" style="display:block;">Gib nur frei, wenn du diese Anmeldung gerade selbst in deinem Client gestartet hast. Der Client-Name oben ist frei w&auml;hlbar und kein Beweis; entscheidend ist das Ziel der &Uuml;bergabe. Kennst du es nicht, lehne ab.</div>
 <form method="post" action="/authorize" class="cluster">
   <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
   <input type="hidden" name="client_id" value="{{.ClientID}}">
