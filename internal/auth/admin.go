@@ -198,6 +198,14 @@ func (m *Manager) RenameRouteSecrets(oldRouteID, newRouteID string) error {
 			newRecord.UserUpstreamBearers[userID] = value
 		}
 	}
+	for name, value := range oldRecord.ForwardHeaders {
+		if _, exists := newRecord.ForwardHeaders[name]; !exists {
+			if newRecord.ForwardHeaders == nil {
+				newRecord.ForwardHeaders = map[string]string{}
+			}
+			newRecord.ForwardHeaders[name] = value
+		}
+	}
 	newRecord.UpdatedAt = time.Now().Unix()
 	delete(m.data.RouteSecrets, oldRouteID)
 	m.deleteEmptyRouteSecretLocked(newRouteID)
@@ -286,6 +294,64 @@ func (m *Manager) ResolveRouteUpstreamBearer(routeID string, identity *Identity)
 	return "", false
 }
 
+// SyncRouteForwardHeaderSecrets stores the given forward header values for
+// a route and drops stored values for headers not named in keep (headers
+// that were removed from the route). It only writes when something changes.
+func (m *Manager) SyncRouteForwardHeaderSecrets(routeID string, set map[string]string, keep []string) error {
+	routeID = strings.TrimSpace(routeID)
+	if routeID == "" {
+		return fmt.Errorf("route id is required")
+	}
+	kept := make(map[string]bool, len(keep))
+	for _, name := range keep {
+		kept[name] = true
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	record := m.data.RouteSecrets[routeID]
+	changed := false
+	if record != nil {
+		for name := range record.ForwardHeaders {
+			if _, replaced := set[name]; !replaced && !kept[name] {
+				delete(record.ForwardHeaders, name)
+				changed = true
+			}
+		}
+	}
+	for name, value := range set {
+		if record == nil {
+			record = m.ensureRouteSecretLocked(routeID)
+		}
+		if record.ForwardHeaders == nil {
+			record.ForwardHeaders = map[string]string{}
+		}
+		if existing, ok := record.ForwardHeaders[name]; !ok || existing != value {
+			record.ForwardHeaders[name] = value
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	record.UpdatedAt = time.Now().Unix()
+	m.deleteEmptyRouteSecretLocked(routeID)
+	return m.saveLocked()
+}
+
+// RouteForwardHeaderSecret returns the stored value of a route's forward
+// header.
+func (m *Manager) RouteForwardHeaderSecret(routeID, name string) (string, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	record := m.data.RouteSecrets[strings.TrimSpace(routeID)]
+	if record == nil {
+		return "", false
+	}
+	value, ok := record.ForwardHeaders[name]
+	return value, ok && value != ""
+}
+
 func (m *Manager) ensureRouteSecretLocked(routeID string) *routeSecretRecord {
 	record := m.data.RouteSecrets[routeID]
 	if record == nil {
@@ -306,7 +372,7 @@ func (m *Manager) deleteEmptyRouteSecretLocked(routeID string) {
 	if record == nil {
 		return
 	}
-	if len(record.Env) == 0 && strings.TrimSpace(record.UpstreamBearer) == "" && len(record.UserUpstreamBearers) == 0 {
+	if len(record.Env) == 0 && strings.TrimSpace(record.UpstreamBearer) == "" && len(record.UserUpstreamBearers) == 0 && len(record.ForwardHeaders) == 0 {
 		delete(m.data.RouteSecrets, routeID)
 	}
 }

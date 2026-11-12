@@ -272,6 +272,7 @@ type routeSecretRecord struct {
 	Env                 map[string]string `json:"env,omitempty"`
 	UpstreamBearer      string            `json:"upstream_bearer,omitempty"`
 	UserUpstreamBearers map[string]string `json:"user_upstream_bearers,omitempty"`
+	ForwardHeaders      map[string]string `json:"forward_headers,omitempty"`
 	UpdatedAt           int64             `json:"updated_at"`
 }
 
@@ -1047,7 +1048,7 @@ func (m *Manager) load() error {
 }
 
 func (m *Manager) saveLocked() error {
-	if err := os.MkdirAll(filepath.Dir(m.cfg.StorePath), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(m.cfg.StorePath), 0o700); err != nil {
 		return fmt.Errorf("failed to create auth store directory: %w", err)
 	}
 

@@ -72,7 +72,7 @@ paths:
 	if err := config.NormalizeRoute(&route); err != nil {
 		t.Fatalf("normalize route: %v", err)
 	}
-	handler, err := newOpenAPIBridge(route)
+	handler, err := newOpenAPIBridge(route, nil)
 	if err != nil {
 		t.Fatalf("create bridge: %v", err)
 	}
