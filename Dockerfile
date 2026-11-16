@@ -2,7 +2,7 @@ ARG BUILDPLATFORM
 ARG TARGETOS
 ARG TARGETARCH
 
-FROM --platform=$BUILDPLATFORM golang:1.24.2-bookworm AS build
+FROM --platform=$BUILDPLATFORM golang:1.27-trixie AS build
 
 WORKDIR /src
 
@@ -18,7 +18,7 @@ ARG TARGETARCH
 RUN test -n "$TARGETOS" && test -n "$TARGETARCH" \
     && CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/mcp-oauth-gateway ./cmd/mcp-oauth-gateway
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
