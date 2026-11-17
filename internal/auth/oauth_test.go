@@ -266,6 +266,7 @@ func TestLazyAuthorizeClientAdoptsSecretDuringCodeExchange(t *testing.T) {
 		"redirect_uri":          {redirectURI},
 		"response_type":         {"code"},
 		"scope":                 {"mcp"},
+		"resource":              {"https://mcp.example.com/legal/mcp"},
 		"state":                 {"state-value"},
 		"code_challenge":        {challenge},
 		"code_challenge_method": {"S256"},

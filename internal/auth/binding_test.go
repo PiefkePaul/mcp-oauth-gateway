@@ -378,3 +378,82 @@ func TestConsentCanBeDeclinedWithoutChoosingAServer(t *testing.T) {
 		t.Fatalf("decline button must skip form validation")
 	}
 }
+
+// Refresh tokens and codes from before the binding must end the login
+// instead of yielding access tokens that every route refuses.
+func TestUnboundRefreshTokensAndCodesAreRefused(t *testing.T) {
+	for name, resource := range map[string]string{"no resource": "", "gateway-wide resource": "https://mcp.example.com"} {
+		login := newCredentialTestLogin(t)
+		manager := login.manager
+
+		manager.mu.Lock()
+		tokens := manager.issueTokenSetLocked(time.Now(), login.userID, login.client.ID, "old-grant", "mcp", resource)
+		manager.mu.Unlock()
+
+		if _, err := manager.refreshToken(login.client.ID, "", "none", tokens.RefreshToken, ""); !errors.Is(err, ErrInvalidGrant) {
+			t.Fatalf("%s: unbound refresh token must be refused with invalid_grant, got %v", name, err)
+		}
+		manager.mu.Lock()
+		_, refreshLeft := manager.data.RefreshTokens[tokens.RefreshToken]
+		_, accessLeft := manager.data.AccessTokens[tokens.AccessToken]
+		manager.mu.Unlock()
+		if refreshLeft || accessLeft {
+			t.Fatalf("%s: the unbound login must be removed (refresh left %v, access left %v)", name, refreshLeft, accessLeft)
+		}
+
+		params := *login.params
+		params.Resource = resource
+		code, err := manager.createAuthorizationCode(login.userID, &params)
+		if err != nil {
+			t.Fatalf("create auth code: %v", err)
+		}
+		if _, err := manager.exchangeAuthorizationCode(login.client.ID, "", "none", code, params.RedirectURI, login.verifier, ""); !errors.Is(err, ErrInvalidGrant) {
+			t.Fatalf("%s: unbound code must be refused with invalid_grant, got %v", name, err)
+		}
+
+		// With unbound tokens allowed the old behaviour stays.
+		manager.cfg.AllowUnboundTokens = true
+		manager.mu.Lock()
+		tokens = manager.issueTokenSetLocked(time.Now(), login.userID, login.client.ID, "old-grant-2", "mcp", resource)
+		manager.mu.Unlock()
+		if _, err := manager.refreshToken(login.client.ID, "", "none", tokens.RefreshToken, ""); err != nil {
+			t.Fatalf("%s: with unbound tokens allowed the refresh must work: %v", name, err)
+		}
+	}
+}
+
+// A client that sends the gateway's base URL as resource gets the server
+// choice at /authorize; the same value at /token must then not fail against
+// the chosen server, on the code exchange or on refresh.
+func TestGatewayWideResourceParameterWorksAcrossAuthorizeAndToken(t *testing.T) {
+	login := newCredentialTestLogin(t)
+	manager := login.manager
+	const base = "https://mcp.example.com"
+
+	code, err := manager.createAuthorizationCode(login.userID, login.params) // bound to the chosen server
+	if err != nil {
+		t.Fatalf("create auth code: %v", err)
+	}
+	tokens, err := manager.exchangeAuthorizationCode(login.client.ID, "", "none", code, login.params.RedirectURI, login.verifier, base)
+	if err != nil {
+		t.Fatalf("code exchange with the base URL as resource: %v", err)
+	}
+	if _, err := manager.ValidateAccessToken(tokens.AccessToken, credentialTestResource); err != nil {
+		t.Fatalf("token must be valid on the chosen server: %v", err)
+	}
+	if _, err := manager.ValidateAccessToken(tokens.AccessToken, "https://mcp.example.com/other/mcp"); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("token must stay bound to the chosen server, got %v", err)
+	}
+	refreshed, err := manager.refreshToken(login.client.ID, "", "none", tokens.RefreshToken, base)
+	if err != nil {
+		t.Fatalf("refresh with the base URL as resource: %v", err)
+	}
+	if _, err := manager.ValidateAccessToken(refreshed.AccessToken, credentialTestResource); err != nil {
+		t.Fatalf("refreshed token must be valid on the chosen server: %v", err)
+	}
+
+	// A different, specific resource is still a mismatch.
+	if _, err := manager.refreshToken(login.client.ID, "", "none", refreshed.RefreshToken, "https://mcp.example.com/other/mcp"); !errors.Is(err, ErrInvalidGrant) {
+		t.Fatalf("another server as resource must be refused, got %v", err)
+	}
+}

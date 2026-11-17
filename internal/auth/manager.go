@@ -1673,6 +1673,24 @@ func (m *Manager) resourceChoiceNeeded(resource string) bool {
 	return strings.TrimSpace(resource) == "" || m.isGatewayWideResource(resource)
 }
 
+// unboundGrantRefused reports whether a stored code or refresh token lacks
+// the MCP server binding that is required now.
+func (m *Manager) unboundGrantRefused(grantResource string) bool {
+	return m.resourceChoiceNeeded(grantResource)
+}
+
+// tokenRequestResourceMatches compares the resource parameter of a token
+// request with the resource the grant is bound to. A client that names no
+// resource, or only the gateway itself, had its MCP server chosen on the
+// consent page; for it the parameter says nothing and the grant decides.
+func (m *Manager) tokenRequestResourceMatches(requested, grantResource string) bool {
+	requested = strings.TrimSpace(requested)
+	if requested == "" || m.resourceChoiceNeeded(requested) {
+		return true
+	}
+	return normalizeResource(requested) == normalizeResource(grantResource)
+}
+
 // parseAuthorizeRequest validates an authorization request. With
 // persistLazyClient false, an unknown client is validated but not stored.
 // With requireResource the request must already name its MCP server.
@@ -1894,7 +1912,14 @@ func (m *Manager) exchangeAuthorizationCode(clientID, clientSecret, clientAuthMe
 	if record.ClientID != client.ID || record.RedirectURI != redirectURI {
 		return nil, ErrInvalidGrant
 	}
-	if resource != "" && normalizeResource(resource) != normalizeResource(record.Resource) {
+	if m.unboundGrantRefused(record.Resource) {
+		// Issued before tokens were bound to one MCP server. Its tokens would
+		// be refused on every route, so the client signs in again instead.
+		delete(m.data.AuthCodes, code)
+		_ = m.saveLocked()
+		return nil, ErrInvalidGrant
+	}
+	if !m.tokenRequestResourceMatches(resource, record.Resource) {
 		return nil, ErrInvalidGrant
 	}
 	if !validatePKCE(record.CodeChallenge, codeVerifier) {
@@ -1994,7 +2019,17 @@ func (m *Manager) refreshToken(clientID, clientSecret, clientAuthMethod, refresh
 	if record.ClientID != client.ID {
 		return nil, ErrInvalidGrant
 	}
-	if resource != "" && normalizeResource(resource) != normalizeResource(record.Resource) {
+	if m.unboundGrantRefused(record.Resource) {
+		// A refresh token from before tokens were bound to one MCP server.
+		// Exchanging it would only yield access tokens that every route
+		// refuses, and the client would loop between 401 and refresh. Ending
+		// the login makes it sign in again and pick up a bound token.
+		revoked := m.revokeGrantLocked(record.UserID, record.ClientID, record.GrantID, record.Resource)
+		log.Printf("oauth unbound refresh token refused client_id=%s user_id=%s revoked_tokens=%d", record.ClientID, record.UserID, revoked)
+		_ = m.saveAndNotifyLocked()
+		return nil, ErrInvalidGrant
+	}
+	if !m.tokenRequestResourceMatches(resource, record.Resource) {
 		return nil, ErrInvalidGrant
 	}
 
