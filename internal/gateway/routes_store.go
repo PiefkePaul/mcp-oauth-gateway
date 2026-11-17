@@ -242,6 +242,11 @@ func (s *Server) persistRoutesLocked(routes []config.Route) error {
 	if err := config.ValidateRoutes(cloned); err != nil {
 		return err
 	}
+	// Credentials in forward headers go to the encrypted auth store; the
+	// routes file only keeps a marker.
+	if err := s.sealForwardHeaderSecrets(cloned); err != nil {
+		return err
+	}
 	return s.installRoutesLocked(cloned, nil, true)
 }
 
@@ -323,7 +328,10 @@ func (s *Server) buildRouteRuntimeReusing(routes []config.Route, previous map[st
 				handler, closeFn, revalidate = bridge, bridge.Close, bridge.sweep
 			}
 		case "openapi":
-			handler, err = newOpenAPIBridge(route)
+			routeID := route.ID
+			handler, err = newOpenAPIBridge(route, func(name, template string) string {
+				return s.forwardHeaderTemplate(routeID, name, template)
+			})
 		default:
 			handler, err = s.newReverseProxy(route)
 		}

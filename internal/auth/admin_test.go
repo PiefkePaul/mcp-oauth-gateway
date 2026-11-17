@@ -90,10 +90,10 @@ func TestChangeUserPasswordRequiresCurrentPassword(t *testing.T) {
 	manager := newTestManager(t, "admin@example.com", "super-secret-password")
 	admin := manager.ListUsers()[0]
 
-	if err := manager.changeUserPassword(admin.ID, "wrong-password", "fresh-secret-password"); err == nil {
+	if err := manager.changeUserPassword(admin.ID, "wrong-password", "fresh-secret-password", ""); err == nil {
 		t.Fatalf("expected wrong current password to fail")
 	}
-	if err := manager.changeUserPassword(admin.ID, "super-secret-password", "fresh-secret-password"); err != nil {
+	if err := manager.changeUserPassword(admin.ID, "super-secret-password", "fresh-secret-password", ""); err != nil {
 		t.Fatalf("change password: %v", err)
 	}
 	if _, err := manager.authenticateUser("admin@example.com", "super-secret-password"); err == nil {

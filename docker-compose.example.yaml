@@ -3,8 +3,11 @@ services:
     image: your-dockerhub-user/mcp-oauth-gateway:latest
     container_name: mcp-oauth-gateway
     restart: unless-stopped
+    # Publish the port only if no reverse proxy on the "reverse-proxy" network
+    # reaches the container directly; otherwise drop this block so the gateway
+    # is not reachable around the proxy.
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     environment:
       MCP_GATEWAY_PUBLIC_BASE_URL: "https://mcp.example.com"
       MCP_GATEWAY_LISTEN_ADDR: ":8080"
@@ -21,6 +24,11 @@ services:
       # non-loopback redirect URI, for example in a private LAN test setup.
       # Prefer setting Open WebUI's WEBUI_URL to its public HTTPS URL instead.
       MCP_GATEWAY_ALLOWED_REDIRECT_ORIGINS: ""
+      # Reverse proxies whose X-Forwarded-For is trusted for login throttling.
+      # Empty means loopback and private networks. Behind Cloudflare also set
+      # MCP_GATEWAY_CLIENT_IP_HEADER to "CF-Connecting-IP".
+      MCP_GATEWAY_TRUSTED_PROXIES: ""
+      MCP_GATEWAY_CLIENT_IP_HEADER: ""
       # Optional: enable only if the gateway should create/start/stop Docker containers.
       # Mounting docker.sock grants this container host-level Docker control.
       MCP_GATEWAY_DOCKER_MANAGEMENT_ENABLED: "false"

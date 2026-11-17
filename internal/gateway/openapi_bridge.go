@@ -33,6 +33,9 @@ type openAPIBridge struct {
 	operationByName  map[string]openAPIOperation
 	upstreamBaseURL  *url.URL
 	responseByteSize int64
+	// resolveHeader returns the real template of a forward header whose
+	// value is kept in the auth store; nil leaves templates as they are.
+	resolveHeader func(name, template string) string
 }
 
 type openAPIOperation struct {
@@ -63,7 +66,7 @@ type openAPIRequestBody struct {
 	Schema      map[string]any
 }
 
-func newOpenAPIBridge(route config.Route) (http.Handler, error) {
+func newOpenAPIBridge(route config.Route, resolveHeader func(name, template string) string) (http.Handler, error) {
 	if route.OpenAPI == nil {
 		return nil, fmt.Errorf("route %q openapi config is required", route.ID)
 	}
@@ -103,6 +106,7 @@ func newOpenAPIBridge(route config.Route) (http.Handler, error) {
 		operationByName:  byName,
 		upstreamBaseURL:  baseURL,
 		responseByteSize: maxOpenAPIResponseBytes,
+		resolveHeader:    resolveHeader,
 	}, nil
 }
 
@@ -357,6 +361,9 @@ func (b *openAPIBridge) buildHTTPRequest(ctx context.Context, operation openAPIO
 
 	if identity := auth.IdentityFromContext(ctx); identity != nil {
 		for headerName, templateValue := range b.route.HeaderTemplates() {
+			if b.resolveHeader != nil {
+				templateValue = b.resolveHeader(headerName, templateValue)
+			}
 			value := expandHeaderTemplate(templateValue, b.route, identity)
 			if strings.TrimSpace(value) != "" {
 				headers.Set(headerName, value)

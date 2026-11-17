@@ -58,6 +58,7 @@ func New(cfg *config.Config, authManager *auth.Manager) (*Server, error) {
 	if err := server.replaceRoutes(cfg.Routes); err != nil {
 		return nil, err
 	}
+	server.sealStoredForwardHeaders()
 	authManager.SetResourceAccessChecker(server.authorizeResourceAccess)
 	authManager.SetChangeListener(server.revalidateSessions)
 
@@ -69,6 +70,8 @@ func Run(cfg *config.Config) error {
 		StorePath:              cfg.Auth.StorePath,
 		MasterKey:              cfg.Auth.MasterKey,
 		AccessTokenTTL:         cfg.Auth.AccessTokenTTL,
+		TrustedProxies:         cfg.Auth.TrustedProxies,
+		ClientIPHeader:         cfg.Auth.ClientIPHeader,
 		RefreshTokenTTL:        cfg.Auth.RefreshTokenTTL,
 		RefreshTokenReuseGrace: cfg.Auth.RefreshTokenReuseGrace,
 		AuthorizationCodeTTL:   cfg.Auth.AuthorizationCodeTTL,
@@ -90,7 +93,7 @@ func Run(cfg *config.Config) error {
 	if err != nil {
 		return err
 	}
-	var httpHandler http.Handler = handler
+	var httpHandler http.Handler = securityHeadersMiddleware(cfg.PublicBaseURL, handler)
 	if cfg.AccessLog {
 		httpHandler = accessLogMiddleware(httpHandler)
 	}
@@ -116,7 +119,40 @@ func Run(cfg *config.Config) error {
 	return httpServer.ListenAndServe()
 }
 
+// maxAccountRequestBytes bounds request bodies of the OAuth and account
+// endpoints, which are reachable without authentication and only ever
+// carry small forms or JSON documents.
+const maxAccountRequestBytes = 1 << 20
+
+func limitsRequestBody(requestPath string) bool {
+	switch requestPath {
+	case "/register", "/authorize", "/token", "/account":
+		return true
+	}
+	return strings.HasPrefix(requestPath, "/account/") || strings.HasPrefix(requestPath, "/register/")
+}
+
+// securityHeadersMiddleware sets headers every response should carry. The
+// HTML pages add their own Content-Security-Policy.
+func securityHeadersMiddleware(publicBaseURL string, next http.Handler) http.Handler {
+	hsts := strings.HasPrefix(strings.ToLower(strings.TrimSpace(publicBaseURL)), "https://")
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		header := w.Header()
+		header.Set("X-Content-Type-Options", "nosniff")
+		header.Set("X-Frame-Options", "DENY")
+		header.Set("Referrer-Policy", "no-referrer")
+		if hsts {
+			header.Set("Strict-Transport-Security", "max-age=31536000")
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Body != nil && limitsRequestBody(r.URL.Path) {
+		r.Body = http.MaxBytesReader(w, r.Body, maxAccountRequestBytes)
+	}
+
 	switch r.URL.Path {
 	case "/":
 		s.handleIndex(w, r)
@@ -296,6 +332,8 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Upstream addresses name internal hosts; only admins get to see them.
+	showUpstream := s.requestIsAdmin(r)
 	routesSnapshot := s.routesSnapshot()
 	routes := make([]map[string]any, 0, len(routesSnapshot))
 	for i := range routesSnapshot {
@@ -311,8 +349,10 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 			"openapi_spec_url":                s.absoluteURL(route.PublicOpenAPISpecPath()),
 			"protected_resource_metadata_url": s.absoluteURL(route.ProtectedResourceMetadataPath()),
 			"scopes_supported":                route.ScopeList(),
-			"upstream":                        route.Upstream,
 			"health":                          healthJSON(s.health.get(route.ID)),
+		}
+		if showUpstream {
+			payload["upstream"] = route.Upstream
 		}
 		if strings.TrimSpace(route.ResourceDocumentation) != "" {
 			payload["resource_documentation"] = route.ResourceDocumentation
@@ -343,13 +383,20 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Public and unauthenticated: report liveness only, not how the gateway
+	// is set up.
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":              "ok",
-		"routes":              len(s.cfg.Routes),
-		"docker_management":   s.cfg.DockerManagement.Enabled,
-		"managed_deployments": len(s.managedDeploymentRoutes()),
-		"time":                time.Now().UTC().Format(time.RFC3339),
+		"status": "ok",
+		"routes": len(s.routesSnapshot()),
+		"time":   time.Now().UTC().Format(time.RFC3339),
 	})
+}
+
+// requestIsAdmin reports whether the request carries an admin's browser
+// session.
+func (s *Server) requestIsAdmin(r *http.Request) bool {
+	identity, err := s.authManager.CurrentIdentity(r)
+	return err == nil && identity != nil && identity.IsAdmin
 }
 
 func (s *Server) handleRouteInfo(w http.ResponseWriter, r *http.Request, route config.Route) {
@@ -380,8 +427,10 @@ func (s *Server) handleRouteInfo(w http.ResponseWriter, r *http.Request, route c
 		"authorization_server_url":        s.absoluteURL("/.well-known/oauth-authorization-server"),
 		"account_portal_url":              s.absoluteURL("/account"),
 		"scopes_supported":                route.ScopeList(),
-		"upstream":                        route.Upstream,
 		"health":                          healthJSON(s.health.get(route.ID)),
+	}
+	if s.requestIsAdmin(r) {
+		payload["upstream"] = route.Upstream
 	}
 	if strings.TrimSpace(route.ResourceDocumentation) != "" {
 		payload["resource_documentation"] = route.ResourceDocumentation
@@ -506,15 +555,21 @@ func (s *Server) newReverseProxy(route config.Route) (http.Handler, error) {
 			}
 
 			identity := auth.IdentityFromContext(pr.In.Context())
-			if identity != nil {
-				for headerName, templateValue := range route.HeaderTemplates() {
-					value := expandHeaderTemplate(templateValue, route, identity)
-					if strings.TrimSpace(value) == "" {
-						pr.Out.Header.Del(headerName)
-						continue
-					}
-					pr.Out.Header.Set(headerName, value)
+			for headerName, templateValue := range route.HeaderTemplates() {
+				templateValue = s.forwardHeaderTemplate(route.ID, headerName, templateValue)
+				// Without an identity (health checks, anonymous OpenAPI
+				// specs) only headers that do not name the user are sent,
+				// e.g. a static upstream API key.
+				if identity == nil && headerTemplateNeedsIdentity(templateValue) {
+					pr.Out.Header.Del(headerName)
+					continue
 				}
+				value := expandHeaderTemplate(templateValue, route, identity)
+				if strings.TrimSpace(value) == "" {
+					pr.Out.Header.Del(headerName)
+					continue
+				}
+				pr.Out.Header.Set(headerName, value)
 			}
 			if upstreamBearer, ok := s.authManager.ResolveRouteUpstreamBearer(route.ID, identity); ok {
 				pr.Out.Header.Set("Authorization", "Bearer "+upstreamBearer)
@@ -604,13 +659,34 @@ func joinRawQuery(baseQuery, requestQuery string) string {
 }
 
 func expandHeaderTemplate(templateValue string, route config.Route, identity *auth.Identity) string {
+	email, userID := "", ""
+	if identity != nil {
+		email, userID = identity.Email, identity.UserID
+	}
 	replacer := strings.NewReplacer(
-		"{email}", identity.Email,
+		"{email}", email,
 		"{route_id}", route.ID,
 		"{route_path}", route.NormalizedPathPrefix,
-		"{user_id}", identity.UserID,
+		"{user_id}", userID,
 	)
 	return replacer.Replace(templateValue)
+}
+
+// headerTemplateNeedsIdentity reports whether a forward header names the
+// calling user and therefore cannot be filled without one.
+func headerTemplateNeedsIdentity(templateValue string) bool {
+	return strings.Contains(templateValue, "{email}") || strings.Contains(templateValue, "{user_id}")
+}
+
+// routeAuthDependsOnUser reports whether the route has forward headers that
+// name the user, so an anonymous request may lack what the upstream needs.
+func routeAuthDependsOnUser(route config.Route) bool {
+	for _, templateValue := range route.ForwardHeaders {
+		if headerTemplateNeedsIdentity(templateValue) {
+			return true
+		}
+	}
+	return false
 }
 
 func bearerToken(headerValue string) (string, error) {

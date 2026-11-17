@@ -152,7 +152,7 @@ func TestAuthorizeAllowsClientsWithoutResourceParameter(t *testing.T) {
 		t.Fatalf("register client: %v", err)
 	}
 
-	params, _, err := manager.parseAuthorizeRequest(url.Values{
+	params, _, err := manager.parseAuthorizeRequest(true, url.Values{
 		"client_id":             {client.ID},
 		"redirect_uri":          {"http://127.0.0.1:51066/callback"},
 		"response_type":         {"code"},
@@ -226,6 +226,22 @@ func TestAuthorizePreflightLazilyAcceptsUnregisteredOpenWebUIClient(t *testing.T
 		t.Fatalf("expected login redirect for lazily accepted client, got %d with body %q", rec.Code, rec.Body.String())
 	}
 
+	if _, err := manager.lookupClient("Hhds3gZ089JVr1z3tLlNJEmyCmf0rPTK"); err == nil {
+		t.Fatalf("an anonymous preflight must not store a client")
+	}
+
+	// The same request from a signed-in user makes the client permanent.
+	req = httptest.NewRequest(http.MethodGet, "https://mcp.example.com/authorize?"+values.Encode(), nil)
+	req.AddCookie(sessionCookieFor(t, manager, "admin@example.com"))
+	rec = httptest.NewRecorder()
+	manager.HandleAuthorize(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected the consent page for a signed-in user, got %d with body %q", rec.Code, rec.Body.String())
+	}
+	if body := rec.Body.String(); !strings.Contains(body, "chat.example.com") {
+		t.Fatalf("the consent page must name the host that receives the code")
+	}
+
 	client, err := manager.lookupClient("Hhds3gZ089JVr1z3tLlNJEmyCmf0rPTK")
 	if err != nil {
 		t.Fatalf("expected lazy client to be stored: %v", err)
@@ -243,7 +259,7 @@ func TestLazyAuthorizeClientAdoptsSecretDuringCodeExchange(t *testing.T) {
 	sum := sha256.Sum256([]byte(verifier))
 	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
 
-	params, client, err := manager.parseAuthorizeRequest(url.Values{
+	params, client, err := manager.parseAuthorizeRequest(true, url.Values{
 		"client_id":             {clientID},
 		"redirect_uri":          {redirectURI},
 		"response_type":         {"code"},
