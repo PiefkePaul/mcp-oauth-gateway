@@ -1,6 +1,6 @@
 # MCP OAuth Gateway
 
-[![Test](https://github.com/PiefkePaul/mcp-oauth-gateway/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/PiefkePaul/mcp-oauth-gateway/actions/workflows/test.yml)
+[![Test](https://git.scholz-cloud.de/Scholz/mcp-oauth-gateway/actions/workflows/test.yml/badge.svg?branch=main)](https://git.scholz-cloud.de/Scholz/mcp-oauth-gateway/actions?workflow=test.yml)
 
 Ein zentraler OAuth-geschuetzter Reverse-Proxy fuer mehrere HTTP-basierte MCP-Server hinter einer gemeinsamen Domain.
 
