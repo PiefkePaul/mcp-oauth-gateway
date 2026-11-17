@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -155,7 +156,13 @@ func TestCSRFRejectsForeignOrigins(t *testing.T) {
 		{"direct LAN origin", "192.168.1.5:40013", map[string]string{"Origin": "http://192.168.1.5:40013"}, true},
 		{"foreign origin", "mcp.example.com", map[string]string{"Origin": "https://evil.example"}, false},
 		{"sibling subdomain", "mcp.example.com", map[string]string{"Origin": "https://other.example.com"}, false},
-		{"null origin", "mcp.example.com", map[string]string{"Origin": "null"}, false},
+		// What browsers really send for the gateway's own forms: the pages
+		// set "Referrer-Policy: no-referrer", which turns Origin into null.
+		{"own form in a browser", "mcp.example.com", map[string]string{"Origin": "null", "Sec-Fetch-Site": "same-origin"}, true},
+		{"own form without fetch metadata", "192.168.1.5:40013", map[string]string{"Origin": "null"}, true},
+		{"null origin from another site", "mcp.example.com", map[string]string{"Origin": "null", "Sec-Fetch-Site": "cross-site"}, false},
+		{"null origin from a sibling subdomain", "mcp.example.com", map[string]string{"Origin": "null", "Sec-Fetch-Site": "same-site"}, false},
+		{"foreign origin with cross-site fetch metadata", "mcp.example.com", map[string]string{"Origin": "https://evil.example", "Sec-Fetch-Site": "cross-site"}, false},
 		{"cross-site fetch metadata", "mcp.example.com", map[string]string{"Sec-Fetch-Site": "cross-site"}, false},
 		{"same-site fetch metadata", "mcp.example.com", map[string]string{"Sec-Fetch-Site": "same-site"}, false},
 		{"same-origin fetch metadata", "mcp.example.com", map[string]string{"Sec-Fetch-Site": "same-origin", "Origin": "https://mcp.example.com"}, true},
@@ -226,6 +233,29 @@ func TestClientRegistryIsBounded(t *testing.T) {
 	}
 	if count != 2 {
 		t.Fatalf("expected only the in-use and the new client to remain, got %d", count)
+	}
+}
+
+func TestClientMetadataTotalSizeIsBounded(t *testing.T) {
+	manager := newTestManager(t, "admin@example.com", "super-secret-password")
+
+	// Every field is within its own limit, but together they are too much.
+	redirectURIs := make([]string, 0, maxClientRedirectURIs)
+	for i := 0; i < maxClientRedirectURIs; i++ {
+		redirectURIs = append(redirectURIs, fmt.Sprintf("https://client.example/cb/%d/%s", i, strings.Repeat("a", 1000)))
+	}
+	if _, err := manager.normalizeClientMetadata(clientMetadataRequest{ClientName: "Big", RedirectURIs: redirectURIs}); err == nil {
+		t.Fatalf("expected client metadata above %d bytes in total to be rejected", maxClientMetadataTotalBytes)
+	}
+
+	ordinary := clientMetadataRequest{
+		ClientName:   "Claude",
+		RedirectURIs: []string{"https://claude.ai/api/mcp/auth_callback", "http://localhost:33418/callback"},
+		ClientURI:    "https://claude.ai",
+		Contacts:     []string{"support@example.com"},
+	}
+	if _, err := manager.normalizeClientMetadata(ordinary); err != nil {
+		t.Fatalf("an ordinary client registration must still pass: %v", err)
 	}
 }
 
