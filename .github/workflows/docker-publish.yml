@@ -3,7 +3,8 @@ name: Build and publish Docker image
 on:
   push:
     branches: [main]
-  pull_request:
+  # No pull_request trigger: the repo is public and the build runs on a NAS
+  # slot, which only takes trusted runs (push to main, manual dispatch).
   workflow_dispatch:
 
 # Gitea (git.scholz-cloud.de) is the primary home of this repo, GitHub is a
@@ -23,14 +24,13 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Gitea only (gitea:3000 is not reachable from GitHub). Pull requests and
-  # other branches only build. Pushes to main also publish the tags latest and
-  # sha-<short>.
+  # Gitea only (gitea:3000 is not reachable from GitHub). Pushes to main publish
+  # the tags latest and sha-<short>. A manual run on another branch only builds.
   build:
     if: github.server_url != 'https://github.com'
     # Needs a Docker daemon. The job containers of gitea-nas-1 (ubuntu-latest)
     # have no Docker socket, the CI manager slots (slot-nas-*) do.
-    runs-on: ${{ fromJSON(vars.CI_RUNNER_LINUX || '["self-hosted","nas","mcp-oauth-gateway"]') }}
+    runs-on: [self-hosted, nas, mcp-oauth-gateway]
     permissions:
       contents: read
     steps:
@@ -51,8 +51,8 @@ jobs:
               http = true
               insecure = true
 
-      # Fails early, also on pull requests, if the runner cannot reach the
-      # registry inside the LAN (401 = up, login required).
+      # Fails early if the slot cannot reach the registry inside the LAN
+      # (401 = up, login required).
       - name: Check Gitea registry is reachable
         run: |
           code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' "http://$REGISTRY/v2/" || true)
