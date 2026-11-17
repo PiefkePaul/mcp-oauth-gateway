@@ -37,7 +37,6 @@ func TestAccessLogMiddlewareStreamsSSEThroughReverseProxy(t *testing.T) {
 		}
 	}))
 	defer upstream.Close()
-	defer close(release)
 
 	target, err := url.Parse(upstream.URL)
 	if err != nil {
@@ -45,6 +44,7 @@ func TestAccessLogMiddlewareStreamsSSEThroughReverseProxy(t *testing.T) {
 	}
 	gateway := httptest.NewServer(accessLogMiddleware(httputil.NewSingleHostReverseProxy(target)))
 	defer gateway.Close()
+	defer close(release)
 
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Get(gateway.URL + "/mcp")
