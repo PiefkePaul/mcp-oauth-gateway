@@ -36,7 +36,7 @@ func loginRequest(email, password, remoteAddr string) *http.Request {
 	form := url.Values{"email": {email}, "password": {password}, "csrf_token": {"csrf"}}
 	req := httptest.NewRequest(http.MethodPost, "https://mcp.example.com/account/login", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.AddCookie(&http.Cookie{Name: csrfCookieName, Value: "csrf"})
+	req.AddCookie(&http.Cookie{Name: "__Host-" + csrfCookieName, Value: "csrf"})
 	req.RemoteAddr = remoteAddr
 	return req
 }
@@ -138,7 +138,7 @@ func TestCSRFRejectsForeignOrigins(t *testing.T) {
 		form := url.Values{"csrf_token": {"csrf"}}
 		req := httptest.NewRequest(http.MethodPost, "http://"+host+"/account/logout", strings.NewReader(form.Encode()))
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		req.AddCookie(&http.Cookie{Name: csrfCookieName, Value: "csrf"})
+		req.AddCookie(&http.Cookie{Name: manager.csrfCookieNameFor(req), Value: "csrf"})
 		for key, value := range headers {
 			req.Header.Set(key, value)
 		}

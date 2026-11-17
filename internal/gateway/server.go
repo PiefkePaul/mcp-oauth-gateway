@@ -60,6 +60,7 @@ func New(cfg *config.Config, authManager *auth.Manager) (*Server, error) {
 	}
 	server.sealStoredForwardHeaders()
 	authManager.SetResourceAccessChecker(server.authorizeResourceAccess)
+	authManager.SetResourceLister(server.listAccessibleResources)
 	authManager.SetChangeListener(server.revalidateSessions)
 
 	return server, nil
@@ -84,6 +85,8 @@ func Run(cfg *config.Config) error {
 		AllowedEmails:          cfg.AllowedEmails,
 		AllowedEmailDomains:    cfg.AllowedEmailDomains,
 		AllowedRedirectOrigins: cfg.Auth.AllowedRedirectOrigins,
+		AllowUnboundTokens:     cfg.Auth.AllowUnboundTokens,
+		LazyClientRegistration: cfg.Auth.LazyClientRegistration,
 	})
 	if err != nil {
 		return err
