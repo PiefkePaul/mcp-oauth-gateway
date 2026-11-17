@@ -3,12 +3,11 @@ name: Build and publish Docker image
 on:
   push:
     branches: [main]
-    tags: ["v*.*.*", "*.*.*"]
   pull_request:
   workflow_dispatch:
 
-# Gitea (git.scholz-cloud.de) is the primary home of this repo, GitHub is only
-# a push mirror. The image goes to the Gitea container registry on the NAS and
+# Gitea (git.scholz-cloud.de) is the primary home of this repo, GitHub is a
+# two-way mirror (git-sync). The image goes to the Gitea container registry on the NAS and
 # is pulled as git.scholz-cloud.de/piefkepaul/mcp-oauth-gateway. The runner
 # pushes inside the LAN as plain http (gitea:3000): the public name runs
 # through Cloudflare, which rejects request bodies over 100 MB.
@@ -24,10 +23,11 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Pull requests and other branches only build. Pushes to main also publish
-  # the tags latest and sha-<short>.
+  # Gitea only (gitea:3000 is not reachable from GitHub). Pull requests and
+  # other branches only build. Pushes to main also publish the tags latest and
+  # sha-<short>.
   build:
-    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    if: github.server_url != 'https://github.com'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -48,6 +48,14 @@ jobs:
             [registry."gitea:3000"]
               http = true
               insecure = true
+
+      # Fails early, also on pull requests, if the runner cannot reach the
+      # registry inside the LAN (401 = up, login required).
+      - name: Check Gitea registry is reachable
+        run: |
+          code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' "http://$REGISTRY/v2/" || true)
+          echo "http://$REGISTRY/v2/ -> HTTP $code"
+          [ "$code" = 401 ] || [ "$code" = 200 ]
 
       - name: Log in to Gitea registry
         if: github.ref == 'refs/heads/main'
@@ -71,11 +79,10 @@ jobs:
             ${{ env.IMAGE }}:latest
             ${{ env.IMAGE }}:sha-${{ steps.sha.outputs.short }}
 
-  # Docker Hub copy with the historical tags. Only makes sense on GitHub, where
-  # Actions are switched off since the move to Gitea; kept for the case that
-  # the mirror is ever used for builds again.
+  # Docker Hub copy with the historical tags. GitHub only, and there only on
+  # pushes to main.
   dockerhub:
-    if: github.server_url == 'https://github.com' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+    if: github.server_url == 'https://github.com' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -95,26 +102,16 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # A short-SHA tag on every commit, latest/beta/openwebui-test floating
-      # tags on every push to main, and a version tag when a version git tag
-      # (v1.2.3 or 1.2.3) is pushed.
+      # The tags the image carried so far: a short-SHA tag plus the floating
+      # tags latest/beta/openwebui-test.
       - name: Compute image tags
         id: tags
         env:
           IMAGE: piefkepaul/mcp-oauth-gateway
-          GITHUB_REF: ${{ github.ref }}
         run: |
           set -euo pipefail
           sha_short=$(git rev-parse --short=7 HEAD)
-          tags="$IMAGE:$sha_short"
-          if [[ "$GITHUB_REF" == refs/heads/main ]]; then
-            tags="$tags,$IMAGE:latest,$IMAGE:beta,$IMAGE:openwebui-test"
-          elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            version="${GITHUB_REF#refs/tags/}"
-            version="${version#v}"
-            tags="$tags,$IMAGE:$version"
-          fi
-          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          echo "tags=$IMAGE:$sha_short,$IMAGE:latest,$IMAGE:beta,$IMAGE:openwebui-test" >> "$GITHUB_OUTPUT"
 
       - name: Build and push
         uses: docker/build-push-action@v7
