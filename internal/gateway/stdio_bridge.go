@@ -299,7 +299,7 @@ func (b *stdioBridge) acquireSession(requestedID string, identity *auth.Identity
 	// would otherwise start an uninitialized child process that is never
 	// cleaned up.
 	if requestedID == "" && !forceNew {
-		return nil, fmt.Errorf("missing %s header; send initialize first", stdioSessionHeader)
+		return nil, fmt.Errorf("%w: missing %s header; send initialize first", errStdioSessionRequired, stdioSessionHeader)
 	}
 
 	if err := b.makeRoomLocked(owner); err != nil {

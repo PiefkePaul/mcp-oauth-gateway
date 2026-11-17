@@ -83,8 +83,8 @@ func (s *Server) checkRoute(ctx context.Context, routeID string) routeHealth {
 	ctx, cancel := context.WithTimeout(ctx, healthCheckTimeout)
 	defer cancel()
 
-	// No identity: the probe uses the route's global upstream bearer, like
-	// an anonymous OpenAPI spec request. Its session is closed right after.
+	// No identity: the probe uses the route's global upstream bearer only.
+	// Its session is closed right after.
 	caller := newMCPRouteCaller(runtime.Route, runtime.Handler, nil, "")
 	start := time.Now()
 	tools, err := caller.listTools(ctx)

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -360,7 +361,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		routes = append(routes, payload)
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	payload := map[string]any{
 		"service":                           "mcp-oauth-gateway",
 		"public_base_url":                   s.baseURL(r),
 		"authorization_server_metadata_url": s.absoluteURL("/.well-known/oauth-authorization-server"),
@@ -371,9 +372,13 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		"account_portal_url":                s.absoluteURL("/account"),
 		"admin_dashboard_url":               s.absoluteURL("/admin"),
 		"self_signup_enabled":               s.cfg.AllowSelfSignup,
-		"bootstrap_user_configured":         s.cfg.BootstrapEmail != "",
 		"routes":                            routes,
-	})
+	}
+	// How the gateway was set up is nobody's business but the admins'.
+	if showUpstream {
+		payload["bootstrap_user_configured"] = s.cfg.BootstrapEmail != ""
+	}
+	writeJSON(w, http.StatusOK, payload)
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -464,6 +469,16 @@ func (s *Server) handleGatewayProtectedResourceMetadata(w http.ResponseWriter, r
 }
 
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, route config.Route, handler http.Handler) {
+	// Checked before authentication, so the answer is the same for everyone
+	// and nothing but the MCP path and its clean children reaches a handler.
+	if !proxyPathAllowed(r.URL.Path, route.PublicMCPPath()) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error":             "invalid_path",
+			"error_description": "the request path is not a valid path below this MCP endpoint",
+		})
+		return
+	}
+
 	identity, ok := s.authenticateRouteBearer(w, r, route)
 	if !ok {
 		return
@@ -557,8 +572,8 @@ func (s *Server) newReverseProxy(route config.Route) (http.Handler, error) {
 			identity := auth.IdentityFromContext(pr.In.Context())
 			for headerName, templateValue := range route.HeaderTemplates() {
 				templateValue = s.forwardHeaderTemplate(route.ID, headerName, templateValue)
-				// Without an identity (health checks, anonymous OpenAPI
-				// specs) only headers that do not name the user are sent,
+				// Without an identity (health checks) only headers
+				// that do not name the user are sent,
 				// e.g. a static upstream API key.
 				if identity == nil && headerTemplateNeedsIdentity(templateValue) {
 					pr.Out.Header.Del(headerName)
@@ -619,8 +634,69 @@ func (s *Server) rewriteUpstreamUnauthorized(route config.Route, resp *http.Resp
 	return nil
 }
 
+// maxPathUnescapeRounds bounds how often a path segment is unescaped again
+// when looking for dot segments an upstream might decode a second time.
+const maxPathUnescapeRounds = 3
+
+// proxyPathAllowed reports whether requestPath (already decoded once by
+// net/http) is the route's public MCP path or a clean path below it. The
+// upstream is reached with the gateway's own credentials, so a caller must
+// not be able to steer the request to other paths on the upstream host with
+// "..", empty segments, backslashes or encoded variants of them.
+func proxyPathAllowed(requestPath, publicBasePath string) bool {
+	if !matchesExactOrChildPath(requestPath, publicBasePath) {
+		return false
+	}
+	for i := 0; i < len(requestPath); i++ {
+		if c := requestPath[i]; c < 0x20 || c == 0x7f || c == '\\' {
+			return false
+		}
+	}
+	// One trailing slash is harmless and some clients send it.
+	trimmed := requestPath
+	if len(trimmed) > 1 && strings.HasSuffix(trimmed, "/") {
+		trimmed = strings.TrimSuffix(trimmed, "/")
+	}
+	if path.Clean(trimmed) != trimmed {
+		return false
+	}
+	for _, segment := range strings.Split(strings.TrimPrefix(trimmed, publicBasePath), "/") {
+		if !proxyPathSegmentAllowed(segment) {
+			return false
+		}
+	}
+	return true
+}
+
+// proxyPathSegmentAllowed rejects segments that are dot segments or path
+// separators once decoded again, and dot segments carrying path parameters
+// ("..;x"), which some servers resolve like "..".
+func proxyPathSegmentAllowed(segment string) bool {
+	for round := 0; round <= maxPathUnescapeRounds; round++ {
+		name, _, _ := strings.Cut(segment, ";")
+		if name == "." || name == ".." {
+			return false
+		}
+		if strings.ContainsAny(segment, "/\\") {
+			return false
+		}
+		decoded, err := url.PathUnescape(segment)
+		if err != nil || decoded == segment {
+			return true
+		}
+		segment = decoded
+	}
+	// Still changing after several rounds: nothing legitimate looks like this.
+	return false
+}
+
 func rewriteUpstreamPath(requestPath, publicBasePath, upstreamBasePath string) string {
 	if requestPath == publicBasePath {
+		return upstreamBasePath
+	}
+	// handleProxy rejects such paths already; never build an upstream path
+	// from one, whoever the caller is.
+	if !proxyPathAllowed(requestPath, publicBasePath) {
 		return upstreamBasePath
 	}
 	suffix := strings.TrimPrefix(requestPath, publicBasePath)
@@ -745,7 +821,7 @@ func accessLogMiddleware(next http.Handler) http.Handler {
 		log.Printf(
 			"access method=%s path=%q status=%d bytes=%d duration_ms=%d remote=%s user_agent=%q",
 			r.Method,
-			r.URL.RequestURI(),
+			accessLogURI(r.URL),
 			rec.status,
 			rec.bytes,
 			time.Since(start).Milliseconds(),
@@ -753,6 +829,58 @@ func accessLogMiddleware(next http.Handler) http.Handler {
 			r.UserAgent(),
 		)
 	})
+}
+
+// accessLogQueryValues lists the query parameters whose values may appear in
+// the access log. Everything else is logged by name only: authorization
+// codes, state, tokens and whatever a client passes to an upstream do not
+// belong in a log file (RFC 9700, sections 4.3 and 4.5).
+var accessLogQueryValues = map[string]bool{
+	"client_id":             true,
+	"code_challenge_method": true,
+	"format":                true,
+	"grant_type":            true,
+	"resource":              true,
+	"response_type":         true,
+	"scope":                 true,
+}
+
+const accessLogRedacted = "REDACTED"
+
+// accessLogURI renders the request target for the access log with the
+// values of all but a few harmless query parameters masked.
+func accessLogURI(u *url.URL) string {
+	if u == nil {
+		return ""
+	}
+	target := u.EscapedPath()
+	if target == "" {
+		target = "/"
+	}
+	if u.RawQuery == "" {
+		if u.ForceQuery {
+			target += "?"
+		}
+		return target
+	}
+	pairs := strings.Split(u.RawQuery, "&")
+	for i, pair := range pairs {
+		rawKey, _, hasValue := strings.Cut(pair, "=")
+		key, err := url.QueryUnescape(rawKey)
+		switch {
+		case err != nil:
+			// Not parseable, so nothing of it is known to be harmless.
+			pairs[i] = accessLogRedacted
+		case !hasValue:
+			// A bare word can be a value in its own right (e.g. "?<token>").
+			if !accessLogQueryValues[strings.ToLower(key)] {
+				pairs[i] = accessLogRedacted
+			}
+		case !accessLogQueryValues[strings.ToLower(key)]:
+			pairs[i] = rawKey + "=" + accessLogRedacted
+		}
+	}
+	return target + "?" + strings.Join(pairs, "&")
 }
 
 func wantsJSON(r *http.Request) bool {

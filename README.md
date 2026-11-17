@@ -71,7 +71,7 @@ Wichtig:
 - `MCP_GATEWAY_TRUSTED_PROXIES` (optional, IPs/CIDRs der Reverse Proxies; leer = Loopback und private Netze)
 - `MCP_GATEWAY_CLIENT_IP_HEADER` (optional, z.B. `CF-Connecting-IP` hinter Cloudflare)
 - `MCP_GATEWAY_REFRESH_TOKEN_REUSE_GRACE` (Standard `2m`)
-- `MCP_GATEWAY_ACCESS_LOG`
+- `MCP_GATEWAY_ACCESS_LOG` (Query-Werte werden bis auf wenige unkritische Parameter als `REDACTED` geloggt)
 - `MCP_GATEWAY_DOCKER_MANAGEMENT_ENABLED`
 - `MCP_GATEWAY_DOCKER_HOST`
 - `MCP_GATEWAY_DOCKER_NETWORKS`
@@ -279,8 +279,11 @@ Jede MCP-Route stellt zusaetzlich eine generierte OpenAPI-3.1-Spezifikation bere
 - `POST /<route>/openapi/tools/<operationId>` ruft das zugehoerige MCP-Tool per `tools/call` auf.
 - Tool-Calls sind mit derselben OAuth-/Bearer-Policy wie `/<route>/mcp` geschuetzt.
 - Der Adapter haelt pro Route und Agent eine initialisierte MCP-Session offen (bei STDIO-Routen also einen laufenden Prozess) und cached `tools/list` fuer 60 Sekunden. Unbekannte Tools loesen hoechstens alle 5 Sekunden einen Refresh aus. Sessions werden nach 10 Minuten Leerlauf, bei Routen-Aenderungen, ab 16 Sessions pro Nutzer und ab 256 Sessions insgesamt (jeweils die am laengsten unbenutzte) geschlossen. Mit `openapi_session_mode: per_request` (im Dashboard: "OpenAPI-Adapter Sessions") bekommt jeder OpenAPI-Aufruf eine eigene, danach geschlossene Session, z.B. fuer zustandsbehaftete Tools, deren Aufrufe sich nicht beeinflussen sollen. Lehnt der Upstream eine abgelaufene Session ab (HTTP 404/400), baut der Gateway einmalig eine neue Session auf und wiederholt den Aufruf.
-- Public-Routen veroeffentlichen die Spec im Katalog. Private oder restricted Routen geben die Spec nur fuer eingeloggte und berechtigte Nutzer aus.
+- Die Spec gibt es nur mit Anmeldung (Browser-Sitzung oder Bearer-Token) und nur fuer Nutzer, die die Route verwenden duerfen. Das gilt auch fuer Public-Routen: "public" heisst "alle angemeldeten Nutzer". Der Katalog verlinkt die Spec weiterhin. Clients wie Open WebUI brauchen dafuer einen Bearer-Token in der Verbindung.
+- Fehlertexte des Upstreams (HTTP-Antworten, Verbindungsfehler) stehen nur im Gateway-Log. Der Client bekommt eine allgemeine Meldung; JSON-RPC-Fehler des MCP-Servers selbst werden weitergegeben.
 - Open WebUI haengt beim Verbindungstest teils selbst `/openapi.json` an. Trage dort bevorzugt die Route-Basis ein, z.B. `https://mcp.example.com/legal`; der Gateway akzeptiert zur Kompatibilitaet aber auch `/<route>/openapi.json/openapi.json`.
+
+Unter `/<route>/mcp` leitet der Gateway nur den MCP-Pfad selbst und saubere Unterpfade weiter. Pfade mit `..`, `.`, leeren Segmenten, Backslashes oder kodierten Varianten davon beantwortet er mit `400 invalid_path`, ohne den Upstream zu kontaktieren.
 
 Damit koennen Clients, die MCP noch nicht sauber aufrufen, aber OpenAPI importieren koennen, dieselben Gateway-Routen verwenden.
 
