@@ -244,10 +244,17 @@ func (s *Server) persistRoutesLocked(routes []config.Route) error {
 	}
 	// Credentials in forward headers go to the encrypted auth store; the
 	// routes file only keeps a marker.
-	if err := s.sealForwardHeaderSecrets(cloned); err != nil {
+	seal, err := s.sealForwardHeaderSecrets(cloned)
+	if err != nil {
 		return err
 	}
-	return s.installRoutesLocked(cloned, nil, true)
+	if err := s.installRoutesLocked(cloned, nil, true); err != nil {
+		// The old routes stay active and need their stored values.
+		seal.rollback()
+		return err
+	}
+	seal.commit()
+	return nil
 }
 
 // installRoutesLocked swaps in routes. Routes whose runtime fingerprint is

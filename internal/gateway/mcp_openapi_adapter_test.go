@@ -77,7 +77,7 @@ done`
 	}
 }
 
-func TestMCPRouteOpenAPISpecEndpointRendersForPublicRoute(t *testing.T) {
+func TestMCPRouteOpenAPISpecEndpointRequiresSignInForPublicRoute(t *testing.T) {
 	script := `while IFS= read -r line; do
 case "$line" in
   *'"method":"initialize"'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"test","version":"1"}}}' ;;
@@ -99,8 +99,36 @@ done`
 		t.Fatalf("normalize route: %v", err)
 	}
 	server := newTestServerWithRoutes(t, []config.Route{route})
+	user, err := server.authManager.CreateUser("user@example.com", "super-secret-password", false)
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	token, _, err := server.authManager.CreatePersonalAccessToken(user.ID, "Open WebUI", 0)
+	if err != nil {
+		t.Fatalf("create bearer token: %v", err)
+	}
+
+	// "public" means every signed-in user: the spec is not served anonymously.
+	for _, authorization := range []string{"", "Bearer not-a-token"} {
+		anonymousReq := httptest.NewRequest(http.MethodGet, "https://mcp.example.com/hello/openapi.json", nil)
+		if authorization != "" {
+			anonymousReq.Header.Set("Authorization", authorization)
+		}
+		anonymousRec := httptest.NewRecorder()
+		server.ServeHTTP(anonymousRec, anonymousReq)
+		if anonymousRec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 for Authorization %q, got %d: %s", authorization, anonymousRec.Code, anonymousRec.Body.String())
+		}
+		if anonymousRec.Header().Get("WWW-Authenticate") == "" {
+			t.Fatalf("expected a WWW-Authenticate challenge for Authorization %q", authorization)
+		}
+		if strings.Contains(anonymousRec.Body.String(), "/openapi/tools/") {
+			t.Fatalf("anonymous response lists tools: %s", anonymousRec.Body.String())
+		}
+	}
 
 	req := httptest.NewRequest(http.MethodGet, "https://mcp.example.com/hello/openapi.json", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 	server.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -111,6 +139,7 @@ done`
 	}
 
 	openWebUIReq := httptest.NewRequest(http.MethodGet, "https://mcp.example.com/hello/openapi.json/openapi.json", nil)
+	openWebUIReq.Header.Set("Authorization", "Bearer "+token)
 	openWebUIRec := httptest.NewRecorder()
 	server.ServeHTTP(openWebUIRec, openWebUIReq)
 	if openWebUIRec.Code != http.StatusOK {

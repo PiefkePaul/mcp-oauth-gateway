@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -105,24 +106,25 @@ func (s *Server) handleRouteOpenAPISpec(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
+	// The spec lists every tool of the route with its schema, and building it
+	// opens an MCP session with the gateway's upstream credentials. It is
+	// therefore never served anonymously: access mode "public" means every
+	// signed-in user, not everyone.
 	identity, _ := s.authManager.CurrentIdentity(r)
 	if identity == nil {
 		if token, err := bearerToken(r.Header.Get("Authorization")); err == nil {
 			resourceURL := s.absoluteURL(route.PublicMCPPath())
 			if tokenIdentity, err := s.authManager.ValidateAccessToken(token, resourceURL); err == nil {
 				identity = tokenIdentity
-			} else if route.Access.IsPrivate() || route.Access.EffectiveMode() != "public" {
-				s.writeChallenge(w, r, route)
-				return
 			}
 		}
 	}
-	if identity != nil && !routeAccessAllowed(route, identity) {
-		http.Error(w, "you are not allowed to view this MCP OpenAPI spec", http.StatusForbidden)
+	if identity == nil {
+		s.writeChallenge(w, r, route)
 		return
 	}
-	if identity == nil && (route.Access.IsPrivate() || route.Access.EffectiveMode() != "public") {
-		s.writeChallenge(w, r, route)
+	if !routeAccessAllowed(route, identity) {
+		http.Error(w, "you are not allowed to view this MCP OpenAPI spec", http.StatusForbidden)
 		return
 	}
 
@@ -135,7 +137,7 @@ func (s *Server) handleRouteOpenAPISpec(w http.ResponseWriter, r *http.Request, 
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]any{
 			"error":             "mcp_tools_list_failed",
-			"error_description": err.Error(),
+			"error_description": s.publicMCPErrorDescription(route, "tools/list", err),
 		})
 		return
 	}
@@ -195,7 +197,7 @@ func (s *Server) handleRouteOpenAPIToolCall(w http.ResponseWriter, r *http.Reque
 	case listErr != nil:
 		writeJSON(w, http.StatusBadGateway, map[string]any{
 			"error":             "mcp_tools_list_failed",
-			"error_description": listErr.Error(),
+			"error_description": s.publicMCPErrorDescription(route, "tools/list", listErr),
 		})
 	case toolMissing:
 		writeJSON(w, http.StatusNotFound, map[string]any{
@@ -205,11 +207,28 @@ func (s *Server) handleRouteOpenAPIToolCall(w http.ResponseWriter, r *http.Reque
 	case callErr != nil:
 		writeJSON(w, http.StatusBadGateway, map[string]any{
 			"error":             "mcp_tool_call_failed",
-			"error_description": callErr.Error(),
+			"error_description": s.publicMCPErrorDescription(route, "tools/call", callErr),
 		})
 	default:
 		writeJSON(w, http.StatusOK, result)
 	}
+}
+
+// publicMCPErrorDescription is what a client of the OpenAPI adapter gets to
+// read about a failed MCP call. Errors the MCP server itself returned over
+// JSON-RPC are meant for the caller and passed on. Everything else (HTTP
+// bodies of the upstream, transport and bridge errors) can name internal
+// hosts, paths or commands, so it only goes to the log.
+func (s *Server) publicMCPErrorDescription(route config.Route, method string, err error) string {
+	var rpcErr *mcpJSONRPCError
+	if errors.As(err, &rpcErr) && !strings.HasPrefix(rpcErr.Message, stdioBridgeErrorPrefix) {
+		return rpcErr.Error()
+	}
+	log.Printf("openapi adapter %s failed route=%s err=%v", method, route.ID, err)
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return "the MCP server did not answer in time"
+	}
+	return "the MCP server could not process the request; the gateway log has the details"
 }
 
 func (s *Server) authenticateRouteBearer(w http.ResponseWriter, r *http.Request, route config.Route) (*auth.Identity, bool) {

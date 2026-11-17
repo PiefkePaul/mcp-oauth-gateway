@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"errors"
+	"log"
 	"net/http"
 	"strconv"
 	"time"
@@ -18,8 +19,10 @@ const (
 
 var (
 	errStdioSessionUnknown = errors.New("unknown stdio session")
-	errStdioAgentLimit     = errors.New("too many open sessions for this agent on this route; close one or retry later")
-	errStdioRouteLimit     = errors.New("this route has reached its session limit; retry later")
+	// errStdioSessionRequired is a client mistake and safe to explain.
+	errStdioSessionRequired = errors.New("stdio session required")
+	errStdioAgentLimit      = errors.New("too many open sessions for this agent on this route; close one or retry later")
+	errStdioRouteLimit      = errors.New("this route has reached its session limit; retry later")
 )
 
 // stdioBridgeOptions bound the number and lifetime of STDIO processes.
@@ -169,10 +172,18 @@ func writeStdioSessionError(w http.ResponseWriter, err error) {
 			"error":             "route_session_limit",
 			"error_description": err.Error(),
 		})
-	default:
+	case errors.Is(err, errStdioSessionRequired):
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"error":             "stdio_session_error",
 			"error_description": err.Error(),
+		})
+	default:
+		// Failing to start the process is the gateway's problem, and the
+		// error names the command and its paths: log it, do not send it.
+		log.Printf("stdio bridge session failed err=%v", err)
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"error":             "stdio_session_error",
+			"error_description": "the MCP server process could not be started; the gateway log has the details",
 		})
 	}
 }
