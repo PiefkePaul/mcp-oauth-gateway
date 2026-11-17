@@ -70,7 +70,7 @@ func (s *Server) sealStoredForwardHeaders() {
 		log.Printf("forward header credentials could not be moved to the auth store and stay in the routes file: %v", err)
 		return
 	}
-	log.Printf("forward header credentials were moved from the routes file to the encrypted auth store")
+	log.Printf("forward header credentials were moved from the routes file to the encrypted auth store; gateway versions without this store cannot use the rewritten file, so a rollback needs the previous routes file")
 }
 
 // forwardHeaderTemplate returns the template to send for a forward header:

@@ -39,6 +39,10 @@ const (
 	maxRegisteredClients    = 2000
 	maxClientRedirectURIs   = 10
 	maxClientMetadataLength = 2048
+	// All metadata of one client together. The store is rewritten as a
+	// whole on every change, so this times maxRegisteredClients bounds how
+	// large anonymous registrations can make it (about 16 MiB).
+	maxClientMetadataTotalBytes = 8 << 10
 	// Clients that never obtained a token may be dropped after this time
 	// to make room for new registrations.
 	unusedClientGracePeriod = time.Hour
@@ -1270,6 +1274,16 @@ func (m *Manager) normalizeClientMetadata(payload clientMetadataRequest) (*clien
 			return nil, fmt.Errorf("metadata URI must be absolute: %s", rawURI)
 		}
 	}
+	total := len(client.Name) + len(client.Scope) + len(client.SoftwareID) + len(client.SoftwareVersion) +
+		len(client.ClientURI) + len(client.LogoURI) + len(client.TOSURI) + len(client.PolicyURI) + len(client.JwksURI)
+	for _, values := range [][]string{client.RedirectURIs, client.Contacts} {
+		for _, value := range values {
+			total += len(value)
+		}
+	}
+	if total > maxClientMetadataTotalBytes {
+		return nil, fmt.Errorf("client metadata is too large; at most %d bytes in total are allowed", maxClientMetadataTotalBytes)
+	}
 	return client, nil
 }
 
@@ -2486,13 +2500,23 @@ func (m *Manager) validateCSRFCookie(r *http.Request) bool {
 // its own token, so the browser's own origin signals are checked as well.
 // Requests without these headers (non-browser clients) are left to the
 // token check.
+//
+// Sec-Fetch-Site decides when the browser sends it. The gateway's pages set
+// "Referrer-Policy: no-referrer", and under that policy browsers send
+// "Origin: null" with form posts, also for same-origin ones. So a null
+// Origin says nothing about where the form came from: with
+// "Sec-Fetch-Site: same-origin" it is the gateway's own form, and without
+// Sec-Fetch-Site (older browsers, plain HTTP on a LAN address) it is
+// treated like a missing Origin.
 func (m *Manager) requestFromOwnOrigin(r *http.Request) bool {
 	switch strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))) {
 	case "cross-site", "same-site":
 		return false
+	case "same-origin", "none":
+		return true
 	}
 	origin := strings.TrimSpace(r.Header.Get("Origin"))
-	if origin == "" {
+	if origin == "" || strings.EqualFold(origin, "null") {
 		return true
 	}
 	parsed, err := url.Parse(origin)
