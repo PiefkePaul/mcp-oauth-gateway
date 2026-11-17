@@ -8,8 +8,8 @@ on:
   workflow_dispatch:
 
 # Gitea (git.scholz-cloud.de) is the primary home of this repo, GitHub is a
-# two-way mirror (git-sync). The image goes to the Gitea container registry on the NAS and
-# is pulled as git.scholz-cloud.de/piefkepaul/mcp-oauth-gateway. The runner
+# two-way mirror (git-sync). The image goes to the Gitea container registry on
+# the NAS and is pulled as git.scholz-cloud.de/scholz/mcp-oauth-gateway. The runner
 # pushes inside the LAN as plain http (gitea:3000): the public name runs
 # through Cloudflare, which rejects request bodies over 100 MB.
 # Nothing deploys from here; deployments pin a fixed sha-<short> tag by hand.
@@ -17,7 +17,7 @@ env:
   # The build record would otherwise be uploaded as an Actions artifact.
   DOCKER_BUILD_RECORD_UPLOAD: false
   REGISTRY: gitea:3000
-  IMAGE: gitea:3000/piefkepaul/mcp-oauth-gateway
+  IMAGE: gitea:3000/scholz/mcp-oauth-gateway
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
