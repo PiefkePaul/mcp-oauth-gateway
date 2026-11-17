@@ -13,7 +13,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Gitea is the primary CI. On the GitHub mirror only pushes to main run.
   test:
+    if: github.server_url != 'https://github.com' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     steps:
       - name: Check out
