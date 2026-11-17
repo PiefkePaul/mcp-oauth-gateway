@@ -24,13 +24,13 @@ func adminTestSession(t *testing.T, server *Server) []*http.Cookie {
 	form := url.Values{"email": {"admin@example.com"}, "password": {"super-secret-password"}, "csrf_token": {adminTestCSRF}}
 	req := httptest.NewRequest(http.MethodPost, "https://mcp.example.com/account/login", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.AddCookie(&http.Cookie{Name: "mcp_gateway_csrf", Value: adminTestCSRF})
+	req.AddCookie(&http.Cookie{Name: "__Host-mcp_gateway_csrf", Value: adminTestCSRF})
 	rec := httptest.NewRecorder()
 	server.ServeHTTP(rec, req)
 	if rec.Code != http.StatusFound {
 		t.Fatalf("admin login: %d %s", rec.Code, rec.Body.String())
 	}
-	cookies := append(rec.Result().Cookies(), &http.Cookie{Name: "mcp_gateway_csrf", Value: adminTestCSRF})
+	cookies := append(rec.Result().Cookies(), &http.Cookie{Name: "__Host-mcp_gateway_csrf", Value: adminTestCSRF})
 	return cookies
 }
 

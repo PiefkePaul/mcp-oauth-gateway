@@ -61,6 +61,7 @@ func New(cfg *config.Config, authManager *auth.Manager) (*Server, error) {
 	}
 	server.sealStoredForwardHeaders()
 	authManager.SetResourceAccessChecker(server.authorizeResourceAccess)
+	authManager.SetResourceLister(server.listAccessibleResources)
 	authManager.SetChangeListener(server.revalidateSessions)
 
 	return server, nil
@@ -85,6 +86,8 @@ func Run(cfg *config.Config) error {
 		AllowedEmails:          cfg.AllowedEmails,
 		AllowedEmailDomains:    cfg.AllowedEmailDomains,
 		AllowedRedirectOrigins: cfg.Auth.AllowedRedirectOrigins,
+		AllowUnboundTokens:     cfg.Auth.AllowUnboundTokens,
+		LazyClientRegistration: cfg.Auth.LazyClientRegistration,
 	})
 	if err != nil {
 		return err
@@ -808,6 +811,20 @@ func (w *accessLogResponseWriter) Write(payload []byte) (int, error) {
 	n, err := w.ResponseWriter.Write(payload)
 	w.bytes += n
 	return n, err
+}
+
+// Flush passes flushes through, so streamed responses (SSE) reach the client
+// immediately instead of waiting in the server buffer until the upstream closes.
+func (w *accessLogResponseWriter) Flush() {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	_ = http.NewResponseController(w.ResponseWriter).Flush()
+}
+
+// Unwrap lets http.ResponseController reach the underlying writer.
+func (w *accessLogResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }
 
 func accessLogMiddleware(next http.Handler) http.Handler {

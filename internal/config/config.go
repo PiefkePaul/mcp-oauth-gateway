@@ -27,7 +27,7 @@ const (
 	defaultBuildMaxArtifactMB  = 100
 	defaultAccessTokenTTL      = time.Hour
 	defaultRefreshTokenTTL     = 30 * 24 * time.Hour
-	defaultRefreshReuseGrace   = 2 * time.Minute
+	defaultRefreshReuseGrace   = 30 * time.Second
 	defaultAuthorizationTTL    = 10 * time.Minute
 	defaultSessionTTL          = 30 * 24 * time.Hour
 	defaultAccountPortalTitle  = "MCP Gateway"
@@ -79,6 +79,12 @@ type AuthConfig struct {
 	AuthorizationCodeTTL   time.Duration
 	SessionTTL             time.Duration
 	AllowedRedirectOrigins []string
+	// AllowUnboundTokens lets OAuth tokens be valid on every route again
+	// instead of only on the MCP server they were issued for.
+	AllowUnboundTokens bool
+	// LazyClientRegistration is "off", "allowlist" or "open"; see the auth
+	// package.
+	LazyClientRegistration string
 	// TrustedProxies are the peers whose forwarding headers are believed
 	// when throttling by client address; empty means loopback and private
 	// networks.
@@ -211,6 +217,8 @@ func Load() (*Config, error) {
 			AuthorizationCodeTTL:   getDurationEnv("MCP_GATEWAY_AUTHORIZATION_CODE_TTL", defaultAuthorizationTTL),
 			SessionTTL:             getDurationEnv("MCP_GATEWAY_SESSION_TTL", defaultSessionTTL),
 			AllowedRedirectOrigins: parseCSVEnv("MCP_GATEWAY_ALLOWED_REDIRECT_ORIGINS"),
+			AllowUnboundTokens:     getBoolEnv("MCP_GATEWAY_ALLOW_UNBOUND_TOKENS", false),
+			LazyClientRegistration: getEnvOrDefault("MCP_GATEWAY_LAZY_CLIENT_REGISTRATION", "allowlist"),
 		},
 		DockerManagement: DockerManagementConfig{
 			Enabled:         getBoolEnv("MCP_GATEWAY_DOCKER_MANAGEMENT_ENABLED", false),

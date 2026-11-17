@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"github.com/PiefkePaul/mcp-oauth-gateway/internal/auth"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -200,9 +201,9 @@ func TestLoginRedirectStaysOnTheGateway(t *testing.T) {
 	server := newAdminSaveTestServer(t, nil)
 	adminTestSession(t, server) // creates the admin account
 	form := url.Values{"email": {"admin@example.com"}, "password": {"super-secret-password"}, "csrf_token": {"csrf"}, "next": {"//evil.example/x"}}
-	req := httptest.NewRequest(http.MethodPost, "/account/login", strings.NewReader(form.Encode()))
+	req := httptest.NewRequest(http.MethodPost, "https://mcp.example.com/account/login", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.AddCookie(&http.Cookie{Name: "mcp_gateway_csrf", Value: "csrf"})
+	req.AddCookie(&http.Cookie{Name: "__Host-mcp_gateway_csrf", Value: "csrf"})
 	rec := httptest.NewRecorder()
 	server.ServeHTTP(rec, req)
 	if rec.Code != http.StatusFound {
@@ -210,5 +211,31 @@ func TestLoginRedirectStaysOnTheGateway(t *testing.T) {
 	}
 	if location := rec.Header().Get("Location"); location != "/account" {
 		t.Fatalf("login must not redirect to another host, got %q", location)
+	}
+}
+
+func TestConsentChoiceListsOnlyAccessibleServers(t *testing.T) {
+	open := config.Route{ID: "legal", DisplayName: "Legal", PathPrefix: "/legal", Upstream: "http://127.0.0.1:1", UpstreamMCPPath: "/mcp"}
+	closed := config.Route{ID: "portainer", DisplayName: "Portainer", PathPrefix: "/portainer", Upstream: "http://127.0.0.1:1", UpstreamMCPPath: "/mcp",
+		Access: config.RouteAccess{Visibility: "private", Mode: "admin"}}
+	for _, route := range []*config.Route{&open, &closed} {
+		if err := config.NormalizeRoute(route); err != nil {
+			t.Fatalf("normalize route: %v", err)
+		}
+	}
+	server := newTestServerWithRoutes(t, []config.Route{open, closed})
+
+	user := server.listAccessibleResources(&auth.Identity{UserID: "u", Email: "user@example.com"})
+	if len(user) != 1 || user[0].URL != "https://mcp.example.com/legal/mcp" || user[0].Name != "Legal" {
+		t.Fatalf("a normal user must only be offered the public server, got %#v", user)
+	}
+	admin := server.listAccessibleResources(&auth.Identity{UserID: "a", Email: "admin@example.com", IsAdmin: true})
+	if len(admin) != 2 {
+		t.Fatalf("an admin must be offered both servers, got %#v", admin)
+	}
+	for _, option := range admin {
+		if err := server.authorizeResourceAccess(&auth.Identity{UserID: "a", IsAdmin: true}, option.URL); err != nil {
+			t.Fatalf("offered server %q must pass the access check: %v", option.URL, err)
+		}
 	}
 }
