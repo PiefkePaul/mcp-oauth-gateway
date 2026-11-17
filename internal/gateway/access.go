@@ -24,6 +24,26 @@ func (s *Server) authorizeResourceAccess(identity *auth.Identity, resource strin
 	return nil
 }
 
+// listAccessibleResources returns the MCP servers identity may use, for the
+// choice on the consent page when a client names no resource.
+func (s *Server) listAccessibleResources(identity *auth.Identity) []auth.ResourceOption {
+	options := []auth.ResourceOption{}
+	for _, route := range s.routesSnapshot() {
+		if !routeAccessAllowed(route, identity) {
+			continue
+		}
+		name := strings.TrimSpace(route.DisplayName)
+		if name == "" {
+			name = route.ID
+		}
+		options = append(options, auth.ResourceOption{URL: s.absoluteURL(route.PublicMCPPath()), Name: name})
+	}
+	slices.SortFunc(options, func(a, b auth.ResourceOption) int {
+		return strings.Compare(strings.ToLower(a.Name), strings.ToLower(b.Name))
+	})
+	return options
+}
+
 func (s *Server) isGatewayWideResource(resource string) bool {
 	baseURL := strings.TrimSpace(s.cfg.PublicBaseURL)
 	return baseURL != "" && normalizeAbsoluteURL(resource) == normalizeAbsoluteURL(baseURL)

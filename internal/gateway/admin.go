@@ -2654,7 +2654,7 @@ const adminDashboardTemplate = `
             </div>
 
             <div class="field" data-dyn-group="http openapi">
-              <label for="forward_headers">Forward Headers <span class="hint">(pro angemeldetem Nutzer, mit Platzhaltern wie <code>{email}</code>)</span></label>
+              <label for="forward_headers">Forward Headers <span class="hint">(pro angemeldetem Nutzer, mit Platzhaltern wie <code>{email}</code>. Werte von Headern wie <code>Authorization</code>, <code>*-Token</code> oder <code>*-Key</code> werden verschl&uuml;sselt gespeichert und danach nur noch als <code>{gateway-secret}</code> angezeigt; zum &Auml;ndern einfach den neuen Wert eintragen.)</span></label>
               <textarea id="forward_headers" name="forward_headers" class="mono" placeholder="X-MCP-User: {email}">{{.SelectedRoute.ForwardHeaders}}</textarea>
             </div>
 

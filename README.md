@@ -68,7 +68,11 @@ Wichtig:
 - `MCP_GATEWAY_ALLOWED_EMAILS`
 - `MCP_GATEWAY_ALLOWED_EMAIL_DOMAINS`
 - `MCP_GATEWAY_ALLOWED_REDIRECT_ORIGINS`
-- `MCP_GATEWAY_REFRESH_TOKEN_REUSE_GRACE` (Standard `2m`)
+- `MCP_GATEWAY_TRUSTED_PROXIES` (optional, IPs/CIDRs der Reverse Proxies; leer = Loopback und private Netze)
+- `MCP_GATEWAY_CLIENT_IP_HEADER` (optional, z.B. `CF-Connecting-IP` hinter Cloudflare)
+- `MCP_GATEWAY_REFRESH_TOKEN_REUSE_GRACE` (Standard `30s`)
+- `MCP_GATEWAY_ALLOW_UNBOUND_TOKENS` (Standard `false`)
+- `MCP_GATEWAY_LAZY_CLIENT_REGISTRATION` (`off`, `allowlist` oder `open`, Standard `allowlist`)
 - `MCP_GATEWAY_ACCESS_LOG`
 - `MCP_GATEWAY_DOCKER_MANAGEMENT_ENABLED`
 - `MCP_GATEWAY_DOCKER_HOST`
@@ -98,7 +102,33 @@ Der Master-Key muss genau 32 Bytes nach Base64-, Base64URL- oder Hex-Decoding er
 
 Jeder OAuth-Login (Authorization-Code-Flow) bildet einen eigenen Grant. Refresh-Tokens bleiben im selben Grant, sodass ein Client ueber Token-Rotation hinweg derselbe Agent bleibt. Zwei Rechner mit eigenem Login sind zwei Agenten; mehrere Prozesse, die sich einen Login teilen (z.B. mehrere Terminals auf einem Rechner), sind ein Agent. Jeder persoenliche Bearer-Token ist ein eigener Agent.
 
-Refresh-Tokens werden bei jeder Nutzung rotiert. Damit mehrere Prozesse mit demselben Login gleichzeitig erneuern koennen, bleibt ein rotiertes Refresh-Token fuer `MCP_GATEWAY_REFRESH_TOKEN_REUSE_GRACE` gueltig (Standard 2 Minuten). Jede Nutzung in diesem Fenster stellt neue Tokens im selben Grant aus; danach wird das alte Token abgelehnt.
+Refresh-Tokens werden bei jeder Nutzung rotiert. Damit mehrere Prozesse mit demselben Login gleichzeitig erneuern koennen, bleibt ein rotiertes Refresh-Token fuer `MCP_GATEWAY_REFRESH_TOKEN_REUSE_GRACE` gueltig (Standard 30 Sekunden). Jede Nutzung in diesem Fenster stellt neue Tokens im selben Grant aus. Wird ein rotiertes Token danach noch einmal vorgelegt, gilt es als gestohlen: der Gateway widerruft alle Tokens dieses Logins, und der Client muss sich neu anmelden (OAuth 2.1, Abschnitt 4.3.1). Dasselbe passiert, wenn ein Autorisierungscode ein zweites Mal eingeloest wird.
+
+### Bindung der Tokens an einen MCP-Server
+
+Ein OAuth-Token gilt nur fuer den einen MCP-Server, fuer den es ausgestellt wurde (`resource`-Parameter nach RFC 8707). Ein Token fuer `/camoufox/mcp` funktioniert nicht auf `/portainer/mcp`. Clients nach aktueller MCP-Spezifikation senden `resource` selbst. Sendet ein Client keinen oder nur die Basis-URL des Gateways, waehlt der Nutzer den Server auf der Zustimmungsseite aus. Bereits ausgestellte Tokens ohne Bindung werden nach dem Update abgelehnt, die betroffenen Clients melden sich einmal neu an.
+
+`MCP_GATEWAY_ALLOW_UNBOUND_TOKENS=true` stellt das alte Verhalten wieder her (Tokens ohne `resource` gelten auf allen Routen). Nur als Uebergang gedacht. Persoenliche Bearer-Tokens aus dem Konto-Portal gelten weiterhin fuer alle Routen des Nutzers.
+
+### Clients ohne Registrierung
+
+Eine unbekannte `client_id` am Authorization-Endpoint wird nur dann ohne vorherige Registrierung akzeptiert, wenn die Redirect-URI unter einer Origin aus `MCP_GATEWAY_ALLOWED_REDIRECT_ORIGINS` liegt (`MCP_GATEWAY_LAZY_CLIENT_REGISTRATION=allowlist`). Das betrifft Clients mit fest eingetragener Client-ID, z.B. Open WebUI: dessen Origin (auch eine HTTPS-Origin) muss dort stehen. Alle anderen Clients registrieren sich ueber `/register` und bekommen sonst `invalid_client`. `off` schaltet das Verhalten ganz ab, `open` akzeptiert wie frueher jede gueltige Redirect-URI.
+
+Redirect-URIs muessen HTTPS nutzen oder auf Loopback zeigen (`localhost`, `127.0.0.1`, `[::1]`), duerfen kein Fragment und keine Benutzerangabe enthalten. Bei Loopback-Redirects ist der Port frei, damit native Clients einen zufaelligen Port nutzen koennen. Autorisierungsantworten tragen den Parameter `iss` (RFC 9207).
+
+## Sicherheit
+
+Der Gateway steht typischerweise offen im Internet und schuetzt Server, die viel duerfen. Ein Admin-Konto kann ueber STDIO-Routen und Managed Deployments Programme starten; mit gemountetem `docker.sock` entspricht das Root auf dem Host. Entsprechend:
+
+- **Login-Schutz:** Nach 5 falschen Passwoertern fuer dasselbe Konto vom selben Client ist dieser 5 Minuten gesperrt. Dazu kommen Obergrenzen pro Konto (30 Fehlversuche in 15 Minuten, egal von wo) und pro Client (50). Fehlversuche, Sperren und erfolgreiche Logins stehen im Log (`login failed`, `login throttled`, `login succeeded`). Die Obergrenze pro Konto ist eine bewusste Abwaegung: wer die E-Mail-Adresse kennt, kann mit rund 2 Fehlversuchen pro Minute neue Logins dieses Kontos blockieren. Bestehende Sitzungen und Tokens laufen weiter. Wer das nicht hinnehmen will, schuetzt `/account/login` zusaetzlich am Reverse Proxy (z.B. Rate-Limit oder Zugriffsregel).
+- **Client-Adresse hinter Proxies:** Damit die Sperre den Angreifer trifft und nicht alle Nutzer, muss der Gateway die echte Client-Adresse kennen. `X-Forwarded-For` wird nur von vertrauenswuerdigen Proxies geglaubt (`MCP_GATEWAY_TRUSTED_PROXIES`, Standard: Loopback und private Netze). Hinter Cloudflare zusaetzlich `MCP_GATEWAY_CLIENT_IP_HEADER=CF-Connecting-IP` setzen, sonst zaehlt die Adresse des Cloudflare-Knotens. Der Standard ist weit gefasst: ist der Gateway auch direkt aus dem LAN oder ueber einen veroeffentlichten Port erreichbar, kann ein Client dort `X-Forwarded-For` frei setzen und die Sperre pro Adresse umgehen (die Sperre pro Konto greift weiter). In dem Fall `MCP_GATEWAY_TRUSTED_PROXIES` auf die Adresse des Reverse Proxy einschraenken.
+- **OAuth-Zustimmung:** Die Seite zeigt, an welchen Host der Zugang uebergeben wird. Der Client-Name ist frei waehlbar und kein Beweis. Unbekannte Ziele ablehnen.
+- **Client-Registrierung:** `/register` ist offen (das verlangt MCP), aber begrenzt: 30 Registrierungen pro Minute und Client, hoechstens 2000 Clients mit zusammen hoechstens 8 KiB Metadaten je Client; ungenutzte Clients werden bei Bedarf entfernt. Unbekannte Client-IDs an `/authorize` werden erst gespeichert, wenn ein Nutzer angemeldet ist.
+- **Sessions:** Eine Passwortaenderung meldet alle anderen Browser-Sessions ab, ein Admin-Reset alle. OAuth-Tokens und Bearer Tokens bleiben gueltig und werden unter "Geraete" bzw. "Bearer Tokens" widerrufen.
+- **Zugangsdaten in `forward_headers`:** Werte von Headern, deren Name `authorization`, `token`, `secret`, `password`, `key` oder `cookie` enthaelt, wandern beim Speichern und beim Start in den verschluesselten Auth-Store. In `routes.yaml`, im Export und im Dashboard steht dann nur `{gateway-secret}`. Wer eine `routes.yaml` mit diesem Marker auf einen Gateway mit anderem Auth-Store importiert, muss den Wert neu eintragen. **Vor dem ersten Start mit dieser Version** eine vollstaendige Kopie der `routes.yaml` sichern (nur fuer den Betreiber lesbar, sie enthaelt die Zugangsdaten im Klartext): aeltere Versionen kennen den Marker nicht und wuerden ihn woertlich an den Upstream senden, ein Rollback braucht also die alte Datei.
+- **STDIO-Prozesse** erben die Umgebung des Gateways ohne dessen eigene `MCP_GATEWAY_*`-Variablen, also ohne Master-Key und Bootstrap-Passwort.
+- **Oeffentliche Endpunkte** (`/?format=json`, `/<route>`, `/healthz`) nennen keine Upstream-Adressen und keine Betriebsdetails mehr; Admins sehen die Upstream-Adresse weiterhin.
+- **Empfehlungen fuer den Betrieb:** `docker.sock` nur mounten, wenn Managed Deployments wirklich genutzt werden. Den Container-Port nicht zusaetzlich am Host veroeffentlichen, wenn ein Reverse Proxy davor steht. Upstream-MCP-Server nur im internen Netz des Gateways erreichbar machen. Routen zu maechtigen Servern (Portainer, Shell, GitHub) auf `mode: admin` oder `restricted` stellen. Images auf feste Versionen statt `latest` pinnen. Master-Key und Bootstrap-Passwort nie in Wikis oder Tickets ablegen.
 
 ## Deployment
 
@@ -138,7 +168,7 @@ docker compose up -d --no-deps mcp-oauth-gateway
 ```
 
 - `chown` mit numerischer ID braucht kein Nutzerkonto auf dem Host. Alternativ bleiben die Ordner beim bisherigen Besitzer und der Container startet mit `user: "<uid>:<gid>"` dieses Besitzers.
-- Rollback auf ein altes Image funktioniert ohne Rueckaendern der Rechte: root im Container liest und schreibt auch Dateien von 10001. Dateien, die das alte Image dann neu anlegt, gehoeren aber wieder root und muessen vor dem naechsten Umstieg erneut uebergeben werden.
+- Rollback auf ein altes Image (root): Mit der alten Compose-Datei ohne `cap_drop` geht das ohne Rueckaendern der Rechte, root liest und schreibt dann auch Dateien von 10001. Bleibt dagegen `cap_drop: [ALL]` aktiv, fehlt root `CAP_DAC_OVERRIDE` und es kommt nicht in Ordner mit Modus 700 und Besitzer 10001. Dann entweder `cap_drop` fuer den Rollback entfernen oder die Ordner zurueckgeben (`sudo chown -R 0:0 ./config ./data`). Dateien, die das alte Image neu anlegt, gehoeren wieder root und muessen vor dem naechsten Umstieg erneut uebergeben werden.
 - Bereits installierte STDIO-Binaries unter `/data/stdio-mcp` gehoeren ebenfalls root (0750) und sind ohne das `chown -R` nicht mehr ausfuehrbar.
 - STDIO-Kindprozesse erben Nutzer, `HOME=/tmp` und `TMPDIR=/tmp`. `/tmp` ist im Beispiel `noexec`: Werkzeuge, die sich nach `/tmp` entpacken und von dort starten, brauchen `exec` am tmpfs oder ein eigenes Volume.
 - Mit Docker-Management braucht der Nutzer die Gruppe des Sockets (`group_add`). Das entspricht weiterhin Root-Rechten auf dem Host.
@@ -309,7 +339,7 @@ Der Gateway prueft jede Route mit einem echten MCP-Durchlauf (`initialize` und `
 - Im Hintergrund laufen alle Checks alle `MCP_GATEWAY_HEALTHCHECK_INTERVAL` (erste Runde ca. 15 Sekunden nach dem Start, hoechstens 4 parallel, 15 Sekunden Timeout pro Route). Abschalten mit `MCP_GATEWAY_HEALTHCHECK_ENABLED=false`.
 - Im Admin-Dashboard zeigen die Routen-Uebersicht und der Route-Editor Status, Zeitpunkt, Tool-Anzahl/Latenz bzw. die Fehlerursache. "Jetzt pruefen" und "Alle pruefen" starten Checks manuell.
 - Der oeffentliche Katalog (`/`, `/?format=json`, `/<route>`) zeigt nur Status, Zeitpunkt, Latenz und Tool-Anzahl, keine Fehlerdetails, da diese interne Hosts nennen koennen.
-- Der Check nutzt den globalen Upstream-Bearer. Hat eine Route nur nutzerspezifische Bearer, meldet er "Eingeschraenkt pruefbar" statt "Gestoert".
+- Der Check laeuft ohne Nutzer: Er sendet den globalen Upstream-Bearer und alle `forward_headers` ohne Nutzer-Platzhalter (z.B. einen statischen API-Key), aber keine Header mit `{email}`/`{user_id}`. Haengt die Upstream-Anmeldung nur an nutzerspezifischen Bearern oder solchen Headern, meldet er "Eingeschraenkt pruefbar" statt "Gestoert".
 - STDIO-Routen starten fuer jeden Check kurz einen eigenen Prozess.
 - Die Ergebnisse liegen nur im Speicher und sind nach einem Neustart bis zur ersten Runde "Noch nicht geprueft".
 
@@ -343,7 +373,7 @@ Wichtig:
 - Beim Speichern wird nur neu gestartet, was sich wirklich geaendert hat: Aendern sich nur Anzeigename, Beschreibung, Doku-Link, Notizen, Scopes, Zugriffsregeln, OpenAPI-Session-Modus oder Deployment-Metadaten, laufen bestehende Sessions und STDIO-Prozesse weiter. Verliert ein Nutzer durch geaenderte Zugriffsregeln den Zugriff, werden nur seine Sessions beendet. Aenderungen an Transport, Upstream, Pfaden, Headern, STDIO-Kommando, -Argumenten, -Umgebung oder an den Werten der Installer-Secrets starten nur diese Route neu. Andere Routen sind nie betroffen.
 - "Neu starten" im Route-Editor beendet alle Sessions der Route und startet sie neu, z.B. nachdem eine Executable unter gleichem Pfad ersetzt wurde.
 - Upstream-Umgebungsvariablen werden bei HTTP-Routen als Deployment-Metadaten gespeichert. Bei manuell gepflegten STDIO-Routen werden `stdio.env`-Werte an den gestarteten Prozess uebergeben; vom Installer erfasste Env-Secrets werden verschluesselt gespeichert und per `stdio.env_secret_refs` referenziert.
-- Full Export kann interne Tokens in `forward_headers`, `upstream_environment` oder manuellem `stdio.env` enthalten. Installer-Secrets und Upstream-Bearer aus dem Dashboard bleiben im verschluesselten Auth-Store und werden nicht als Klartext exportiert.
+- Full Export kann interne Tokens in `upstream_environment` oder manuellem `stdio.env` enthalten. Installer-Secrets, Upstream-Bearer und Zugangsdaten in `forward_headers` (siehe Sicherheit) bleiben im verschluesselten Auth-Store und werden nicht als Klartext exportiert.
 
 ### Upstream Bearer Auth
 

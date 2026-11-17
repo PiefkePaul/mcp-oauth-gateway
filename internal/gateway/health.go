@@ -115,6 +115,9 @@ func (s *Server) classifyHealthError(ctx context.Context, routeID string, err er
 			// none to send, so this says nothing about real users.
 			return healthStatusWarning, "the route only has user-specific upstream bearers, so the check cannot authenticate; real users may still work"
 		}
+		if route, ok := s.routeByID(routeID); ok && !globalBearer && routeAuthDependsOnUser(route) {
+			return healthStatusWarning, "the upstream refused a request without user-specific forward headers ({email}/{user_id}), which the check cannot send; real users may still work"
+		}
 		return healthStatusError, "the upstream rejected the gateway's credentials; check the route's Upstream Bearer"
 	case strings.Contains(text, "bad_gateway"):
 		return healthStatusError, "the upstream MCP server could not be reached"

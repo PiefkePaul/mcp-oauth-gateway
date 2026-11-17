@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"net/netip"
 	"net/url"
 	"os"
 	"path"
@@ -26,7 +27,7 @@ const (
 	defaultBuildMaxArtifactMB  = 100
 	defaultAccessTokenTTL      = time.Hour
 	defaultRefreshTokenTTL     = 30 * 24 * time.Hour
-	defaultRefreshReuseGrace   = 2 * time.Minute
+	defaultRefreshReuseGrace   = 30 * time.Second
 	defaultAuthorizationTTL    = 10 * time.Minute
 	defaultSessionTTL          = 30 * 24 * time.Hour
 	defaultAccountPortalTitle  = "MCP Gateway"
@@ -78,7 +79,24 @@ type AuthConfig struct {
 	AuthorizationCodeTTL   time.Duration
 	SessionTTL             time.Duration
 	AllowedRedirectOrigins []string
+	// AllowUnboundTokens lets OAuth tokens be valid on every route again
+	// instead of only on the MCP server they were issued for.
+	AllowUnboundTokens bool
+	// LazyClientRegistration is "off", "allowlist" or "open"; see the auth
+	// package.
+	LazyClientRegistration string
+	// TrustedProxies are the peers whose forwarding headers are believed
+	// when throttling by client address; empty means loopback and private
+	// networks.
+	TrustedProxies []netip.Prefix
+	// ClientIPHeader optionally names a header from a trusted proxy that
+	// carries the client address, e.g. CF-Connecting-IP.
+	ClientIPHeader string
 }
+
+// ForwardHeaderSecretMarker stands in routes.yaml for a forward header value
+// that is kept in the encrypted auth store instead.
+const ForwardHeaderSecretMarker = "{gateway-secret}"
 
 type DockerManagementConfig struct {
 	Enabled         bool
@@ -199,6 +217,8 @@ func Load() (*Config, error) {
 			AuthorizationCodeTTL:   getDurationEnv("MCP_GATEWAY_AUTHORIZATION_CODE_TTL", defaultAuthorizationTTL),
 			SessionTTL:             getDurationEnv("MCP_GATEWAY_SESSION_TTL", defaultSessionTTL),
 			AllowedRedirectOrigins: parseCSVEnv("MCP_GATEWAY_ALLOWED_REDIRECT_ORIGINS"),
+			AllowUnboundTokens:     getBoolEnv("MCP_GATEWAY_ALLOW_UNBOUND_TOKENS", false),
+			LazyClientRegistration: getEnvOrDefault("MCP_GATEWAY_LAZY_CLIENT_REGISTRATION", "allowlist"),
 		},
 		DockerManagement: DockerManagementConfig{
 			Enabled:         getBoolEnv("MCP_GATEWAY_DOCKER_MANAGEMENT_ENABLED", false),
@@ -270,6 +290,12 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	cfg.Auth.AllowedRedirectOrigins = allowedRedirectOrigins
+	trustedProxies, err := parseProxyPrefixes(parseCSVEnv("MCP_GATEWAY_TRUSTED_PROXIES"))
+	if err != nil {
+		return nil, err
+	}
+	cfg.Auth.TrustedProxies = trustedProxies
+	cfg.Auth.ClientIPHeader = strings.TrimSpace(os.Getenv("MCP_GATEWAY_CLIENT_IP_HEADER"))
 
 	routes, err := LoadRoutesFile(cfg.RoutesPath)
 	if err != nil {
@@ -846,6 +872,24 @@ func cloneRouteOpenAPI(openapi RouteOpenAPI) RouteOpenAPI {
 		}
 	}
 	return cloned
+}
+
+// parseProxyPrefixes reads addresses or CIDR ranges of trusted reverse
+// proxies.
+func parseProxyPrefixes(values []string) ([]netip.Prefix, error) {
+	prefixes := make([]netip.Prefix, 0, len(values))
+	for _, value := range values {
+		if prefix, err := netip.ParsePrefix(value); err == nil {
+			prefixes = append(prefixes, prefix.Masked())
+			continue
+		}
+		addr, err := netip.ParseAddr(value)
+		if err != nil {
+			return nil, fmt.Errorf("MCP_GATEWAY_TRUSTED_PROXIES entry %q is neither an IP address nor a CIDR range", value)
+		}
+		prefixes = append(prefixes, netip.PrefixFrom(addr, addr.BitLen()))
+	}
+	return prefixes, nil
 }
 
 func parseMasterKey(raw string) ([]byte, error) {

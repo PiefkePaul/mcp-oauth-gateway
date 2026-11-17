@@ -41,6 +41,13 @@ services:
       # non-loopback redirect URI, for example in a private LAN test setup.
       # Prefer setting Open WebUI's WEBUI_URL to its public HTTPS URL instead.
       MCP_GATEWAY_ALLOWED_REDIRECT_ORIGINS: ""
+      MCP_GATEWAY_LAZY_CLIENT_REGISTRATION: "allowlist"
+      MCP_GATEWAY_ALLOW_UNBOUND_TOKENS: "false"
+      # Reverse proxies whose X-Forwarded-For is trusted for login throttling.
+      # Empty means loopback and private networks. Behind Cloudflare also set
+      # MCP_GATEWAY_CLIENT_IP_HEADER to "CF-Connecting-IP".
+      MCP_GATEWAY_TRUSTED_PROXIES: ""
+      MCP_GATEWAY_CLIENT_IP_HEADER: ""
       # Optional: enable only if the gateway should create/start/stop Docker containers.
       # Mounting docker.sock grants this container host-level Docker control.
       MCP_GATEWAY_DOCKER_MANAGEMENT_ENABLED: "false"

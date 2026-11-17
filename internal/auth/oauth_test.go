@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -49,7 +50,7 @@ func TestAuthorizeApprovalReturnsBrowserRedirectPage(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "https://mcp.example.com/authorize", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.AddCookie(&http.Cookie{Name: csrfCookieName, Value: csrfToken})
+	req.AddCookie(&http.Cookie{Name: "__Host-" + csrfCookieName, Value: csrfToken})
 	for _, cookie := range sessionRec.Result().Cookies() {
 		req.AddCookie(cookie)
 	}
@@ -115,7 +116,7 @@ func TestAuthorizeDenyReturnsBrowserRedirectPage(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "https://mcp.example.com/authorize", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.AddCookie(&http.Cookie{Name: csrfCookieName, Value: csrfToken})
+	req.AddCookie(&http.Cookie{Name: "__Host-" + csrfCookieName, Value: csrfToken})
 	for _, cookie := range sessionRec.Result().Cookies() {
 		req.AddCookie(cookie)
 	}
@@ -152,7 +153,7 @@ func TestAuthorizeAllowsClientsWithoutResourceParameter(t *testing.T) {
 		t.Fatalf("register client: %v", err)
 	}
 
-	params, _, err := manager.parseAuthorizeRequest(url.Values{
+	params, _, err := manager.parseAuthorizeRequest(true, false, url.Values{
 		"client_id":             {client.ID},
 		"redirect_uri":          {"http://127.0.0.1:51066/callback"},
 		"response_type":         {"code"},
@@ -213,6 +214,7 @@ func TestAuthorizePreflightLazilyAcceptsUnregisteredOpenWebUIClient(t *testing.T
 		"redirect_uri":          {"https://chat.example.com/oauth/clients/mcp:legal/callback"},
 		"response_type":         {"code"},
 		"scope":                 {"mcp"},
+		"resource":              {"https://mcp.example.com/legal/mcp"},
 		"state":                 {"state-value"},
 		"code_challenge":        {"abcdefghijklmnopqrstuvwxyz0123456789abcdef"},
 		"code_challenge_method": {"S256"},
@@ -224,6 +226,22 @@ func TestAuthorizePreflightLazilyAcceptsUnregisteredOpenWebUIClient(t *testing.T
 
 	if rec.Code != http.StatusFound {
 		t.Fatalf("expected login redirect for lazily accepted client, got %d with body %q", rec.Code, rec.Body.String())
+	}
+
+	if _, err := manager.lookupClient("Hhds3gZ089JVr1z3tLlNJEmyCmf0rPTK"); err == nil {
+		t.Fatalf("an anonymous preflight must not store a client")
+	}
+
+	// The same request from a signed-in user makes the client permanent.
+	req = httptest.NewRequest(http.MethodGet, "https://mcp.example.com/authorize?"+values.Encode(), nil)
+	req.AddCookie(sessionCookieFor(t, manager, "admin@example.com"))
+	rec = httptest.NewRecorder()
+	manager.HandleAuthorize(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected the consent page for a signed-in user, got %d with body %q", rec.Code, rec.Body.String())
+	}
+	if body := rec.Body.String(); !strings.Contains(body, "chat.example.com") {
+		t.Fatalf("the consent page must name the host that receives the code")
 	}
 
 	client, err := manager.lookupClient("Hhds3gZ089JVr1z3tLlNJEmyCmf0rPTK")
@@ -243,11 +261,12 @@ func TestLazyAuthorizeClientAdoptsSecretDuringCodeExchange(t *testing.T) {
 	sum := sha256.Sum256([]byte(verifier))
 	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
 
-	params, client, err := manager.parseAuthorizeRequest(url.Values{
+	params, client, err := manager.parseAuthorizeRequest(true, false, url.Values{
 		"client_id":             {clientID},
 		"redirect_uri":          {redirectURI},
 		"response_type":         {"code"},
 		"scope":                 {"mcp"},
+		"resource":              {"https://mcp.example.com/legal/mcp"},
 		"state":                 {"state-value"},
 		"code_challenge":        {challenge},
 		"code_challenge_method": {"S256"},
@@ -319,37 +338,52 @@ func TestAuthorizeStillRequiresPKCEForAuthenticatedUser(t *testing.T) {
 	}
 }
 
-func TestGatewayWideAccessTokenCanBeValidatedForSpecificResource(t *testing.T) {
-	manager := newTestManager(t, "admin@example.com", "super-secret-password")
-	userID := manager.ListUsers()[0].ID
+func TestUnboundAccessTokensAreRejectedOnRoutes(t *testing.T) {
+	for name, resource := range map[string]string{"no resource": "", "gateway-wide resource": "https://mcp.example.com"} {
+		manager := newTestManager(t, "admin@example.com", "super-secret-password")
+		userID := manager.ListUsers()[0].ID
 
-	manager.mu.Lock()
-	tokenSet := manager.issueTokenSetLocked(time.Now(), userID, "client-id", "", "mcp", "")
-	manager.mu.Unlock()
+		manager.mu.Lock()
+		tokenSet := manager.issueTokenSetLocked(time.Now(), userID, "client-id", "", "mcp", resource)
+		manager.mu.Unlock()
 
-	identity, err := manager.ValidateAccessToken(tokenSet.AccessToken, "https://mcp.example.com/legal/mcp")
-	if err != nil {
-		t.Fatalf("validate gateway-wide token for resource: %v", err)
-	}
-	if identity.Email != "admin@example.com" {
-		t.Fatalf("unexpected identity: %#v", identity)
+		if _, err := manager.ValidateAccessToken(tokenSet.AccessToken, "https://mcp.example.com/legal/mcp"); !errors.Is(err, ErrInvalidToken) {
+			t.Fatalf("%s: expected the token to be rejected on a route, got %v", name, err)
+		}
+
+		manager.cfg.AllowUnboundTokens = true
+		if _, err := manager.ValidateAccessToken(tokenSet.AccessToken, "https://mcp.example.com/legal/mcp"); err != nil {
+			t.Fatalf("%s: with unbound tokens allowed the token must work: %v", name, err)
+		}
 	}
 }
 
-func TestRootResourceAccessTokenCanBeValidatedForSpecificResource(t *testing.T) {
+func TestAccessTokenIsBoundToItsResource(t *testing.T) {
 	manager := newTestManager(t, "admin@example.com", "super-secret-password")
 	userID := manager.ListUsers()[0].ID
 
 	manager.mu.Lock()
-	tokenSet := manager.issueTokenSetLocked(time.Now(), userID, "client-id", "", "mcp", "https://mcp.example.com")
+	tokenSet := manager.issueTokenSetLocked(time.Now(), userID, "client-id", "grant", "mcp", "https://mcp.example.com/camoufox/mcp")
 	manager.mu.Unlock()
 
-	identity, err := manager.ValidateAccessToken(tokenSet.AccessToken, "https://mcp.example.com/camoufox/mcp")
-	if err != nil {
-		t.Fatalf("validate root-resource token for route resource: %v", err)
+	if _, err := manager.ValidateAccessToken(tokenSet.AccessToken, "https://mcp.example.com/camoufox/mcp"); err != nil {
+		t.Fatalf("token must work on its own resource: %v", err)
 	}
-	if identity.Email != "admin@example.com" {
-		t.Fatalf("unexpected identity: %#v", identity)
+	if _, err := manager.ValidateAccessToken(tokenSet.AccessToken, "https://mcp.example.com/portainer/mcp"); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("token must not work on another route, got %v", err)
+	}
+}
+
+func TestPersonalAccessTokenStaysGatewayWide(t *testing.T) {
+	manager := newTestManager(t, "admin@example.com", "super-secret-password")
+	userID := manager.ListUsers()[0].ID
+
+	rawToken, _, err := manager.CreatePersonalAccessToken(userID, "cli", time.Hour)
+	if err != nil {
+		t.Fatalf("create personal access token: %v", err)
+	}
+	if _, err := manager.ValidateAccessToken(rawToken, "https://mcp.example.com/portainer/mcp"); err != nil {
+		t.Fatalf("personal access token must work on a route: %v", err)
 	}
 }
 
