@@ -70,7 +70,9 @@ Wichtig:
 - `MCP_GATEWAY_ALLOWED_REDIRECT_ORIGINS`
 - `MCP_GATEWAY_TRUSTED_PROXIES` (optional, IPs/CIDRs der Reverse Proxies; leer = Loopback und private Netze)
 - `MCP_GATEWAY_CLIENT_IP_HEADER` (optional, z.B. `CF-Connecting-IP` hinter Cloudflare)
-- `MCP_GATEWAY_REFRESH_TOKEN_REUSE_GRACE` (Standard `2m`)
+- `MCP_GATEWAY_REFRESH_TOKEN_REUSE_GRACE` (Standard `30s`)
+- `MCP_GATEWAY_ALLOW_UNBOUND_TOKENS` (Standard `false`)
+- `MCP_GATEWAY_LAZY_CLIENT_REGISTRATION` (`off`, `allowlist` oder `open`, Standard `allowlist`)
 - `MCP_GATEWAY_ACCESS_LOG`
 - `MCP_GATEWAY_DOCKER_MANAGEMENT_ENABLED`
 - `MCP_GATEWAY_DOCKER_HOST`
@@ -100,7 +102,19 @@ Der Master-Key muss genau 32 Bytes nach Base64-, Base64URL- oder Hex-Decoding er
 
 Jeder OAuth-Login (Authorization-Code-Flow) bildet einen eigenen Grant. Refresh-Tokens bleiben im selben Grant, sodass ein Client ueber Token-Rotation hinweg derselbe Agent bleibt. Zwei Rechner mit eigenem Login sind zwei Agenten; mehrere Prozesse, die sich einen Login teilen (z.B. mehrere Terminals auf einem Rechner), sind ein Agent. Jeder persoenliche Bearer-Token ist ein eigener Agent.
 
-Refresh-Tokens werden bei jeder Nutzung rotiert. Damit mehrere Prozesse mit demselben Login gleichzeitig erneuern koennen, bleibt ein rotiertes Refresh-Token fuer `MCP_GATEWAY_REFRESH_TOKEN_REUSE_GRACE` gueltig (Standard 2 Minuten). Jede Nutzung in diesem Fenster stellt neue Tokens im selben Grant aus; danach wird das alte Token abgelehnt.
+Refresh-Tokens werden bei jeder Nutzung rotiert. Damit mehrere Prozesse mit demselben Login gleichzeitig erneuern koennen, bleibt ein rotiertes Refresh-Token fuer `MCP_GATEWAY_REFRESH_TOKEN_REUSE_GRACE` gueltig (Standard 30 Sekunden). Jede Nutzung in diesem Fenster stellt neue Tokens im selben Grant aus. Wird ein rotiertes Token danach noch einmal vorgelegt, gilt es als gestohlen: der Gateway widerruft alle Tokens dieses Logins, und der Client muss sich neu anmelden (OAuth 2.1, Abschnitt 4.3.1). Dasselbe passiert, wenn ein Autorisierungscode ein zweites Mal eingeloest wird.
+
+### Bindung der Tokens an einen MCP-Server
+
+Ein OAuth-Token gilt nur fuer den einen MCP-Server, fuer den es ausgestellt wurde (`resource`-Parameter nach RFC 8707). Ein Token fuer `/camoufox/mcp` funktioniert nicht auf `/portainer/mcp`. Clients nach aktueller MCP-Spezifikation senden `resource` selbst. Sendet ein Client keinen oder nur die Basis-URL des Gateways, waehlt der Nutzer den Server auf der Zustimmungsseite aus. Bereits ausgestellte Tokens ohne Bindung werden nach dem Update abgelehnt, die betroffenen Clients melden sich einmal neu an.
+
+`MCP_GATEWAY_ALLOW_UNBOUND_TOKENS=true` stellt das alte Verhalten wieder her (Tokens ohne `resource` gelten auf allen Routen). Nur als Uebergang gedacht. Persoenliche Bearer-Tokens aus dem Konto-Portal gelten weiterhin fuer alle Routen des Nutzers.
+
+### Clients ohne Registrierung
+
+Eine unbekannte `client_id` am Authorization-Endpoint wird nur dann ohne vorherige Registrierung akzeptiert, wenn die Redirect-URI unter einer Origin aus `MCP_GATEWAY_ALLOWED_REDIRECT_ORIGINS` liegt (`MCP_GATEWAY_LAZY_CLIENT_REGISTRATION=allowlist`). Das betrifft Clients mit fest eingetragener Client-ID, z.B. Open WebUI: dessen Origin (auch eine HTTPS-Origin) muss dort stehen. Alle anderen Clients registrieren sich ueber `/register` und bekommen sonst `invalid_client`. `off` schaltet das Verhalten ganz ab, `open` akzeptiert wie frueher jede gueltige Redirect-URI.
+
+Redirect-URIs muessen HTTPS nutzen oder auf Loopback zeigen (`localhost`, `127.0.0.1`, `[::1]`), duerfen kein Fragment und keine Benutzerangabe enthalten. Bei Loopback-Redirects ist der Port frei, damit native Clients einen zufaelligen Port nutzen koennen. Autorisierungsantworten tragen den Parameter `iss` (RFC 9207).
 
 ## Sicherheit
 

@@ -275,6 +275,8 @@ func newTestManager(t *testing.T, bootstrapEmail, bootstrapPassword string) *Man
 		PortalTitle:          "MCP Gateway",
 		BootstrapEmail:       bootstrapEmail,
 		BootstrapPassword:    bootstrapPassword,
+		// Lazy client registration is limited to listed redirect origins.
+		AllowedRedirectOrigins: []string{"https://chat.example.com"},
 	})
 	if err != nil {
 		t.Fatalf("create auth manager: %v", err)

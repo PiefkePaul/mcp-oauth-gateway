@@ -42,6 +42,9 @@ const (
 	// Clients that never obtained a token may be dropped after this time
 	// to make room for new registrations.
 	unusedClientGracePeriod = time.Hour
+	// rotatedRefreshTokenRetention is how long an exchanged refresh token is
+	// remembered so that a later reuse can be detected.
+	rotatedRefreshTokenRetention = 7 * 24 * time.Hour
 )
 
 var (
@@ -71,6 +74,16 @@ type Config struct {
 	AllowedEmails          []string
 	AllowedEmailDomains    []string
 	AllowedRedirectOrigins []string
+	// AllowUnboundTokens restores the old behaviour in which an OAuth token
+	// may be issued without a resource, or for the gateway as a whole, and
+	// is then valid on every route. Off, each OAuth token is bound to the
+	// one MCP resource it was requested for (RFC 8707).
+	AllowUnboundTokens bool
+	// LazyClientRegistration controls whether an unknown client_id in an
+	// authorization request is registered on the fly: "off", "allowlist"
+	// (only for redirect URIs under AllowedRedirectOrigins, the default) or
+	// "open" (any valid redirect URI, the old behaviour).
+	LazyClientRegistration string
 	// TrustedProxies are the peers whose forwarding headers are believed
 	// when working out a client address for throttling. Empty means
 	// loopback and private networks.
@@ -87,6 +100,7 @@ type Manager struct {
 	mu                    sync.Mutex
 	data                  *storeData
 	resourceAccessChecker ResourceAccessChecker
+	resourceLister        ResourceLister
 	changeListener        func()
 }
 
@@ -130,6 +144,16 @@ func (i *Identity) OwnerKey() string {
 }
 
 type ResourceAccessChecker func(identity *Identity, resource string) error
+
+// ResourceOption is one MCP server a user may request a token for.
+type ResourceOption struct {
+	URL  string
+	Name string
+}
+
+// ResourceLister returns the MCP servers identity may use. It feeds the
+// choice on the consent page for clients that do not name a resource.
+type ResourceLister func(identity *Identity) []ResourceOption
 
 type contextKey string
 
@@ -229,6 +253,11 @@ type authCodeRecord struct {
 	CodeChallenge       string `json:"code_challenge"`
 	CodeChallengeMethod string `json:"code_challenge_method"`
 	ExpiresAt           int64  `json:"expires_at"`
+	// UsedAt and GrantID are set once the code was exchanged. The record is
+	// kept until it expires so a second use can be recognised and the tokens
+	// from the first use revoked.
+	UsedAt  int64  `json:"used_at,omitempty"`
+	GrantID string `json:"grant_id,omitempty"`
 }
 
 type accessTokenRecord struct {
@@ -336,6 +365,12 @@ func (m *Manager) SetResourceAccessChecker(checker ResourceAccessChecker) {
 	m.resourceAccessChecker = checker
 }
 
+func (m *Manager) SetResourceLister(lister ResourceLister) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.resourceLister = lister
+}
+
 func (m *Manager) HandleAuthorizationServerMetadata(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", http.MethodGet)
@@ -349,14 +384,15 @@ func (m *Manager) HandleAuthorizationServerMetadata(w http.ResponseWriter, r *ht
 		"authorization_endpoint": baseURL + "/authorize",
 		"token_endpoint":         baseURL + "/token",
 		"registration_endpoint":  baseURL + "/register",
-		"registration_endpoint_auth_methods_supported": []string{"none"},
-		"response_types_supported":                     []string{"code"},
-		"grant_types_supported":                        []string{"authorization_code", "refresh_token"},
-		"token_endpoint_auth_methods_supported":        []string{"none", "client_secret_post", "client_secret_basic"},
-		"code_challenge_methods_supported":             []string{"S256"},
-		"scopes_supported":                             []string{"mcp"},
-		"subject_types_supported":                      []string{"public"},
-		"client_id_metadata_document_supported":        false,
+		"registration_endpoint_auth_methods_supported":   []string{"none"},
+		"response_types_supported":                       []string{"code"},
+		"grant_types_supported":                          []string{"authorization_code", "refresh_token"},
+		"token_endpoint_auth_methods_supported":          []string{"none", "client_secret_post", "client_secret_basic"},
+		"code_challenge_methods_supported":               []string{"S256"},
+		"scopes_supported":                               []string{"mcp"},
+		"subject_types_supported":                        []string{"public"},
+		"client_id_metadata_document_supported":          false,
+		"authorization_response_iss_parameter_supported": true,
 	})
 }
 
@@ -866,7 +902,7 @@ func (m *Manager) ValidateAccessToken(token, resource string) (*Identity, error)
 			_ = m.saveLocked()
 			return nil, ErrTokenExpired
 		}
-		if record.Resource != "" && normalizeResource(record.Resource) != normalizeResource(resource) && !m.isGatewayWideResource(record.Resource) {
+		if !m.tokenValidForResource(record.Resource, resource, false) {
 			return nil, ErrInvalidToken
 		}
 
@@ -893,7 +929,7 @@ func (m *Manager) ValidateAccessToken(token, resource string) (*Identity, error)
 			_ = m.saveLocked()
 			return nil, ErrTokenExpired
 		}
-		if personalToken.Resource != "" && normalizeResource(personalToken.Resource) != normalizeResource(resource) && !m.isGatewayWideResource(personalToken.Resource) {
+		if !m.tokenValidForResource(personalToken.Resource, resource, true) {
 			return nil, ErrInvalidToken
 		}
 		user, ok := m.data.Users[personalToken.UserID]
@@ -950,6 +986,21 @@ func (m *Manager) baseURL(r *http.Request) string {
 		return strings.TrimRight(strings.TrimSpace(m.cfg.PublicBaseURL), "/")
 	}
 	return BaseURLFromRequest(r)
+}
+
+// tokenValidForResource reports whether a token issued for tokenResource may
+// be used on requested. OAuth tokens must name exactly that resource; a token
+// without a resource, or for the gateway as a whole, is only accepted when
+// unbound tokens are allowed. Personal access tokens are created by the user
+// on purpose and stay gateway-wide unless they were bound to one resource.
+func (m *Manager) tokenValidForResource(tokenResource, requested string, personal bool) bool {
+	if strings.TrimSpace(tokenResource) != "" && normalizeResource(tokenResource) == normalizeResource(requested) {
+		return true
+	}
+	if strings.TrimSpace(tokenResource) == "" || m.isGatewayWideResource(tokenResource) {
+		return personal || m.cfg.AllowUnboundTokens
+	}
+	return false
 }
 
 func (m *Manager) isGatewayWideResource(resource string) bool {
@@ -1102,7 +1153,9 @@ func (m *Manager) cleanupLocked(now time.Time) {
 		}
 	}
 	for token, record := range m.data.RefreshTokens {
-		if record.ExpiresAt <= nowUnix || (record.RotatedAt > 0 && !m.refreshReuseAllowed(record, now)) {
+		// Rotated tokens are kept for a while after their grace period so a
+		// later reuse can still be recognised (see refreshToken).
+		if record.ExpiresAt <= nowUnix || (record.RotatedAt > 0 && record.RotatedAt+int64(rotatedRefreshTokenRetention.Seconds()) <= nowUnix) {
 			delete(m.data.RefreshTokens, token)
 		}
 	}
@@ -1428,6 +1481,15 @@ func clientSecretForAuthMethod(method string) string {
 	return randomToken(32)
 }
 
+func (m *Manager) lazyClientRegistrationMode() string {
+	switch mode := strings.ToLower(strings.TrimSpace(m.cfg.LazyClientRegistration)); mode {
+	case "off", "open":
+		return mode
+	default:
+		return "allowlist"
+	}
+}
+
 func validateClientIDForLazyRegistration(clientID string) error {
 	clientID = strings.TrimSpace(clientID)
 	if len(clientID) < 8 || len(clientID) > 200 {
@@ -1446,7 +1508,7 @@ func (m *Manager) handleAuthorizeGet(w http.ResponseWriter, r *http.Request) {
 	// but only a signed-in user makes that registration permanent. Without a
 	// session the request is validated and nothing is stored, so anonymous
 	// requests cannot fill the client registry.
-	params, client, err := m.parseAuthorizeRequest(identity != nil, r.URL.Query())
+	params, client, err := m.parseAuthorizeRequest(identity != nil, false, r.URL.Query())
 	if err != nil {
 		writeAuthorizationRequestError(w, err)
 		return
@@ -1461,7 +1523,22 @@ func (m *Manager) handleAuthorizeGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := m.checkResourceAccess(identity, params.Resource); err != nil {
+	var resourceOptions []ResourceOption
+	if m.resourceChoiceNeeded(params.Resource) {
+		// The client did not say which MCP server it wants. Instead of a
+		// token for all of them, the user binds it to one here.
+		params.Resource = ""
+		m.mu.Lock()
+		lister := m.resourceLister
+		m.mu.Unlock()
+		if lister != nil {
+			resourceOptions = lister(identity)
+		}
+		if len(resourceOptions) == 0 {
+			http.Error(w, "your account has no MCP server it could authorize this client for", http.StatusForbidden)
+			return
+		}
+	} else if err := m.checkResourceAccess(identity, params.Resource); err != nil {
 		http.Error(w, err.Error(), http.StatusForbidden)
 		return
 	}
@@ -1472,6 +1549,8 @@ func (m *Manager) handleAuthorizeGet(w http.ResponseWriter, r *http.Request) {
 		"RedirectHost":        redirectDisplayHost(params.RedirectURI),
 		"RedirectIsLocal":     redirectIsLoopback(params.RedirectURI),
 		"Resource":            params.Resource,
+		"ResourceOptions":     resourceOptions,
+		"UnboundAllowed":      m.cfg.AllowUnboundTokens,
 		"Scope":               params.Scope,
 		"State":               params.State,
 		"CSRFToken":           csrfToken,
@@ -1508,14 +1587,14 @@ func (m *Manager) handleAuthorizePost(w http.ResponseWriter, r *http.Request) {
 		values.Set(key, r.FormValue(key))
 	}
 
-	params, _, err := m.parseAuthorizeRequest(true, values)
+	params, _, err := m.parseAuthorizeRequest(true, true, values)
 	if err != nil {
 		writeAuthorizationRequestError(w, err)
 		return
 	}
 
 	if r.FormValue("action") != "approve" {
-		target, buildErr := buildOAuthErrorRedirectURL(params.RedirectURI, "access_denied", params.State)
+		target, buildErr := buildOAuthErrorRedirectURL(params.RedirectURI, m.baseURL(r), "access_denied", params.State)
 		if buildErr != nil {
 			http.Error(w, "invalid redirect_uri", http.StatusBadRequest)
 			return
@@ -1524,7 +1603,7 @@ func (m *Manager) handleAuthorizePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := m.checkResourceAccess(identity, params.Resource); err != nil {
-		target, buildErr := buildOAuthErrorRedirectURL(params.RedirectURI, "access_denied", params.State)
+		target, buildErr := buildOAuthErrorRedirectURL(params.RedirectURI, m.baseURL(r), "access_denied", params.State)
 		if buildErr != nil {
 			http.Error(w, "invalid redirect_uri", http.StatusBadRequest)
 			return
@@ -1539,7 +1618,7 @@ func (m *Manager) handleAuthorizePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	target, err := buildOAuthCodeRedirectURL(params.RedirectURI, code, params.State)
+	target, err := buildOAuthCodeRedirectURL(params.RedirectURI, m.baseURL(r), code, params.State)
 	if err != nil {
 		http.Error(w, "invalid redirect_uri", http.StatusBadRequest)
 		return
@@ -1547,9 +1626,21 @@ func (m *Manager) handleAuthorizePost(w http.ResponseWriter, r *http.Request) {
 	completeBrowserRedirect(w, target, "Authorization complete")
 }
 
+// resourceChoiceNeeded reports whether an authorization request still lacks
+// the one MCP server its token will be bound to. Clients that follow the
+// current MCP specification name it in the resource parameter; for the
+// others the user picks it on the consent page.
+func (m *Manager) resourceChoiceNeeded(resource string) bool {
+	if m.cfg.AllowUnboundTokens {
+		return false
+	}
+	return strings.TrimSpace(resource) == "" || m.isGatewayWideResource(resource)
+}
+
 // parseAuthorizeRequest validates an authorization request. With
 // persistLazyClient false, an unknown client is validated but not stored.
-func (m *Manager) parseAuthorizeRequest(persistLazyClient bool, values url.Values) (*authorizeParams, *clientRecord, error) {
+// With requireResource the request must already name its MCP server.
+func (m *Manager) parseAuthorizeRequest(persistLazyClient, requireResource bool, values url.Values) (*authorizeParams, *clientRecord, error) {
 	params := &authorizeParams{
 		ClientID:            strings.TrimSpace(values.Get("client_id")),
 		RedirectURI:         strings.TrimSpace(values.Get("redirect_uri")),
@@ -1575,6 +1666,9 @@ func (m *Manager) parseAuthorizeRequest(persistLazyClient bool, values url.Value
 			return nil, nil, err
 		}
 	}
+	if requireResource && m.resourceChoiceNeeded(params.Resource) {
+		return nil, nil, fmt.Errorf("the token must be bound to one MCP server: choose one on the consent page or send the resource parameter (RFC 8707)")
+	}
 
 	if len(params.State) > maxClientMetadataLength || len(params.Scope) > maxClientMetadataLength || len(params.Resource) > maxClientMetadataLength || len(params.CodeChallenge) > 256 {
 		return nil, nil, fmt.Errorf("authorization request parameter is too long")
@@ -1587,7 +1681,7 @@ func (m *Manager) parseAuthorizeRequest(persistLazyClient bool, values url.Value
 	if !slices.Contains(client.GrantTypes, "authorization_code") || !slices.Contains(client.ResponseTypes, "code") {
 		return nil, nil, fmt.Errorf("client is not registered for authorization_code")
 	}
-	if !slices.Contains(client.RedirectURIs, params.RedirectURI) {
+	if !redirectURIRegistered(client.RedirectURIs, params.RedirectURI) {
 		return nil, nil, fmt.Errorf("redirect_uri is not registered for this client")
 	}
 	if params.Scope == "" {
@@ -1626,6 +1720,19 @@ func (m *Manager) registerLazyAuthorizeClient(params *authorizeParams, persist b
 	}
 	if err := m.validateRedirectURI(params.RedirectURI); err != nil {
 		return nil, err
+	}
+	// An unknown client_id is otherwise taken at its word, together with
+	// whatever redirect URI the request names. By default that is limited to
+	// redirect origins the operator listed; everyone else registers first.
+	switch m.lazyClientRegistrationMode() {
+	case "open":
+	case "allowlist":
+		parsed, err := url.Parse(params.RedirectURI)
+		if err != nil || !m.redirectOriginAllowed(parsed) {
+			return nil, ErrInvalidClient
+		}
+	default:
+		return nil, ErrInvalidClient
 	}
 
 	now := time.Now()
@@ -1748,6 +1855,15 @@ func (m *Manager) exchangeAuthorizationCode(clientID, clientSecret, clientAuthMe
 		_ = m.saveLocked()
 		return nil, ErrTokenExpired
 	}
+	if record.UsedAt > 0 {
+		// A code is good for one exchange. A second one means the code leaked,
+		// so the tokens the first exchange produced are withdrawn as well.
+		revoked := m.revokeGrantLocked(record.UserID, record.ClientID, record.GrantID, record.Resource)
+		delete(m.data.AuthCodes, code)
+		log.Printf("oauth authorization code replayed client_id=%s user_id=%s revoked_tokens=%d", record.ClientID, record.UserID, revoked)
+		_ = m.saveAndNotifyLocked()
+		return nil, ErrInvalidGrant
+	}
 	if record.ClientID != client.ID || record.RedirectURI != redirectURI {
 		return nil, ErrInvalidGrant
 	}
@@ -1758,8 +1874,10 @@ func (m *Manager) exchangeAuthorizationCode(clientID, clientSecret, clientAuthMe
 		return nil, ErrInvalidGrant
 	}
 
-	delete(m.data.AuthCodes, code)
-	tokenSet := m.issueTokenSetLocked(now, record.UserID, client.ID, randomToken(16), record.Scope, record.Resource)
+	grantID := randomToken(16)
+	record.UsedAt = now.Unix()
+	record.GrantID = grantID
+	tokenSet := m.issueTokenSetLocked(now, record.UserID, client.ID, grantID, record.Scope, record.Resource)
 	if err := m.saveLocked(); err != nil {
 		return nil, err
 	}
@@ -1817,9 +1935,16 @@ func (m *Manager) refreshToken(clientID, clientSecret, clientAuthMethod, refresh
 	if !ok {
 		return nil, ErrInvalidGrant
 	}
+	if record.ClientID != client.ID {
+		return nil, ErrInvalidGrant
+	}
 	if record.RotatedAt > 0 && !m.refreshReuseAllowed(record, now) {
-		delete(m.data.RefreshTokens, refreshToken)
-		_ = m.saveLocked()
+		// The token was already exchanged and its grace period is over. The
+		// gateway cannot tell whether the thief or the owner is asking, so
+		// the whole login is ended and the client has to sign in again.
+		revoked := m.revokeGrantLocked(record.UserID, record.ClientID, record.GrantID, record.Resource)
+		log.Printf("oauth refresh token reuse detected client_id=%s user_id=%s revoked_tokens=%d", record.ClientID, record.UserID, revoked)
+		_ = m.saveAndNotifyLocked()
 		return nil, ErrInvalidGrant
 	}
 	if record.ExpiresAt <= now.Unix() {
@@ -1834,14 +1959,11 @@ func (m *Manager) refreshToken(clientID, clientSecret, clientAuthMethod, refresh
 		return nil, ErrInvalidGrant
 	}
 
-	if m.cfg.RefreshTokenReuseGrace > 0 {
-		// Keep the rotated token briefly so a second process sharing this
-		// login can still refresh; its grace period is not extended on reuse.
-		if record.RotatedAt == 0 {
-			record.RotatedAt = now.Unix()
-		}
-	} else {
-		delete(m.data.RefreshTokens, refreshToken)
+	// The rotated token stays in the store. Within the grace period a second
+	// process sharing this login can still refresh with it (the period is not
+	// extended on reuse); after that it only serves to detect reuse.
+	if record.RotatedAt == 0 {
+		record.RotatedAt = now.Unix()
 	}
 	// Legacy tokens without a grant ID keep an empty one; their sessions are
 	// then identified by device, which stays stable across refreshes.
@@ -2244,6 +2366,35 @@ func (m *Manager) DeriveKey(label string) []byte {
 	return mac.Sum(nil)
 }
 
+// revokeGrantLocked removes every access and refresh token of one login and
+// returns how many were removed. Tokens from before grant IDs existed are
+// matched by user, client and resource instead.
+func (m *Manager) revokeGrantLocked(userID, clientID, grantID, resource string) int {
+	matches := func(recUser, recClient, recGrant, recResource string) bool {
+		if recUser != userID || recClient != clientID {
+			return false
+		}
+		if grantID != "" {
+			return recGrant == grantID
+		}
+		return recGrant == "" && normalizeResource(recResource) == normalizeResource(resource)
+	}
+	removed := 0
+	for token, record := range m.data.AccessTokens {
+		if matches(record.UserID, record.ClientID, record.GrantID, record.Resource) {
+			delete(m.data.AccessTokens, token)
+			removed++
+		}
+	}
+	for token, record := range m.data.RefreshTokens {
+		if matches(record.UserID, record.ClientID, record.GrantID, record.Resource) {
+			delete(m.data.RefreshTokens, token)
+			removed++
+		}
+	}
+	return removed
+}
+
 func (m *Manager) refreshReuseAllowed(record *refreshTokenRecord, now time.Time) bool {
 	if record.RotatedAt == 0 {
 		return true
@@ -2292,10 +2443,16 @@ func (m *Manager) validateRedirectURI(raw string) error {
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
 		return fmt.Errorf("invalid redirect_uri: %s", raw)
 	}
+	if parsed.Fragment != "" || strings.Contains(raw, "#") {
+		return fmt.Errorf("redirect_uri must not contain a fragment")
+	}
+	if parsed.User != nil {
+		return fmt.Errorf("redirect_uri must not contain user information")
+	}
 	if parsed.Scheme == "https" {
 		return nil
 	}
-	if parsed.Scheme == "http" && (parsed.Hostname() == "localhost" || parsed.Hostname() == "127.0.0.1") {
+	if parsed.Scheme == "http" && isLoopbackHost(parsed.Hostname()) {
 		return nil
 	}
 	if parsed.Scheme == "http" && m.redirectOriginAllowed(parsed) {
@@ -2332,9 +2489,37 @@ func redirectIsLoopback(redirectURI string) bool {
 	if err != nil {
 		return false
 	}
-	switch parsed.Hostname() {
+	return isLoopbackHost(parsed.Hostname())
+}
+
+func isLoopbackHost(host string) bool {
+	switch host {
 	case "localhost", "127.0.0.1", "::1":
 		return true
+	}
+	return false
+}
+
+// redirectURIRegistered compares a requested redirect URI with the registered
+// ones. The match is exact, except that a plain-HTTP loopback redirect may
+// use any port: native apps listen on a port the system picks at run time
+// (OAuth 2.1 section 2.3.1, RFC 8252 section 7.3).
+func redirectURIRegistered(registered []string, requested string) bool {
+	if slices.Contains(registered, requested) {
+		return true
+	}
+	want, err := url.Parse(requested)
+	if err != nil || want.Scheme != "http" || !isLoopbackHost(want.Hostname()) || want.User != nil || want.Fragment != "" {
+		return false
+	}
+	for _, candidate := range registered {
+		have, err := url.Parse(candidate)
+		if err != nil || have.Scheme != "http" || !isLoopbackHost(have.Hostname()) {
+			continue
+		}
+		if have.Hostname() == want.Hostname() && have.EscapedPath() == want.EscapedPath() && have.RawQuery == want.RawQuery {
+			return true
+		}
 	}
 	return false
 }
@@ -2452,13 +2637,14 @@ func dedupeStrings(values []string) []string {
 }
 
 func (m *Manager) ensureCSRFCookie(w http.ResponseWriter, r *http.Request) string {
-	if cookie, err := r.Cookie(csrfCookieName); err == nil && strings.TrimSpace(cookie.Value) != "" {
+	name := m.csrfCookieNameFor(r)
+	if cookie, err := r.Cookie(name); err == nil && strings.TrimSpace(cookie.Value) != "" {
 		return cookie.Value
 	}
 
 	token := randomToken(18)
 	http.SetCookie(w, &http.Cookie{
-		Name:     csrfCookieName,
+		Name:     name,
 		Value:    token,
 		Path:     "/",
 		HttpOnly: false,
@@ -2468,11 +2654,21 @@ func (m *Manager) ensureCSRFCookie(w http.ResponseWriter, r *http.Request) strin
 	return token
 }
 
+// csrfCookieNameFor returns the CSRF cookie name. Over HTTPS it carries the
+// __Host- prefix: browsers then only accept it from this exact host, so a
+// sibling subdomain cannot plant its own token.
+func (m *Manager) csrfCookieNameFor(r *http.Request) string {
+	if m.cookieSecure(r) {
+		return "__Host-" + csrfCookieName
+	}
+	return csrfCookieName
+}
+
 func (m *Manager) validateCSRFCookie(r *http.Request) bool {
 	if !m.requestFromOwnOrigin(r) {
 		return false
 	}
-	cookie, err := r.Cookie(csrfCookieName)
+	cookie, err := r.Cookie(m.csrfCookieNameFor(r))
 	if err != nil || strings.TrimSpace(cookie.Value) == "" {
 		return false
 	}
@@ -2549,7 +2745,7 @@ func sanitizeNext(next string) string {
 	return next
 }
 
-func buildOAuthCodeRedirectURL(redirectURI, code, state string) (string, error) {
+func buildOAuthCodeRedirectURL(redirectURI, issuer, code, state string) (string, error) {
 	parsed, err := url.Parse(redirectURI)
 	if err != nil {
 		return "", err
@@ -2559,11 +2755,14 @@ func buildOAuthCodeRedirectURL(redirectURI, code, state string) (string, error) 
 	if state != "" {
 		query.Set("state", state)
 	}
+	// RFC 9207: lets a client that talks to several authorization servers
+	// tell which one answered.
+	query.Set("iss", issuer)
 	parsed.RawQuery = query.Encode()
 	return parsed.String(), nil
 }
 
-func buildOAuthErrorRedirectURL(redirectURI, errCode, state string) (string, error) {
+func buildOAuthErrorRedirectURL(redirectURI, issuer, errCode, state string) (string, error) {
 	parsed, err := url.Parse(redirectURI)
 	if err != nil {
 		return "", err
@@ -2573,6 +2772,7 @@ func buildOAuthErrorRedirectURL(redirectURI, errCode, state string) (string, err
 	if state != "" {
 		query.Set("state", state)
 	}
+	query.Set("iss", issuer)
 	parsed.RawQuery = query.Encode()
 	return parsed.String(), nil
 }
@@ -2885,7 +3085,7 @@ const authorizeTemplate = `
 <div class="panel">
   <div class="panel-body stack-sm">
     <div><strong>{{.ClientName}}</strong> m&ouml;chte auf folgende Ressource zugreifen:</div>
-    {{if .Resource}}<code style="word-break:break-all;">{{.Resource}}</code>{{else}}<div><strong>Alle MCP-Server dieses Gateways</strong>, die dein Account nutzen darf (gatewayweiter Zugriff).</div>{{end}}
+    {{if .Resource}}<code style="word-break:break-all;">{{.Resource}}</code>{{else if .ResourceOptions}}<div class="hint">Der Client hat keinen MCP-Server genannt. W&auml;hle unten den einen Server, f&uuml;r den dieser Zugang gelten soll.</div>{{else}}<div><strong>Alle MCP-Server dieses Gateways</strong>, die dein Account nutzen darf (gatewayweiter Zugriff).</div>{{end}}
     <div class="hint">Angeforderte Scopes: <code>{{.Scope}}</code></div>
     <div>Der Zugang wird &uuml;bergeben an: <strong class="mono" style="word-break:break-all;">{{.RedirectHost}}</strong>{{if .RedirectIsLocal}} <span class="hint">(Programm auf diesem Ger&auml;t)</span>{{end}}</div>
     <div class="hint mono" style="word-break:break-all;">{{.RedirectURI}}</div>
@@ -2899,7 +3099,12 @@ const authorizeTemplate = `
   <input type="hidden" name="response_type" value="{{.ResponseType}}">
   <input type="hidden" name="state" value="{{.State}}">
   <input type="hidden" name="scope" value="{{.ScopeValue}}">
-  <input type="hidden" name="resource" value="{{.ResourceValue}}">
+  {{if .ResourceOptions}}<label style="display:block;width:100%;">MCP-Server f&uuml;r diesen Zugang
+    <select name="resource" required>
+      <option value="" selected disabled>Bitte w&auml;hlen</option>
+      {{range .ResourceOptions}}<option value="{{.URL}}">{{.Name}} ({{.URL}})</option>{{end}}
+    </select>
+  </label>{{else}}<input type="hidden" name="resource" value="{{.ResourceValue}}">{{end}}
   <input type="hidden" name="code_challenge" value="{{.CodeChallenge}}">
   <input type="hidden" name="code_challenge_method" value="{{.CodeChallengeMethod}}">
   <button type="submit" name="action" value="approve" class="btn btn-primary">Freigeben</button>
