@@ -322,3 +322,59 @@ func TestFullClientRegistryAnswersWithRetryLater(t *testing.T) {
 		t.Fatalf("expected 429 temporarily_unavailable with Retry-After, got %d %q", rec.Code, rec.Body.String())
 	}
 }
+
+// Holding a used code is not enough to end the login it produced: the request
+// must also come from the code's client with the right verifier.
+func TestUsedCodeAloneCannotRevokeTheLogin(t *testing.T) {
+	login := newCredentialTestLogin(t)
+	code, err := login.manager.createAuthorizationCode(login.userID, login.params)
+	if err != nil {
+		t.Fatalf("create auth code: %v", err)
+	}
+	tokens, err := login.manager.exchangeAuthorizationCode(login.client.ID, "", "none", code, login.params.RedirectURI, login.verifier, credentialTestResource)
+	if err != nil {
+		t.Fatalf("first exchange: %v", err)
+	}
+	other, err := login.manager.registerClient("Other", []string{login.params.RedirectURI}, nil, nil, "none")
+	if err != nil {
+		t.Fatalf("register other client: %v", err)
+	}
+
+	if _, err := login.manager.exchangeAuthorizationCode(other.ID, "", "none", code, login.params.RedirectURI, login.verifier, credentialTestResource); !errors.Is(err, ErrInvalidGrant) {
+		t.Fatalf("used code from another client: expected invalid_grant, got %v", err)
+	}
+	if _, err := login.manager.exchangeAuthorizationCode(login.client.ID, "", "none", code, login.params.RedirectURI, "wrong-verifier-wrong-verifier-wrong-verifier", credentialTestResource); !errors.Is(err, ErrInvalidGrant) {
+		t.Fatalf("used code with a wrong verifier: expected invalid_grant, got %v", err)
+	}
+	if _, err := login.manager.ValidateAccessToken(tokens.AccessToken, credentialTestResource); err != nil {
+		t.Fatalf("the login must survive replays that fail the code's own checks: %v", err)
+	}
+}
+
+func TestConsentCanBeDeclinedWithoutChoosingAServer(t *testing.T) {
+	manager := newTestManager(t, "admin@example.com", "super-secret-password")
+	client, err := manager.registerClient("Codex CLI", []string{"http://127.0.0.1:51066/callback"}, nil, nil, "none")
+	if err != nil {
+		t.Fatalf("register client: %v", err)
+	}
+	form := url.Values{
+		"csrf_token": {"csrf"}, "action": {"deny"}, "client_id": {client.ID}, "redirect_uri": {"http://127.0.0.1:51066/callback"},
+		"response_type": {"code"}, "state": {"state-value"}, "resource": {""},
+		"code_challenge": {"abcdefghijklmnopqrstuvwxyz0123456789abcdef"}, "code_challenge_method": {"S256"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "https://mcp.example.com/authorize", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(&http.Cookie{Name: manager.csrfCookieNameFor(req), Value: "csrf"})
+	req.AddCookie(sessionCookieFor(t, manager, "admin@example.com"))
+	rec := httptest.NewRecorder()
+	manager.HandleAuthorize(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "error=access_denied") {
+		t.Fatalf("declining without a server must answer access_denied, got %d %q", rec.Code, rec.Body.String())
+	}
+
+	// The consent page must let the browser submit the decline button without
+	// the required server choice.
+	if !strings.Contains(authorizeTemplate, `value="deny" class="btn btn-ghost" formnovalidate`) {
+		t.Fatalf("decline button must skip form validation")
+	}
+}

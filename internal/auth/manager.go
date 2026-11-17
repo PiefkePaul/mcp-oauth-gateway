@@ -1620,13 +1620,16 @@ func (m *Manager) handleAuthorizePost(w http.ResponseWriter, r *http.Request) {
 		values.Set(key, r.FormValue(key))
 	}
 
-	params, _, err := m.parseAuthorizeRequest(true, true, values)
+	// Declining needs no MCP server: a client that named none must still get
+	// its access_denied answer.
+	approve := r.FormValue("action") == "approve"
+	params, _, err := m.parseAuthorizeRequest(true, approve, values)
 	if err != nil {
 		writeAuthorizationRequestError(w, err)
 		return
 	}
 
-	if r.FormValue("action") != "approve" {
+	if !approve {
 		target, buildErr := buildOAuthErrorRedirectURL(params.RedirectURI, m.baseURL(r), "access_denied", params.State)
 		if buildErr != nil {
 			http.Error(w, "invalid redirect_uri", http.StatusBadRequest)
@@ -1888,15 +1891,6 @@ func (m *Manager) exchangeAuthorizationCode(clientID, clientSecret, clientAuthMe
 		_ = m.saveLocked()
 		return nil, ErrTokenExpired
 	}
-	if record.UsedAt > 0 {
-		// A code is good for one exchange. A second one means the code leaked,
-		// so the tokens the first exchange produced are withdrawn as well.
-		revoked := m.revokeGrantLocked(record.UserID, record.ClientID, record.GrantID, record.Resource)
-		delete(m.data.AuthCodes, code)
-		log.Printf("oauth authorization code replayed client_id=%s user_id=%s revoked_tokens=%d", record.ClientID, record.UserID, revoked)
-		_ = m.saveAndNotifyLocked()
-		return nil, ErrInvalidGrant
-	}
 	if record.ClientID != client.ID || record.RedirectURI != redirectURI {
 		return nil, ErrInvalidGrant
 	}
@@ -1904,6 +1898,18 @@ func (m *Manager) exchangeAuthorizationCode(clientID, clientSecret, clientAuthMe
 		return nil, ErrInvalidGrant
 	}
 	if !validatePKCE(record.CodeChallenge, codeVerifier) {
+		return nil, ErrInvalidGrant
+	}
+	if record.UsedAt > 0 {
+		// A code is good for one exchange. A second valid one means the code
+		// and its verifier leaked, so the tokens the first exchange produced
+		// are withdrawn as well. This comes after the checks above on
+		// purpose: someone who only holds a used code, without the client and
+		// the verifier it belongs to, must not be able to end the login.
+		revoked := m.revokeGrantLocked(record.UserID, record.ClientID, record.GrantID, record.Resource)
+		delete(m.data.AuthCodes, code)
+		log.Printf("oauth authorization code replayed client_id=%s user_id=%s revoked_tokens=%d", record.ClientID, record.UserID, revoked)
+		_ = m.saveAndNotifyLocked()
 		return nil, ErrInvalidGrant
 	}
 
@@ -3152,7 +3158,7 @@ const authorizeTemplate = `
   <input type="hidden" name="code_challenge" value="{{.CodeChallenge}}">
   <input type="hidden" name="code_challenge_method" value="{{.CodeChallengeMethod}}">
   <button type="submit" name="action" value="approve" class="btn btn-primary">Freigeben</button>
-  <button type="submit" name="action" value="deny" class="btn btn-ghost">Ablehnen</button>
+  <button type="submit" name="action" value="deny" class="btn btn-ghost" formnovalidate>Ablehnen</button>
 </form>
 {{end}}
 `
