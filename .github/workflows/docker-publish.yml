@@ -28,7 +28,9 @@ jobs:
   # sha-<short>.
   build:
     if: github.server_url != 'https://github.com'
-    runs-on: ubuntu-latest
+    # Needs a Docker daemon. The job containers of gitea-nas-1 (ubuntu-latest)
+    # have no Docker socket, the CI manager slots (slot-nas-*) do.
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_LINUX || '["self-hosted","nas","mcp-oauth-gateway"]') }}
     permissions:
       contents: read
     steps:
@@ -39,7 +41,7 @@ jobs:
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
 
-      # Builder in the runner's network: resolves gitea:3000, plain http.
+      # Builder in the slot's network: resolves gitea:3000, plain http.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
         with:
