@@ -4,34 +4,42 @@ on:
   push:
     branches: [main]
     tags: ["v*.*.*", "*.*.*"]
+  pull_request:
+  workflow_dispatch:
 
-# Images go to the Gitea container registry on the NAS (pulled as
-# git.scholz-cloud.de/piefkepaul/mcp-oauth-gateway) and, as an off-site copy,
-# to Docker Hub. Built on the NAS runners, which push to Gitea inside ci-net as
-# plain http (gitea:3000): the public name runs through Cloudflare, which
-# rejects request bodies over 100 MB. Nothing deploys from here.
+# Gitea (git.scholz-cloud.de) is the primary home of this repo, GitHub is only
+# a push mirror. The image goes to the Gitea container registry on the NAS and
+# is pulled as git.scholz-cloud.de/piefkepaul/mcp-oauth-gateway. The runner
+# pushes inside the LAN as plain http (gitea:3000): the public name runs
+# through Cloudflare, which rejects request bodies over 100 MB.
+# Nothing deploys from here; deployments pin a fixed sha-<short> tag by hand.
 env:
-  # The build record would be uploaded as an Actions artifact (full GitHub storage).
+  # The build record would otherwise be uploaded as an Actions artifact.
   DOCKER_BUILD_RECORD_UPLOAD: false
-  GITEA_REGISTRY: gitea:3000
+  REGISTRY: gitea:3000
+  IMAGE: gitea:3000/piefkepaul/mcp-oauth-gateway
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  build-and-push:
-    runs-on: ${{ fromJSON(vars.CI_RUNNER_LINUX || '["self-hosted","nas","mcp-oauth-gateway"]') }}
+  # Pull requests and other branches only build. Pushes to main also publish
+  # the tags latest and sha-<short>.
+  build:
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
       - name: Check out
         uses: actions/checkout@v7
 
+      # Only the runtime stage runs under emulation (arm64); Go is cross-compiled.
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
 
-      # Builder in the slot's network namespace (ci-net): resolves gitea:3000, plain http.
+      # Builder in the runner's network: resolves gitea:3000, plain http.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
         with:
@@ -42,11 +50,44 @@ jobs:
               insecure = true
 
       - name: Log in to Gitea registry
+        if: github.ref == 'refs/heads/main'
         uses: docker/login-action@v4
         with:
-          registry: ${{ env.GITEA_REGISTRY }}
-          username: ${{ vars.GITEA_REGISTRY_USER || 'piefkepaul' }}
-          password: ${{ secrets.GITEA_REGISTRY_TOKEN }}
+          registry: ${{ env.REGISTRY }}
+          username: piefkepaul
+          password: ${{ secrets.REGISTRY_TOKEN }}
+
+      - name: Short SHA
+        id: sha
+        run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Build (and push on main)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.ref == 'refs/heads/main' }}
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:sha-${{ steps.sha.outputs.short }}
+
+  # Docker Hub copy with the historical tags. Only makes sense on GitHub, where
+  # Actions are switched off since the move to Gitea; kept for the case that
+  # the mirror is ever used for builds again.
+  dockerhub:
+    if: github.server_url == 'https://github.com' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to Docker Hub
         uses: docker/login-action@v4
@@ -54,31 +95,25 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # Reproduces the tags the image previously carried: a short-SHA tag on
-      # every commit, latest/beta/openwebui-test floating tags on every push
-      # to main, and a version tag when a version git tag (v1.2.3 or 1.2.3)
-      # is pushed. Every tag goes to Gitea and Docker Hub.
+      # A short-SHA tag on every commit, latest/beta/openwebui-test floating
+      # tags on every push to main, and a version tag when a version git tag
+      # (v1.2.3 or 1.2.3) is pushed.
       - name: Compute image tags
         id: tags
         env:
-          IMAGES: gitea:3000/piefkepaul/mcp-oauth-gateway piefkepaul/mcp-oauth-gateway
+          IMAGE: piefkepaul/mcp-oauth-gateway
           GITHUB_REF: ${{ github.ref }}
         run: |
           set -euo pipefail
           sha_short=$(git rev-parse --short=7 HEAD)
-          names="$sha_short"
+          tags="$IMAGE:$sha_short"
           if [[ "$GITHUB_REF" == refs/heads/main ]]; then
-            names="$names latest beta openwebui-test"
+            tags="$tags,$IMAGE:latest,$IMAGE:beta,$IMAGE:openwebui-test"
           elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
             version="${GITHUB_REF#refs/tags/}"
-            names="$names ${version#v}"
+            version="${version#v}"
+            tags="$tags,$IMAGE:$version"
           fi
-          tags=""
-          for image in $IMAGES; do
-            for name in $names; do
-              tags="${tags:+$tags,}$image:$name"
-            done
-          done
           echo "tags=$tags" >> "$GITHUB_OUTPUT"
 
       - name: Build and push
