@@ -3,10 +3,88 @@ name: Build and publish Docker image
 on:
   push:
     branches: [main]
-    tags: ["v*.*.*", "*.*.*"]
+  # No pull_request trigger: the repo is public and the build runs on a NAS
+  # slot, which only takes trusted runs (push to main, manual dispatch).
+  workflow_dispatch:
+
+# Gitea (git.scholz-cloud.de) is the primary home of this repo, GitHub is a
+# two-way mirror (git-sync). The image goes to the Gitea container registry on
+# the NAS and is pulled as git.scholz-cloud.de/scholz/mcp-oauth-gateway. The runner
+# pushes inside the LAN as plain http (gitea:3000): the public name runs
+# through Cloudflare, which rejects request bodies over 100 MB.
+# Nothing deploys from here; deployments pin a fixed sha-<short> tag by hand.
+env:
+  # The build record would otherwise be uploaded as an Actions artifact.
+  DOCKER_BUILD_RECORD_UPLOAD: false
+  REGISTRY: gitea:3000
+  IMAGE: gitea:3000/scholz/mcp-oauth-gateway
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  build-and-push:
+  # Gitea only (gitea:3000 is not reachable from GitHub). Pushes to main publish
+  # the tags latest and sha-<short>. A manual run on another branch only builds.
+  build:
+    if: github.server_url != 'https://github.com'
+    # Needs a Docker daemon. The job containers of gitea-nas-1 (ubuntu-latest)
+    # have no Docker socket, the CI manager slots (slot-nas-*) do.
+    runs-on: [self-hosted, nas, mcp-oauth-gateway]
+    permissions:
+      contents: read
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      # Only the runtime stage runs under emulation (arm64); Go is cross-compiled.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      # Builder in the slot's network: resolves gitea:3000, plain http.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          driver-opts: network=host
+          buildkitd-config-inline: |
+            [registry."gitea:3000"]
+              http = true
+              insecure = true
+
+      # Fails early if the slot cannot reach the registry inside the LAN
+      # (401 = up, login required).
+      - name: Check Gitea registry is reachable
+        run: |
+          code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' "http://$REGISTRY/v2/" || true)
+          echo "http://$REGISTRY/v2/ -> HTTP $code"
+          [ "$code" = 401 ] || [ "$code" = 200 ]
+
+      - name: Log in to Gitea registry
+        if: github.ref == 'refs/heads/main'
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: piefkepaul
+          password: ${{ secrets.REGISTRY_TOKEN }}
+
+      - name: Short SHA
+        id: sha
+        run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Build (and push on main)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.ref == 'refs/heads/main' }}
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:sha-${{ steps.sha.outputs.short }}
+
+  # Docker Hub copy with the historical tags. GitHub only, and there only on
+  # pushes to main.
+  dockerhub:
+    if: github.server_url == 'https://github.com' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -26,27 +104,16 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # Reproduces the tags the image previously carried: a short-SHA tag on
-      # every commit, latest/beta/openwebui-test floating tags on every push
-      # to main, and a version tag when a version git tag (v1.2.3 or 1.2.3)
-      # is pushed.
+      # The tags the image carried so far: a short-SHA tag plus the floating
+      # tags latest/beta/openwebui-test.
       - name: Compute image tags
         id: tags
         env:
           IMAGE: piefkepaul/mcp-oauth-gateway
-          GITHUB_REF: ${{ github.ref }}
         run: |
           set -euo pipefail
           sha_short=$(git rev-parse --short=7 HEAD)
-          tags="$IMAGE:$sha_short"
-          if [[ "$GITHUB_REF" == refs/heads/main ]]; then
-            tags="$tags,$IMAGE:latest,$IMAGE:beta,$IMAGE:openwebui-test"
-          elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            version="${GITHUB_REF#refs/tags/}"
-            version="${version#v}"
-            tags="$tags,$IMAGE:$version"
-          fi
-          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          echo "tags=$IMAGE:$sha_short,$IMAGE:latest,$IMAGE:beta,$IMAGE:openwebui-test" >> "$GITHUB_OUTPUT"
 
       - name: Build and push
         uses: docker/build-push-action@v7
