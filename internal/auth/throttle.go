@@ -201,3 +201,42 @@ func (m *Manager) recordLoginFailure(email, ip string) {
 func (m *Manager) recordLoginSuccess(email, ip string) {
 	m.limiter.reset(loginPairKey(email, ip))
 }
+
+// keyedLocks hands out one mutex per key and forgets it once nobody holds
+// or waits for it.
+type keyedLocks struct {
+	mu    sync.Mutex
+	locks map[string]*keyedLock
+}
+
+type keyedLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+// lock blocks until the caller holds the lock for key and returns the
+// function that releases it.
+func (k *keyedLocks) lock(key string) func() {
+	k.mu.Lock()
+	if k.locks == nil {
+		k.locks = make(map[string]*keyedLock)
+	}
+	entry := k.locks[key]
+	if entry == nil {
+		entry = &keyedLock{}
+		k.locks[key] = entry
+	}
+	entry.refs++
+	k.mu.Unlock()
+
+	entry.mu.Lock()
+	return func() {
+		entry.mu.Unlock()
+		k.mu.Lock()
+		entry.refs--
+		if entry.refs == 0 {
+			delete(k.locks, key)
+		}
+		k.mu.Unlock()
+	}
+}

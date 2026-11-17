@@ -6,7 +6,9 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestRefreshTokenReuseAfterGraceRevokesTheWholeLogin(t *testing.T) {
@@ -265,5 +267,58 @@ func TestCSRFCookieUsesHostPrefixOverHTTPS(t *testing.T) {
 	post.AddCookie(&http.Cookie{Name: csrfCookieName, Value: "planted"})
 	if manager.validateCSRFCookie(post) {
 		t.Fatalf("a CSRF cookie without the __Host- prefix must not be accepted over HTTPS")
+	}
+}
+
+// A burst of parallel guesses must not slip past the throttle before the
+// first failure is counted.
+func TestParallelLoginGuessesAreCountedOneByOne(t *testing.T) {
+	manager := newTestManager(t, "admin@example.com", "super-secret-password")
+
+	const attempts = 20
+	codes := make([]int, attempts)
+	var wg sync.WaitGroup
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			rec := httptest.NewRecorder()
+			manager.HandleAccountLogin(rec, loginRequest("admin@example.com", "wrong-password", "203.0.113.7:1234"))
+			codes[i] = rec.Code
+		}(i)
+	}
+	wg.Wait()
+
+	checked := 0
+	for _, code := range codes {
+		switch code {
+		case http.StatusOK:
+			checked++
+		case http.StatusTooManyRequests:
+		default:
+			t.Fatalf("unexpected status %d", code)
+		}
+	}
+	if checked != loginPairLimit {
+		t.Fatalf("%d of %d parallel guesses reached the password check, want exactly %d", checked, attempts, loginPairLimit)
+	}
+}
+
+func TestFullClientRegistryAnswersWithRetryLater(t *testing.T) {
+	manager := newTestManager(t, "admin@example.com", "super-secret-password")
+	manager.mu.Lock()
+	for i := 0; i < maxRegisteredClients; i++ {
+		id := randomToken(8)
+		manager.data.Clients[id] = &clientRecord{ID: id, UpdatedAt: time.Now().Unix()}
+	}
+	manager.mu.Unlock()
+
+	body := `{"client_name":"x","redirect_uris":["https://app.example/cb"]}`
+	req := httptest.NewRequest(http.MethodPost, "https://mcp.example.com/register", strings.NewReader(body))
+	req.RemoteAddr = "203.0.113.9:1"
+	rec := httptest.NewRecorder()
+	manager.HandleClientRegistration(rec, req)
+	if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Retry-After") == "" || !strings.Contains(rec.Body.String(), "temporarily_unavailable") {
+		t.Fatalf("expected 429 temporarily_unavailable with Retry-After, got %d %q", rec.Code, rec.Body.String())
 	}
 }

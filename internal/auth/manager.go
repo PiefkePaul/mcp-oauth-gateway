@@ -57,6 +57,8 @@ var (
 	ErrTokenExpired     = errors.New("token expired")
 	ErrInvalidClient    = errors.New("invalid client")
 	ErrInvalidGrant     = errors.New("invalid grant")
+	// ErrTooManyClients means the client registry is full for now.
+	ErrTooManyClients = errors.New("too many registered clients; try again later")
 )
 
 type Config struct {
@@ -100,6 +102,9 @@ type Config struct {
 type Manager struct {
 	cfg     Config
 	limiter *attemptLimiter
+	// loginLocks lets one password check per account run at a time, so the
+	// throttle counts every attempt before the next one is looked at.
+	loginLocks keyedLocks
 
 	mu                    sync.Mutex
 	data                  *storeData
@@ -451,6 +456,14 @@ func (m *Manager) HandleClientRegistration(w http.ResponseWriter, r *http.Reques
 	}
 
 	client, err := m.registerClientFromMetadata(payload)
+	if errors.Is(err, ErrTooManyClients) {
+		// Not the client's fault and not permanent: unused registrations are
+		// pruned after their grace period.
+		log.Printf("oauth client registration refused: registry full")
+		w.Header().Set("Retry-After", strconv.Itoa(int(unusedClientGracePeriod.Seconds())))
+		writeOAuthError(w, http.StatusTooManyRequests, "temporarily_unavailable", err.Error())
+		return
+	}
 	if err != nil {
 		log.Printf("oauth client registration failed name=%q auth_method=%q err=%v", payload.ClientName, payload.TokenEndpointAuthMethod, err)
 		writeOAuthError(w, http.StatusBadRequest, "invalid_client_metadata", err.Error())
@@ -674,6 +687,12 @@ func (m *Manager) HandleAccountLogin(w http.ResponseWriter, r *http.Request) {
 				"Title":     m.cfg.PortalTitle,
 			})
 		}
+		// Checking the block, verifying the password and counting a failure
+		// are separate steps. Without this lock a burst of parallel guesses
+		// for one account would all pass the check before the first failure
+		// is counted.
+		unlockLogin := m.loginLocks.lock(throttleEmail)
+		defer unlockLogin()
 		if blocked := m.loginBlockedFor(throttleEmail, clientIP); blocked > 0 {
 			minutes := int(blocked/time.Minute) + 1
 			w.Header().Set("Retry-After", strconv.Itoa(int(blocked.Seconds())+1))
@@ -1236,7 +1255,7 @@ func (m *Manager) makeRoomForClientLocked(now time.Time) error {
 		log.Printf("oauth client registry pruned unused_clients=%d remaining=%d", removed, len(m.data.Clients))
 	}
 	if len(m.data.Clients) >= maxRegisteredClients {
-		return fmt.Errorf("too many registered clients; try again later")
+		return ErrTooManyClients
 	}
 	return nil
 }
@@ -3075,6 +3094,7 @@ const accountTemplate = `
 
 <details>
   <summary>Passwort &auml;ndern</summary>
+  <p class="hint" style="margin-top:.6rem;">Eine Passwort&auml;nderung meldet alle anderen Browser-Sitzungen ab. Verbundene Ger&auml;te und Bearer Tokens bleiben g&uuml;ltig. Wenn du das Passwort wegen eines Verdachts &auml;nderst, widerrufe sie oben einzeln.</p>
   <form method="post" action="/account/password" class="stack-sm" style="margin-top:.8rem;">
     <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
     <div class="field" style="margin-top:0;">
