@@ -1,10 +1,9 @@
 module github.com/PiefkePaul/mcp-oauth-gateway
 
-go 1.24.2
+go 1.27.4
 
 require (
-	golang.org/x/crypto v0.37.0
+	github.com/ulikunitz/xz v0.5.17
+	golang.org/x/crypto v0.59.0
 	gopkg.in/yaml.v3 v3.0.1
 )
-
-require github.com/ulikunitz/xz v0.5.15 // indirect

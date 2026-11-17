@@ -3,11 +3,28 @@ services:
     image: your-dockerhub-user/mcp-oauth-gateway:latest
     container_name: mcp-oauth-gateway
     restart: unless-stopped
-    # Publish the port only if no reverse proxy on the "reverse-proxy" network
-    # reaches the container directly; otherwise drop this block so the gateway
-    # is not reachable around the proxy.
-    ports:
-      - "127.0.0.1:8080:8080"
+    # The image runs as the unprivileged user 10001:10001. ./config and ./data
+    # must be writable for that user:
+    #   sudo chown -R 10001:10001 ./config ./data && chmod 700 ./config ./data
+    # Alternatively keep the current owner of the folders and run the container
+    # as that owner, e.g. on a NAS:
+    # user: "1026:100"
+    read_only: true
+    tmpfs:
+      # Scratch space for the gateway and native STDIO children. Not executable.
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    # No host port by default: the reverse proxy reaches the gateway as
+    # http://mcp-oauth-gateway:8080 through the gateway-edge network.
+    # Without a reverse proxy in Docker, publish it on loopback only:
+    # ports:
+    #   - "127.0.0.1:8080:8080"
+    expose:
+      - "8080"
     environment:
       MCP_GATEWAY_PUBLIC_BASE_URL: "https://mcp.example.com"
       MCP_GATEWAY_LISTEN_ADDR: ":8080"
@@ -57,8 +74,12 @@ services:
       # - ./tools:/tools:ro
       # Required only when MCP_GATEWAY_DOCKER_MANAGEMENT_ENABLED=true:
       # - /var/run/docker.sock:/var/run/docker.sock
+    # The unprivileged user then also needs the group that owns the socket on
+    # the host (see `stat -c %g /var/run/docker.sock`):
+    # group_add:
+    #   - "999"
     networks:
-      - reverse-proxy
+      - gateway-edge
       - mcp-internal
 
   n8n-mcp:
@@ -109,7 +130,15 @@ services:
       - mcp-internal
 
 networks:
-  reverse-proxy:
+  # Dedicated network that holds only the reverse proxy and the gateway. Do not
+  # reuse a shared proxy network with unrelated containers: everything in it
+  # could talk to the gateway and, through other shared networks, to the MCP
+  # servers directly. Create it once and attach the proxy to it:
+  #   docker network create mcp-gateway-edge
+  #   docker network connect mcp-gateway-edge <reverse-proxy-container>
+  gateway-edge:
+    name: mcp-gateway-edge
     external: true
+  # Gateway and its MCP upstreams only. The upstreams publish no host ports.
   mcp-internal:
     driver: bridge
