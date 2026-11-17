@@ -737,6 +737,20 @@ func (w *accessLogResponseWriter) Write(payload []byte) (int, error) {
 	return n, err
 }
 
+// Flush passes flushes through, so streamed responses (SSE) reach the client
+// immediately instead of waiting in the server buffer until the upstream closes.
+func (w *accessLogResponseWriter) Flush() {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	_ = http.NewResponseController(w.ResponseWriter).Flush()
+}
+
+// Unwrap lets http.ResponseController reach the underlying writer.
+func (w *accessLogResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
 func accessLogMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
