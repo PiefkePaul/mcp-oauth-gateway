@@ -1,0 +1,38 @@
+name: Vulnerability check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  # New advisories appear without any change in this repo.
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vulncheck-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Gitea is the primary CI. On the GitHub mirror only pushes to main run.
+  govulncheck:
+    if: github.server_url != 'https://github.com' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      # go.mod pins the exact Go release, so the standard library that is
+      # scanned is the one the Dockerfile's golang:<minor> image should carry.
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      # Reports only vulnerabilities in code paths the gateway actually calls
+      # (modules and standard library) and fails the job if there is one.
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...

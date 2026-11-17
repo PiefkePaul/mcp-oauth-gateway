@@ -111,6 +111,39 @@ Wenn `/config/routes.yaml` beim Start fehlt, erstellt der Gateway automatisch ei
 
 Ein Compose-Beispiel liegt in [docker-compose.example.yaml](/Volumes/ssd-data/Docker/mcp-oauth-gateway/docker-compose.example.yaml).
 
+### Container-Haertung
+
+Das Image laeuft nicht als root, sondern als fester Nutzer `gateway` mit UID/GID `10001:10001`. Das Compose-Beispiel setzt zusaetzlich `read_only: true`, `cap_drop: [ALL]`, `no-new-privileges`, ein `tmpfs` auf `/tmp` und ein eigenes Netz `mcp-gateway-edge`, in dem nur Reverse-Proxy und Gateway haengen.
+
+Was der Gateway schreibt:
+
+| Pfad | Inhalt | Modus |
+| --- | --- | --- |
+| `/config/routes.yaml` | Routen (Dashboard speichert hierhin) | 0644 |
+| `/data/auth-store.enc` | verschluesselter Auth-Store | 0600 |
+| `/data/openapi/` | hochgeladene OpenAPI-Dokumente | 0750 / 0640 |
+| `/data/stdio-mcp/` | installierte STDIO-Binaries | 0750 |
+| `/tmp` | Scratch (tmpfs, geht beim Neustart verloren) | - |
+
+Alle Dateien werden ueber eine temporaere Datei im selben Ordner und `rename` geschrieben. Deshalb muss der Nutzer im **Ordner** schreiben duerfen, Schreibrecht nur auf die Datei reicht nicht. Der Rest des Dateisystems darf schreibgeschuetzt sein.
+
+**Umstieg von einem aelteren Image (lief als root):** Bestehende Bind-Mounts gehoeren dann root, `auth-store.enc` hat Modus 0600. Ohne Anpassung startet der neue Container nicht (`failed to read routes config ... permission denied`). Rechte und Image in einem Schritt umstellen:
+
+```sh
+docker compose stop mcp-oauth-gateway
+sudo chown -R 10001:10001 ./config ./data
+sudo chmod 700 ./config ./data
+# danach Image-Tag wechseln
+docker compose up -d --no-deps mcp-oauth-gateway
+```
+
+- `chown` mit numerischer ID braucht kein Nutzerkonto auf dem Host. Alternativ bleiben die Ordner beim bisherigen Besitzer und der Container startet mit `user: "<uid>:<gid>"` dieses Besitzers.
+- Rollback auf ein altes Image funktioniert ohne Rueckaendern der Rechte: root im Container liest und schreibt auch Dateien von 10001. Dateien, die das alte Image dann neu anlegt, gehoeren aber wieder root und muessen vor dem naechsten Umstieg erneut uebergeben werden.
+- Bereits installierte STDIO-Binaries unter `/data/stdio-mcp` gehoeren ebenfalls root (0750) und sind ohne das `chown -R` nicht mehr ausfuehrbar.
+- STDIO-Kindprozesse erben Nutzer, `HOME=/tmp` und `TMPDIR=/tmp`. `/tmp` ist im Beispiel `noexec`: Werkzeuge, die sich nach `/tmp` entpacken und von dort starten, brauchen `exec` am tmpfs oder ein eigenes Volume.
+- Mit Docker-Management braucht der Nutzer die Gruppe des Sockets (`group_add`). Das entspricht weiterhin Root-Rechten auf dem Host.
+- Port 8080 liegt ueber 1024, es wird keine Capability gebraucht.
+
 ## Managed Deployments
 
 Der Gateway kann HTTP-basierte MCP-Container direkt aus dem Admin-Dashboard erstellen. Diese Docker-Funktion ist standardmaessig deaktiviert, weil der Docker-Socket sehr maechtig ist.
