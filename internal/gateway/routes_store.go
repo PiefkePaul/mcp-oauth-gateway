@@ -262,6 +262,11 @@ func (s *Server) persistRoutesLocked(routes []config.Route) error {
 // display name does not restart every STDIO process; only new, changed,
 // removed or force-restarted routes are rebuilt or closed.
 func (s *Server) installRoutesLocked(routes []config.Route, forceRestart map[string]bool, persist bool) error {
+	if s.routeSecrets != nil {
+		if err := config.ValidateRouteSecretKeys(routes); err != nil {
+			return err
+		}
+	}
 	runtimes, built, err := s.buildRouteRuntimeReusing(routes, s.runtime, forceRestart)
 	if err != nil {
 		return err

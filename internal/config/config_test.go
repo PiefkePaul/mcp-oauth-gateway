@@ -172,3 +172,29 @@ func TestNormalizeURLOrigins(t *testing.T) {
 		}
 	}
 }
+
+func TestUpstreamBearerSecretKey(t *testing.T) {
+	cases := map[string]string{
+		"whatsapp":                 "WHATSAPP",
+		"german-legal-mcp":         "GERMAN_LEGAL_MCP",
+		"openwebui-chatgpt.bridge": "OPENWEBUI_CHATGPT_BRIDGE",
+		"n8n":                      "N8N",
+	}
+	for id, want := range cases {
+		if got := (Route{ID: id}).UpstreamBearerSecretKey(); got != want {
+			t.Errorf("%s: got %q, want %q", id, got, want)
+		}
+	}
+	if got := (Route{ID: "whatsapp", UpstreamBearerKey: "WA"}).UpstreamBearerSecretKey(); got != "WA" {
+		t.Errorf("explicit key: got %q", got)
+	}
+
+	route := Route{ID: "a", PathPrefix: "/a", Upstream: "http://a:1", UpstreamBearerKey: "lower-case"}
+	if err := NormalizeRoute(&route); err == nil {
+		t.Errorf("expected upstream_bearer_key with other characters to be rejected")
+	}
+	routes := []Route{{ID: "a-b"}, {ID: "a_b"}}
+	if err := ValidateRouteSecretKeys(routes); err == nil {
+		t.Errorf("expected a collision for a-b and a_b")
+	}
+}

@@ -95,6 +95,9 @@ Wichtig:
 - `MCP_GATEWAY_STDIO_MAX_SESSIONS_PER_AGENT` (Standard `8`)
 - `MCP_GATEWAY_STDIO_MAX_SESSIONS_PER_ROUTE` (Standard `64`)
 - `MCP_GATEWAY_OPENAPI_STORE_DIR`
+- `MCP_GATEWAY_ROUTE_SECRETS_FILE` (optional, Datei mit den Upstream-Bearern der Routen; leer = aus)
+- `MCP_GATEWAY_ROUTE_SECRETS_RELOAD` (Standard `10s`, mindestens `1s`)
+- `MCP_GATEWAY_ROUTE_SECRETS_STRICT` (Standard `false`)
 
 Der Master-Key muss genau 32 Bytes nach Base64-, Base64URL- oder Hex-Decoding ergeben.
 
@@ -393,6 +396,37 @@ Lehnt ein Upstream die Zugangsdaten des Gateways mit 401 ab, antwortet der Gatew
 Nutzerspezifische Upstream-Bearer haben Vorrang vor dem globalen Route-Bearer. So kann ein gemeinsamer Gateway-OAuth vor mehreren MCPs liegen, waehrend einzelne Upstreams weiterhin ihre eigenen Secrets behalten.
 
 Bei `ghcr.io/czlonkowski/n8n-mcp` ist der interne Container-Port standardmaessig `3000`, nicht `8080`. Die Route sollte deshalb typischerweise `upstream: http://n8n-mcp:3000` und `upstream_mcp_path: /mcp` nutzen. Der n8n-MCP-Container selbst braucht denselben Wert als `AUTH_TOKEN`, den du im Gateway als Upstream Bearer speicherst.
+
+### Upstream Bearer aus einer Secrets-Datei
+
+Statt im Admin-Formular kann der globale Upstream-Bearer einer HTTP-Route aus einer Datei kommen, die ein externer Agent pflegt, zum Beispiel der Infisical-Agent. Der Gateway spricht dabei nicht selbst mit dem Secret-Manager: Er liest nur die Datei und laeuft mit dem letzten Stand weiter, wenn der Secret-Manager ausfaellt.
+
+```yaml
+environment:
+  MCP_GATEWAY_ROUTE_SECRETS_FILE: "/run/gateway-secrets/gateway-routes.env"
+volumes:
+  # Den Ordner einbinden, nicht die einzelne Datei: Ersetzt der Agent die
+  # Datei (neue Inode), saehe der Container bei einem Datei-Mount die alte.
+  - ./secrets/gateway:/run/gateway-secrets:ro
+```
+
+Format der Datei, eine Zeile je Route:
+
+```
+WHATSAPP='wert'
+GERMAN_LEGAL_MCP='wert'
+```
+
+- Der Schluessel ist die Route-ID in Grossbuchstaben, jedes Zeichen ausser `A-Z` und `0-9` wird zu `_` (`german-legal-mcp` wird `GERMAN_LEGAL_MCP`). Mit `upstream_bearer_key` in der Route (oder im Admin-Formular) laesst sich ein anderer Name festlegen. Zwei Routen mit demselben Schluessel lehnt der Gateway ab.
+- Erlaubt sind `KEY='wert'`, `KEY="wert"` und `KEY=wert`, Leerzeilen und `#`-Zeilen. Werte in Anfuehrungszeichen werden woertlich genommen. Ein leerer Wert zaehlt als fehlend.
+- Reihenfolge je Anfrage: eigener Bearer des Nutzers, dann die Datei, dann der im Gateway gespeicherte Bearer der Route.
+- Die Datei wird alle `MCP_GATEWAY_ROUTE_SECRETS_RELOAD` geprueft (Vergleich ueber den Inhalt). Ein neuer Inhalt gilt, sobald zwei Pruefungen nacheinander denselben Inhalt lesen; so wird keine halb geschriebene Datei uebernommen. Ein neuer Wert wirkt damit nach hoechstens zwei Intervallen, ohne Neustart. `SIGHUP` laedt sofort.
+- Ist die Datei nicht lesbar oder fehlerhaft, bleibt der letzte gute Stand. Das Log nennt die Zeilennummer und die Namen der geaenderten Schluessel, nie Werte.
+- `MCP_GATEWAY_ROUTE_SECRETS_STRICT=true`: Der im Gateway gespeicherte Bearer der Route wird nicht mehr gesendet. Eine Route, die noch einen gespeicherten Bearer oder ein `upstream_bearer_key` hat, deren Schluessel aber in der Datei fehlt, wird mit `503 upstream_bearer_missing` beantwortet und nicht weitergeleitet. Routen, die nie einen Upstream-Bearer hatten, sind nicht betroffen.
+- Das Dashboard zeigt je Route die Quelle (Datei mit Schluesselname, Admin-Formular, fehlt), nie den Wert. Kommt der Wert aus der Datei, ist das Bearer-Feld gesperrt; ein noch gespeicherter Wert laesst sich ueber "Globalen Upstream Bearer loeschen" entfernen.
+- Rueckweg: `MCP_GATEWAY_ROUTE_SECRETS_FILE` leeren, dann gilt wieder nur der gespeicherte Bearer. Gespeicherte Werte bleiben erhalten, bis sie bewusst geloescht werden.
+
+Nicht aus der Datei gespeist werden bisher `forward_headers`, `openapi.headers` und `stdio.env`.
 
 ## Open WebUI Hinweise
 
