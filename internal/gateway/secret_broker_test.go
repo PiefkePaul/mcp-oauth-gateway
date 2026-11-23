@@ -98,25 +98,39 @@ func TestBrokerGetsTheBearerAndTheGatewayStoresNone(t *testing.T) {
 	}
 }
 
+// routeSavedWithBrokerError checks the outcome of a failed hand-over: the
+// route is saved, the bearer is stored nowhere and the admin is told so.
+func routeSavedWithBrokerError(t *testing.T, f routeSecretsFixture, rec *httptest.ResponseRecorder, reason string) {
+	t.Helper()
+	if rec.Code != http.StatusFound {
+		t.Fatalf("save: %d, want 302 (route saved, bearer not)", rec.Code)
+	}
+	location, err := url.Parse(rec.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("redirect: %v", err)
+	}
+	errText := location.Query().Get("error")
+	if !strings.Contains(errText, "Route saved, but the Upstream Bearer was not saved anywhere") || !strings.Contains(errText, reason) {
+		t.Errorf("redirect error does not explain the refusal: %q", errText)
+	}
+	if location.Query().Get("route") != "german-legal-mcp" {
+		t.Errorf("redirect leaves the route: %s", location)
+	}
+	if strings.Contains(location.String(), brokerBearer) {
+		t.Fatalf("bearer value echoed in the redirect")
+	}
+	if _, ok := f.server.authManager.RouteGlobalUpstreamBearer("german-legal-mcp"); ok {
+		t.Fatalf("the gateway fell back to storing the bearer")
+	}
+}
+
 func TestBrokerRefusalStoresNothingAndSaysSo(t *testing.T) {
 	f := newRouteSecretsFixture(t, "", false)
 	fb, srv := newFakeBroker(t, http.StatusConflict, `{"ok":false,"error":"GERMAN_LEGAL_MCP verweist auf einen anderen Ordner"}`)
 	withBroker(f, srv.URL)
 
 	rec := saveGermanLegal(t, f, brokerBearer)
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("save: %d, want 502", rec.Code)
-	}
-	body := rec.Body.String()
-	if !strings.Contains(body, "not saved anywhere") || !strings.Contains(body, "verweist auf einen anderen Ordner") {
-		t.Errorf("error page does not explain the refusal")
-	}
-	if strings.Contains(body, brokerBearer) {
-		t.Fatalf("bearer value echoed in the error page")
-	}
-	if _, ok := f.server.authManager.RouteGlobalUpstreamBearer("german-legal-mcp"); ok {
-		t.Fatalf("the gateway fell back to storing the bearer")
-	}
+	routeSavedWithBrokerError(t, f, rec, "verweist auf einen anderen Ordner")
 	if len(fb.requests) != 1 {
 		t.Fatalf("broker got %d requests", len(fb.requests))
 	}
@@ -126,11 +140,72 @@ func TestBrokerUnreachableStoresNothing(t *testing.T) {
 	f := newRouteSecretsFixture(t, "", false)
 	withBroker(f, "http://127.0.0.1:1/api/route-secret")
 	rec := saveGermanLegal(t, f, brokerBearer)
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("save: %d, want 502", rec.Code)
+	routeSavedWithBrokerError(t, f, rec, "not reachable")
+}
+
+// A route that fails validation must not leave its bearer in the secret
+// manager: the broker is called only after the route is saved.
+func TestBrokerNotCalledWhenTheRouteIsInvalid(t *testing.T) {
+	f := newRouteSecretsFixture(t, "", false)
+	fb, srv := newFakeBroker(t, http.StatusOK, `{"ok":true}`)
+	withBroker(f, srv.URL)
+	f.server.cfg.RoutesPath = t.TempDir() + "/routes.yaml"
+	cookies := adminTestSession(t, f.server)
+	rec := postAdminRouteSave(t, f.server, cookies, url.Values{
+		"original_id":           {"german-legal-mcp"},
+		"id":                    {"german-legal-mcp"},
+		"display_name":          {"German Legal"},
+		"transport":             {"http"},
+		"path_prefix":           {"/legal"},
+		"upstream":              {"not a url"},
+		"upstream_mcp_path":     {"/mcp"},
+		"upstream_bearer_token": {brokerBearer},
+	})
+	if rec.Code == http.StatusFound {
+		t.Fatalf("invalid route was saved")
 	}
-	if _, ok := f.server.authManager.RouteGlobalUpstreamBearer("german-legal-mcp"); ok {
-		t.Fatalf("the gateway stored the bearer")
+	if len(fb.requests) != 0 {
+		t.Fatalf("broker was called for a route that was not saved")
+	}
+}
+
+// "${...}" is a secret reference; resolved by the secret manager it would
+// send another secret to the route's upstream.
+func TestSecretReferenceIsRefusedAsBearer(t *testing.T) {
+	for _, value := range []string{"${prod.gitea.GITEA_TOKEN}", "Bearer ${prod.x.Y}", "abc${prod.x.Y}"} {
+		for _, broker := range []bool{true, false} {
+			f := newRouteSecretsFixture(t, "", false)
+			fb, srv := newFakeBroker(t, http.StatusOK, `{"ok":true}`)
+			if broker {
+				withBroker(f, srv.URL)
+			}
+			rec := saveGermanLegal(t, f, value)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("%q (broker %v): save %d, want 400", value, broker, rec.Code)
+			}
+			if !strings.Contains(rec.Body.String(), "secret references are not accepted") {
+				t.Errorf("%q: error page does not explain the refusal", value)
+			}
+			if len(fb.requests) != 0 {
+				t.Fatalf("%q: broker was called", value)
+			}
+			if _, ok := f.server.authManager.RouteGlobalUpstreamBearer("german-legal-mcp"); ok {
+				t.Fatalf("%q: the gateway stored the reference", value)
+			}
+		}
+	}
+}
+
+func TestHandOverRefusesSecretReferences(t *testing.T) {
+	f := newRouteSecretsFixture(t, "", false)
+	fb, srv := newFakeBroker(t, http.StatusOK, `{"ok":true}`)
+	withBroker(f, srv.URL)
+	route, _ := f.server.routeByID("german-legal-mcp")
+	if _, err := f.server.handOverUpstreamBearer(t.Context(), route, "${prod.a.B}"); err == nil {
+		t.Fatalf("reference was handed over")
+	}
+	if len(fb.requests) != 0 {
+		t.Fatalf("broker was called")
 	}
 }
 

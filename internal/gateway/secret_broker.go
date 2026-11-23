@@ -113,6 +113,11 @@ func (s *Server) handOverUpstreamBearer(ctx context.Context, route config.Route,
 	if s.secretBroker == nil || token == "" {
 		return "", nil
 	}
+	// Second line of defence next to normalizeUpstreamBearer: a "${...}"
+	// value would be resolved by the secret manager to another secret.
+	if strings.Contains(token, "${") {
+		return "", fmt.Errorf("the Upstream Bearer was not saved anywhere: secret references (\"${\") are not accepted")
+	}
 	key := route.UpstreamBearerSecretKey()
 	folder, err := s.secretBroker.SetRouteSecret(ctx, route.ID, key, token)
 	if err != nil {
@@ -126,4 +131,15 @@ func (s *Server) handOverUpstreamBearer(ctx context.Context, route config.Route,
 	}
 	return fmt.Sprintf("Upstream Bearer handed to the token broker and saved in %s, not in the gateway; it is used once it is in the secrets file as %s (usually within %s)",
 		where, key, s.secretBroker.delay.Round(time.Second)), nil
+}
+
+// joinErrors joins non-empty error texts for the admin redirect.
+func joinErrors(texts ...string) string {
+	var parts []string
+	for _, text := range texts {
+		if text = strings.TrimSpace(text); text != "" {
+			parts = append(parts, text)
+		}
+	}
+	return strings.Join(parts, "; ")
 }

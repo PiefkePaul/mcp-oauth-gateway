@@ -323,17 +323,6 @@ func (s *Server) handleAdminRouteSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// With a token broker the global bearer goes to the broker before the
-	// route is saved, so a refused value leaves nothing half done.
-	brokerNotice, err := s.handOverUpstreamBearer(r.Context(), route, bearerForm.token)
-	if err != nil {
-		s.renderAdminDashboard(w, r, identity, formData, "", err.Error(), http.StatusBadGateway)
-		return
-	}
-	if brokerNotice != "" {
-		bearerForm.token = ""
-	}
-
 	if err := s.upsertRoute(formData.OriginalID, route); err != nil {
 		s.renderAdminDashboard(w, r, identity, formData, "", err.Error(), http.StatusBadRequest)
 		return
@@ -341,6 +330,15 @@ func (s *Server) handleAdminRouteSave(w http.ResponseWriter, r *http.Request) {
 	if err := s.authManager.RenameRouteSecrets(formData.OriginalID, route.ID); err != nil {
 		s.renderAdminDashboard(w, r, identity, formData, "", err.Error(), http.StatusBadRequest)
 		return
+	}
+
+	// With a token broker the global bearer goes to the broker only after
+	// the route is saved, so a route that fails validation or saving never
+	// leaves a value in the secret manager. The gateway keeps no copy,
+	// whether the hand-over works or not.
+	brokerNotice, brokerErr := s.handOverUpstreamBearer(r.Context(), route, bearerForm.token)
+	if s.secretBroker != nil {
+		bearerForm.token = ""
 	}
 	if err := s.applyUpstreamBearerForm(bearerForm, route.ID); err != nil {
 		s.renderAdminDashboard(w, r, identity, formData, "", err.Error(), http.StatusBadRequest)
@@ -357,6 +355,11 @@ func (s *Server) handleAdminRouteSave(w http.ResponseWriter, r *http.Request) {
 	// Verify the route right away so misconfigurations show up on save.
 	checkNotice, checkError := healthCheckMessages(route.ID, s.checkRoute(r.Context(), route.ID))
 	notice += "; " + checkNotice
+	if brokerErr != nil {
+		// Stay on the route so the admin sees that the bearer is missing.
+		http.Redirect(w, r, adminRedirectURL(route.ID, notice, joinErrors("Route saved, but "+brokerErr.Error(), checkError)), http.StatusFound)
+		return
+	}
 	switch next := strings.TrimSpace(r.FormValue("next_route")); next {
 	case "":
 		http.Redirect(w, r, adminRedirectURL(route.ID, notice, checkError), http.StatusFound)
@@ -498,6 +501,12 @@ func normalizeUpstreamBearer(raw string) (token string, unquoted bool, err error
 		if r == '"' || r == '\'' || unicode.IsSpace(r) || unicode.IsControl(r) {
 			return "", false, fmt.Errorf("the Upstream Bearer must not contain quotes or whitespace; paste the token value only")
 		}
+	}
+	// "${...}" is a secret reference in the secret manager. Stored there as
+	// a route bearer it would be resolved to another secret and sent to the
+	// route's upstream, so it is refused everywhere, not only with a broker.
+	if strings.Contains(token, "${") {
+		return "", false, fmt.Errorf("the Upstream Bearer must not contain \"${\"; secret references are not accepted, paste the token value only")
 	}
 	return token, unquoted, nil
 }
@@ -1016,19 +1025,6 @@ func (s *Server) handleAdminDeploymentCreate(w http.ResponseWriter, r *http.Requ
 			return
 		}
 	}
-	brokerNotice, err := s.handOverUpstreamBearer(r.Context(), route, formData.UpstreamBearerToken)
-	if err != nil {
-		if spec != nil {
-			rollbackCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			_ = s.dockerManager.Remove(rollbackCtx, spec.ContainerName)
-		}
-		s.renderAdminDashboard(w, r, identity, newEmptyRouteFormData(), "", err.Error(), http.StatusBadGateway)
-		return
-	}
-	if brokerNotice != "" {
-		formData.UpstreamBearerToken = ""
-	}
 	if err := s.upsertRoute("", route); err != nil {
 		if spec != nil {
 			rollbackCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -1037,6 +1033,12 @@ func (s *Server) handleAdminDeploymentCreate(w http.ResponseWriter, r *http.Requ
 		}
 		s.renderAdminDashboard(w, r, identity, newEmptyRouteFormData(), "", err.Error(), http.StatusBadRequest)
 		return
+	}
+	// The bearer goes to the broker only once the route is saved, so a
+	// failed deployment never leaves a value in the secret manager.
+	brokerNotice, brokerErr := s.handOverUpstreamBearer(r.Context(), route, formData.UpstreamBearerToken)
+	if s.secretBroker != nil {
+		formData.UpstreamBearerToken = ""
 	}
 	if formData.UpstreamBearerToken != "" {
 		if err := s.authManager.SetRouteUpstreamBearer(route.ID, formData.UpstreamBearerToken); err != nil {
@@ -1054,7 +1056,11 @@ func (s *Server) handleAdminDeploymentCreate(w http.ResponseWriter, r *http.Requ
 	if brokerNotice != "" {
 		deploymentNotice += "; " + brokerNotice
 	}
-	http.Redirect(w, r, adminRedirectURLWithTab("deployments", route.ID, deploymentNotice, ""), http.StatusFound)
+	deploymentError := ""
+	if brokerErr != nil {
+		deploymentError = "Deployment created, but " + brokerErr.Error()
+	}
+	http.Redirect(w, r, adminRedirectURLWithTab("deployments", route.ID, deploymentNotice, deploymentError), http.StatusFound)
 }
 
 func (s *Server) handleAdminDeploymentStart(w http.ResponseWriter, r *http.Request) {
