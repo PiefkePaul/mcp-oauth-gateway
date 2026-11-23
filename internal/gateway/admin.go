@@ -70,6 +70,7 @@ type dashboardRouteView struct {
 	ForwardHeadersCount      int
 	UpstreamEnvironmentCount int
 	UpstreamBearerConfigured bool
+	UpstreamBearerSource     string
 	UserUpstreamBearerCount  int
 	Health                   healthView
 }
@@ -212,16 +213,27 @@ type routeFormData struct {
 	ClearUpstreamBearer          bool
 	UpstreamBearerConfigured     bool
 	UserUpstreamBearerConfigured map[string]bool
-	StdioCommand                 string
-	StdioArgs                    string
-	StdioEnv                     string
-	StdioWorkingDir              string
-	OpenAPISpecPath              string
-	OpenAPISpecURL               string
-	OpenAPIBaseURL               string
-	OpenAPIHeaders               string
-	OpenAPITimeoutSeconds        string
-	Notes                        string
+	// UpstreamBearerKey is the route's own key in the route secrets file,
+	// empty for the name derived from the id.
+	UpstreamBearerKey string
+	// The following describe the state, they are not submitted.
+	UpstreamBearerSource     string
+	UpstreamBearerFromFile   bool
+	UpstreamBearerDerivedKey string
+	RouteSecretsFile         string
+	// RouteSecretsHint says where the value for this route is maintained.
+	RouteSecretsHint      string
+	RouteSecretsStrict    bool
+	StdioCommand          string
+	StdioArgs             string
+	StdioEnv              string
+	StdioWorkingDir       string
+	OpenAPISpecPath       string
+	OpenAPISpecURL        string
+	OpenAPIBaseURL        string
+	OpenAPIHeaders        string
+	OpenAPITimeoutSeconds string
+	Notes                 string
 }
 
 func (s *Server) handleAdminDashboard(w http.ResponseWriter, r *http.Request) {
@@ -1352,7 +1364,8 @@ func (s *Server) renderAdminDashboard(w http.ResponseWriter, r *http.Request, id
 			PassAuthorization:        route.PassAuthorization,
 			ForwardHeadersCount:      len(route.ForwardHeaders),
 			UpstreamEnvironmentCount: countNonSessionEnv(route.UpstreamEnvironment),
-			UpstreamBearerConfigured: globalBearer,
+			UpstreamBearerConfigured: globalBearer || s.routeBearerAvailable(route),
+			UpstreamBearerSource:     s.routeBearerSourceLabel(route),
 			UserUpstreamBearerCount:  len(userBearers),
 			Health:                   s.healthViewFor(route.ID, true),
 		})
@@ -1454,12 +1467,22 @@ func (s *Server) decorateRouteSecretFormData(form *routeFormData) {
 	if routeID == "" {
 		routeID = strings.TrimSpace(form.ID)
 	}
+	if s.routeSecrets != nil {
+		form.RouteSecretsFile = s.routeSecrets.Path()
+		form.RouteSecretsHint = s.routeSecretsHint(routeID, form.UpstreamBearerKey)
+		form.RouteSecretsStrict = s.cfg.RouteSecrets.Strict
+	}
 	if routeID == "" {
 		return
 	}
 	globalBearer, userBearers := s.authManager.RouteUpstreamBearerConfigured(routeID)
 	form.UpstreamBearerConfigured = globalBearer
 	form.UserUpstreamBearerConfigured = userBearers
+	if route, ok := s.routeByID(routeID); ok {
+		form.UpstreamBearerSource = s.routeBearerSourceLabel(route)
+		form.UpstreamBearerFromFile = s.routeBearerSource(route) == bearerSourceFile
+		form.UpstreamBearerDerivedKey = config.Route{ID: route.ID}.UpstreamBearerSecretKey()
+	}
 }
 
 func parseRouteForm(r *http.Request) (routeFormData, config.Route, error) {
@@ -1474,6 +1497,7 @@ func parseRouteForm(r *http.Request) (routeFormData, config.Route, error) {
 		ScopesSupported:       strings.TrimSpace(r.FormValue("scopes_supported")),
 		PassAuthorization:     formCheckbox(r, "pass_authorization_header"),
 		ResourceDocumentation: strings.TrimSpace(r.FormValue("resource_documentation")),
+		UpstreamBearerKey:     strings.TrimSpace(r.FormValue("upstream_bearer_key")),
 		MCPHTTPSessionMode:    strings.TrimSpace(r.FormValue("mcp_http_session_mode")),
 		OpenAPISessionMode:    strings.TrimSpace(r.FormValue("openapi_session_mode")),
 		AccessVisibility:      defaultIfEmpty(strings.TrimSpace(r.FormValue("access_visibility")), "public"),
@@ -1533,6 +1557,7 @@ func parseRouteForm(r *http.Request) (routeFormData, config.Route, error) {
 			ForwardHeaders:        forwardHeaders,
 			UpstreamEnvironment:   upstreamEnvironment,
 			ResourceDocumentation: formData.ResourceDocumentation,
+			UpstreamBearerKey:     formData.UpstreamBearerKey,
 			Notes:                 formData.Notes,
 			OpenAPISessionMode:    formData.OpenAPISessionMode,
 			Access: config.RouteAccess{
@@ -1572,6 +1597,7 @@ func parseRouteForm(r *http.Request) (routeFormData, config.Route, error) {
 			ForwardHeaders:        forwardHeaders,
 			UpstreamEnvironment:   upstreamEnvironment,
 			ResourceDocumentation: formData.ResourceDocumentation,
+			UpstreamBearerKey:     formData.UpstreamBearerKey,
 			Notes:                 formData.Notes,
 			OpenAPISessionMode:    formData.OpenAPISessionMode,
 			Access: config.RouteAccess{
@@ -1613,6 +1639,7 @@ func parseRouteForm(r *http.Request) (routeFormData, config.Route, error) {
 			DeniedGroups:  formData.DeniedGroups,
 		},
 		ResourceDocumentation: formData.ResourceDocumentation,
+		UpstreamBearerKey:     formData.UpstreamBearerKey,
 		Notes:                 formData.Notes,
 		OpenAPISessionMode:    formData.OpenAPISessionMode,
 	}
@@ -1760,6 +1787,7 @@ func newRouteFormData(route config.Route, originalID string) routeFormData {
 		ScopesSupported:       strings.Join(route.ScopesSupported, ", "),
 		PassAuthorization:     route.PassAuthorization,
 		ResourceDocumentation: route.ResourceDocumentation,
+		UpstreamBearerKey:     route.UpstreamBearerKey,
 		MCPHTTPSessionMode:    strings.TrimSpace(route.UpstreamEnvironment["MCP_HTTP_SESSION_MODE"]),
 		OpenAPISessionMode:    route.OpenAPISessionMode,
 		AccessVisibility:      defaultIfEmpty(route.Access.Visibility, "public"),
@@ -2620,9 +2648,18 @@ const adminDashboardTemplate = `
                   <p class="hint">Fuer MCP-Server wie n8n-mcp, die zusaetzlich zum Gateway-OAuth einen internen Bearer erwarten. Werte werden verschluesselt gespeichert und nicht nach <code>routes.yaml</code> exportiert.</p>
                   <div class="field">
                     <label for="upstream_bearer_token">Globaler Upstream Bearer</label>
-                    <input id="upstream_bearer_token" name="upstream_bearer_token" type="password" placeholder="{{if .SelectedRoute.UpstreamBearerConfigured}}Token ist gesetzt; leer lassen zum Beibehalten{{else}}n8n AUTH_TOKEN oder anderer Upstream-Bearer{{end}}">
-                    <p class="hint">{{if .SelectedRoute.UpstreamBearerConfigured}}Aktuell ist ein globaler Upstream-Bearer gesetzt.{{else}}Kein globaler Upstream-Bearer gesetzt.{{end}} Nutzer-spezifische Tokens haben Vorrang.</p>
+                    <input id="upstream_bearer_token" name="upstream_bearer_token" type="password" {{if .SelectedRoute.UpstreamBearerFromFile}}disabled{{end}} placeholder="{{if .SelectedRoute.UpstreamBearerFromFile}}Wert kommt aus der Secrets-Datei{{else if .SelectedRoute.UpstreamBearerConfigured}}Token ist gesetzt; leer lassen zum Beibehalten{{else}}n8n AUTH_TOKEN oder anderer Upstream-Bearer{{end}}">
+                    <p class="hint">{{if .SelectedRoute.UpstreamBearerConfigured}}Im Gateway ist ein globaler Upstream-Bearer gespeichert.{{else}}Im Gateway ist kein globaler Upstream-Bearer gespeichert.{{end}} Nutzer-spezifische Tokens haben Vorrang.</p>
+                    {{if .SelectedRoute.RouteSecretsFile}}<p class="hint">Verwendet wird: {{.SelectedRoute.UpstreamBearerSource}}. Die Secrets-Datei <code>{{.SelectedRoute.RouteSecretsFile}}</code> hat Vorrang vor dem gespeicherten Wert{{if .SelectedRoute.UpstreamBearerFromFile}}; das Feld ist deshalb gesperrt. Ein noch gespeicherter Wert laesst sich unten loeschen{{end}}.</p>{{end}}
                   </div>
+                  {{if .SelectedRoute.RouteSecretsHint}}<p class="hint"><strong>Wert nicht hier eintragen.</strong> Der Gateway schreibt nichts in die Secrets-Datei oder in den Secret-Manager. Der Upstream-Bearer dieser Route wird gepflegt unter: <code>{{.SelectedRoute.RouteSecretsHint}}</code>. Ein hier eingetragener Wert landet nur im Gateway und gilt, solange der Schluessel in der Datei fehlt{{if .SelectedRoute.RouteSecretsStrict}}; im Strict-Modus wird die Route dann nicht weitergeleitet{{end}}.</p>{{end}}
+                  {{if .SelectedRoute.RouteSecretsFile}}
+                  <div class="field">
+                    <label for="upstream_bearer_key">Schluessel in der Secrets-Datei</label>
+                    <input id="upstream_bearer_key" name="upstream_bearer_key" type="text" class="mono" pattern="[A-Z0-9_]*" value="{{.SelectedRoute.UpstreamBearerKey}}" placeholder="{{if .SelectedRoute.UpstreamBearerDerivedKey}}{{.SelectedRoute.UpstreamBearerDerivedKey}} (aus der Route-ID abgeleitet){{else}}leer = aus der Route-ID abgeleitet{{end}}">
+                    <p class="hint">Nur ausfuellen, wenn der Name in der Datei von der Route-ID abweicht. Erlaubt sind A-Z, 0-9 und <code>_</code>.</p>
+                  </div>
+                  {{else}}<input type="hidden" name="upstream_bearer_key" value="{{.SelectedRoute.UpstreamBearerKey}}">{{end}}
                   <label class="checkbox-row">
                     <input id="clear_upstream_bearer" name="clear_upstream_bearer" type="checkbox">
                     <span>Globalen Upstream Bearer loeschen</span>

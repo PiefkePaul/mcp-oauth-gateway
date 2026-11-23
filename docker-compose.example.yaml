@@ -67,9 +67,19 @@ services:
       MCP_GATEWAY_STDIO_ALLOWED_DOWNLOAD_HOSTS: "github.com,objects.githubusercontent.com,github-releases.githubusercontent.com,release-assets.githubusercontent.com"
       MCP_GATEWAY_STDIO_ALLOW_ANY_DOWNLOAD_HOST: "false"
       MCP_GATEWAY_OPENAPI_STORE_DIR: "/data/openapi"
+      # Optional: read the routes' upstream bearers from a file that an agent
+      # (for example the Infisical agent) keeps up to date. See README,
+      # "Upstream Bearer aus einer Secrets-Datei". Mount the folder, not the
+      # single file, and make it readable for the container user.
+      # MCP_GATEWAY_ROUTE_SECRETS_FILE: "/run/gateway-secrets/gateway-routes.env"
+      # MCP_GATEWAY_ROUTE_SECRETS_RELOAD: "10s"
+      # MCP_GATEWAY_ROUTE_SECRETS_STRICT: "false"
+      # MCP_GATEWAY_ROUTE_SECRETS_HINT: "Infisical <project>/<env>/gateway/routes/{route_id}/UPSTREAM_BEARER"
     volumes:
       - ./config:/config
       - ./data:/data
+      # Optional: folder with the route secrets file, read-only.
+      # - ./secrets/gateway:/run/gateway-secrets:ro
       # Optional: native STDIO MCP executables made available to the gateway.
       # - ./tools:/tools:ro
       # Required only when MCP_GATEWAY_DOCKER_MANAGEMENT_ENABLED=true:

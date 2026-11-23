@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/PiefkePaul/mcp-oauth-gateway/internal/auth"
 	"github.com/PiefkePaul/mcp-oauth-gateway/internal/config"
+	"github.com/PiefkePaul/mcp-oauth-gateway/internal/secretsfile"
 )
 
 type Server struct {
@@ -30,6 +32,12 @@ type Server struct {
 	runtime        map[string]routeRuntime
 	mcpSessions    *mcpSessionPool
 	health         *healthStore
+
+	// routeSecrets is the file an external agent writes the routes'
+	// upstream bearers to; nil when none is configured.
+	routeSecrets        *secretsfile.Store
+	missingBearerMu     sync.Mutex
+	missingBearerLogged map[string]time.Time
 }
 
 func New(cfg *config.Config, authManager *auth.Manager) (*Server, error) {
@@ -46,6 +54,9 @@ func New(cfg *config.Config, authManager *auth.Manager) (*Server, error) {
 		runtime:     make(map[string]routeRuntime, len(cfg.Routes)),
 		mcpSessions: newMCPSessionPool(),
 		health:      newHealthStore(),
+	}
+	if cfg.RouteSecrets.File != "" {
+		server.routeSecrets = secretsfile.Open(cfg.RouteSecrets.File)
 	}
 	if cfg.DockerManagement.Enabled {
 		dockerManager, err := newDockerManager(cfg.DockerManagement)
@@ -118,6 +129,11 @@ func Run(cfg *config.Config) error {
 
 	if cfg.HealthCheck.Enabled {
 		handler.startHealthChecks(cfg.HealthCheck.Interval)
+	}
+	if handler.routeSecrets != nil {
+		log.Printf("route secrets file=%s reload=%s strict=%t", cfg.RouteSecrets.File, cfg.RouteSecrets.Reload, cfg.RouteSecrets.Strict)
+		go handler.routeSecrets.Watch(context.Background(), cfg.RouteSecrets.Reload)
+		go reloadOnHangup(handler.routeSecrets)
 	}
 
 	return httpServer.ListenAndServe()
@@ -548,7 +564,7 @@ func (s *Server) newReverseProxy(route config.Route) (http.Handler, error) {
 	upstreamBasePath := joinURLPath(target.Path, route.NormalizedUpstreamPath)
 	publicBasePath := route.PublicMCPPath()
 
-	return &httputil.ReverseProxy{
+	proxy := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.Out.URL.Scheme = target.Scheme
 			pr.Out.URL.Host = target.Host
@@ -589,7 +605,7 @@ func (s *Server) newReverseProxy(route config.Route) (http.Handler, error) {
 				}
 				pr.Out.Header.Set(headerName, value)
 			}
-			if upstreamBearer, ok := s.authManager.ResolveRouteUpstreamBearer(route.ID, identity); ok {
+			if upstreamBearer, _ := s.resolveUpstreamBearer(route, identity); upstreamBearer != "" {
 				pr.Out.Header.Set("Authorization", "Bearer "+upstreamBearer)
 			}
 		},
@@ -603,7 +619,19 @@ func (s *Server) newReverseProxy(route config.Route) (http.Handler, error) {
 				"error_description": "the upstream MCP server could not be reached",
 			})
 		},
-	}, nil
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Strict mode: a route whose bearer should be in the route
+		// secrets file but is not is answered here. Forwarding it without
+		// a bearer, or with the old one from the auth store, would hide
+		// that the file is incomplete.
+		if _, source := s.resolveUpstreamBearer(route, auth.IdentityFromContext(r.Context())); source == bearerSourceMissing {
+			s.logMissingBearer(route)
+			writeUpstreamBearerMissing(w)
+			return
+		}
+		proxy.ServeHTTP(w, r)
+	}), nil
 }
 
 // upstreamUnauthorizedBody explains a 401 from the upstream. It is sent as
@@ -619,8 +647,8 @@ func (s *Server) rewriteUpstreamUnauthorized(route config.Route, resp *http.Resp
 	if resp.StatusCode != http.StatusUnauthorized || route.PassAuthorization {
 		return nil
 	}
-	bearerConfigured, userBearers := s.authManager.RouteUpstreamBearerConfigured(route.ID)
-	log.Printf("gateway upstream rejected credentials route=%s status=401 upstream_bearer_configured=%t user_upstream_bearers=%d", route.ID, bearerConfigured, len(userBearers))
+	_, userBearers := s.authManager.RouteUpstreamBearerConfigured(route.ID)
+	log.Printf("gateway upstream rejected credentials route=%s status=401 upstream_bearer_source=%q user_upstream_bearers=%d", route.ID, s.routeBearerSource(route), len(userBearers))
 
 	_ = resp.Body.Close()
 	resp.StatusCode = http.StatusBadGateway

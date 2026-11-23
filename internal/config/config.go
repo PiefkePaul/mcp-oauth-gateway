@@ -23,6 +23,7 @@ const (
 	defaultDockerHost          = "unix:///var/run/docker.sock"
 	defaultBuildWorkDir        = "/data/builds"
 	defaultOpenAPIStoreDir     = "/data/openapi"
+	defaultRouteSecretsReload  = 10 * time.Second
 	defaultStdioStoreDir       = "/data/stdio-mcp"
 	defaultBuildMaxArtifactMB  = 100
 	defaultAccessTokenTTL      = time.Hour
@@ -53,6 +54,7 @@ type Config struct {
 	StdioSessions       StdioSessionConfig
 	HealthCheck         HealthCheckConfig
 	OpenAPIStoreDir     string
+	RouteSecrets        RouteSecretsConfig
 	Routes              []Route
 }
 
@@ -124,22 +126,26 @@ type StdioInstallerConfig struct {
 }
 
 type Route struct {
-	ID                    string            `yaml:"id"`
-	DisplayName           string            `yaml:"display_name"`
-	Transport             string            `yaml:"transport,omitempty"`
-	PathPrefix            string            `yaml:"path_prefix"`
-	Upstream              string            `yaml:"upstream,omitempty"`
-	UpstreamMCPPath       string            `yaml:"upstream_mcp_path,omitempty"`
-	ScopesSupported       []string          `yaml:"scopes_supported"`
-	PassAuthorization     bool              `yaml:"pass_authorization_header"`
-	ForwardHeaders        map[string]string `yaml:"forward_headers"`
-	UpstreamEnvironment   map[string]string `yaml:"upstream_environment"`
-	Access                RouteAccess       `yaml:"access"`
-	Deployment            *RouteDeployment  `yaml:"deployment,omitempty"`
-	Stdio                 *RouteStdio       `yaml:"stdio,omitempty"`
-	OpenAPI               *RouteOpenAPI     `yaml:"openapi,omitempty"`
-	ResourceDocumentation string            `yaml:"resource_documentation"`
-	Notes                 string            `yaml:"notes"`
+	ID                  string            `yaml:"id"`
+	DisplayName         string            `yaml:"display_name"`
+	Transport           string            `yaml:"transport,omitempty"`
+	PathPrefix          string            `yaml:"path_prefix"`
+	Upstream            string            `yaml:"upstream,omitempty"`
+	UpstreamMCPPath     string            `yaml:"upstream_mcp_path,omitempty"`
+	ScopesSupported     []string          `yaml:"scopes_supported"`
+	PassAuthorization   bool              `yaml:"pass_authorization_header"`
+	ForwardHeaders      map[string]string `yaml:"forward_headers"`
+	UpstreamEnvironment map[string]string `yaml:"upstream_environment"`
+	// UpstreamBearerKey names the entry of the route secrets file that
+	// holds this route's upstream bearer. Empty means the name derived
+	// from the route id, see UpstreamBearerSecretKey.
+	UpstreamBearerKey     string           `yaml:"upstream_bearer_key,omitempty"`
+	Access                RouteAccess      `yaml:"access"`
+	Deployment            *RouteDeployment `yaml:"deployment,omitempty"`
+	Stdio                 *RouteStdio      `yaml:"stdio,omitempty"`
+	OpenAPI               *RouteOpenAPI    `yaml:"openapi,omitempty"`
+	ResourceDocumentation string           `yaml:"resource_documentation"`
+	Notes                 string           `yaml:"notes"`
 	// OpenAPISessionMode controls the MCP-to-OpenAPI adapter: "pooled"
 	// (default) keeps one MCP session per agent, "per_request" opens a fresh
 	// session for every OpenAPI call.
@@ -186,6 +192,57 @@ type RouteAccess struct {
 	AllowedGroups []string `yaml:"allowed_groups,omitempty"`
 	DeniedUsers   []string `yaml:"denied_users,omitempty"`
 	DeniedGroups  []string `yaml:"denied_groups,omitempty"`
+}
+
+// RouteSecretsConfig describes the file an external agent (for example the
+// Infisical agent) writes the routes' upstream bearers to.
+type RouteSecretsConfig struct {
+	// File is the path of the file. Empty turns the feature off.
+	File string
+	// Reload is how often the file is checked for changes.
+	Reload time.Duration
+	// Hint tells admins where the value of a route's key is maintained,
+	// for example a path in the secret manager. "{route_id}" and "{key}"
+	// are replaced. It is only shown in the admin form.
+	Hint string
+	// Strict stops the gateway from falling back to the upstream bearer
+	// stored in the auth store when the file has no value for a route.
+	Strict bool
+}
+
+// UpstreamBearerSecretKey returns the name under which the route secrets
+// file holds this route's upstream bearer: upstream_bearer_key if set,
+// otherwise the route id in upper case with every character outside A-Z
+// and 0-9 replaced by '_' ("german-legal-mcp" becomes "GERMAN_LEGAL_MCP").
+func (r Route) UpstreamBearerSecretKey() string {
+	if key := strings.TrimSpace(r.UpstreamBearerKey); key != "" {
+		return key
+	}
+	return deriveSecretKey(r.ID)
+}
+
+func deriveSecretKey(routeID string) string {
+	var b strings.Builder
+	for _, c := range strings.ToUpper(strings.TrimSpace(routeID)) {
+		if (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+			b.WriteRune(c)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	return b.String()
+}
+
+func validSecretKey(key string) bool {
+	if key == "" {
+		return false
+	}
+	for _, c := range key {
+		if !((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_') {
+			return false
+		}
+	}
+	return true
 }
 
 type routesFile struct {
@@ -252,6 +309,21 @@ func Load() (*Config, error) {
 			MaxSessionsRoute:   getIntEnv("MCP_GATEWAY_STDIO_MAX_SESSIONS_PER_ROUTE", 64),
 		},
 		OpenAPIStoreDir: getEnvOrDefault("MCP_GATEWAY_OPENAPI_STORE_DIR", defaultOpenAPIStoreDir),
+		RouteSecrets: RouteSecretsConfig{
+			File:   strings.TrimSpace(os.Getenv("MCP_GATEWAY_ROUTE_SECRETS_FILE")),
+			Reload: getDurationEnv("MCP_GATEWAY_ROUTE_SECRETS_RELOAD", defaultRouteSecretsReload),
+			Strict: getBoolEnv("MCP_GATEWAY_ROUTE_SECRETS_STRICT", false),
+			Hint:   strings.TrimSpace(os.Getenv("MCP_GATEWAY_ROUTE_SECRETS_HINT")),
+		},
+	}
+	if cfg.RouteSecrets.File != "" && !filepath.IsAbs(cfg.RouteSecrets.File) {
+		return nil, fmt.Errorf("MCP_GATEWAY_ROUTE_SECRETS_FILE must be an absolute path")
+	}
+	if cfg.RouteSecrets.Reload < time.Second {
+		return nil, fmt.Errorf("MCP_GATEWAY_ROUTE_SECRETS_RELOAD must be at least 1s")
+	}
+	if cfg.RouteSecrets.Strict && cfg.RouteSecrets.File == "" {
+		return nil, fmt.Errorf("MCP_GATEWAY_ROUTE_SECRETS_STRICT needs MCP_GATEWAY_ROUTE_SECRETS_FILE")
 	}
 	if len(cfg.BuildManagement.AllowedDownloadHosts) == 0 {
 		cfg.BuildManagement.AllowedDownloadHosts = []string{
@@ -438,6 +510,22 @@ func ValidateRoutes(routes []Route) error {
 	return nil
 }
 
+// ValidateRouteSecretKeys reports two routes that would read the same entry
+// of the route secrets file: "a-b" and "a_b" both derive A_B, and one would
+// silently send the other's bearer to its upstream. It only matters when a
+// route secrets file is configured.
+func ValidateRouteSecretKeys(routes []Route) error {
+	seen := make(map[string]string, len(routes))
+	for _, route := range routes {
+		key := route.UpstreamBearerSecretKey()
+		if other, exists := seen[key]; exists {
+			return fmt.Errorf("routes %q and %q share the route secrets key %q; set upstream_bearer_key on one of them", other, route.ID, key)
+		}
+		seen[key] = route.ID
+	}
+	return nil
+}
+
 func NormalizeRoute(route *Route) error {
 	return normalizeRoute(route)
 }
@@ -451,6 +539,11 @@ func normalizeRoute(route *Route) error {
 	route.DisplayName = strings.TrimSpace(route.DisplayName)
 	if route.DisplayName == "" {
 		route.DisplayName = route.ID
+	}
+
+	route.UpstreamBearerKey = strings.TrimSpace(route.UpstreamBearerKey)
+	if route.UpstreamBearerKey != "" && !validSecretKey(route.UpstreamBearerKey) {
+		return fmt.Errorf("route %q upstream_bearer_key may only contain A-Z, 0-9 and '_'", route.ID)
 	}
 
 	route.Transport = strings.ToLower(strings.TrimSpace(route.Transport))

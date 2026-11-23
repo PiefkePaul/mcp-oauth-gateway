@@ -294,6 +294,37 @@ func (m *Manager) ResolveRouteUpstreamBearer(routeID string, identity *Identity)
 	return "", false
 }
 
+// RouteUserUpstreamBearer returns the upstream bearer the user behind
+// identity has stored for the route.
+func (m *Manager) RouteUserUpstreamBearer(routeID string, identity *Identity) (string, bool) {
+	if identity == nil {
+		return "", false
+	}
+	routeID = strings.TrimSpace(routeID)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	record := m.data.RouteSecrets[routeID]
+	if record == nil {
+		return "", false
+	}
+	token := strings.TrimSpace(record.UserUpstreamBearers[identity.UserID])
+	return token, token != ""
+}
+
+// RouteGlobalUpstreamBearer returns the upstream bearer stored for the
+// route itself, the one all users without a bearer of their own share.
+func (m *Manager) RouteGlobalUpstreamBearer(routeID string) (string, bool) {
+	routeID = strings.TrimSpace(routeID)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	record := m.data.RouteSecrets[routeID]
+	if record == nil {
+		return "", false
+	}
+	token := strings.TrimSpace(record.UpstreamBearer)
+	return token, token != ""
+}
+
 // SyncRouteForwardHeaderSecrets stores the given forward header values for
 // a route and drops stored values for headers not named in keep (headers
 // that were removed from the route). It only writes when something changes.
