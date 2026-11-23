@@ -52,8 +52,9 @@ Stand 18.11.2026. Gilt für Menschen und KI-Agenten (Claude, Claude Code, Codex,
 - Fehlende Werte nie erfinden: Fundort im NAS-Wiki `infrastruktur/schluessel-inventar`, dann Paul fragen.
 
 ## Stand in diesem Repo
-- Workflows `docker-publish.yml` (Docker Hub), `test.yml`, `vulncheck.yml`.
-- `docker-publish.yml`: Gitea-Registry dazu (Docker Hub bleibt als Zweitkopie), `runs-on` des Image-Jobs auf `[self-hosted, nas, mcp-oauth-gateway]` prüfen. Entwurf dazu war PR #15 (prüfen, ob noch offen).
+- Workflows `docker-publish.yml`, `test.yml`, `vulncheck.yml`.
+- `docker-publish.yml` ist umgestellt (PR #15, gemergt am 17.11.2026): Der Job `build` läuft nur in Gitea auf `[self-hosted, nas, mcp-oauth-gateway]` und pusht von `main` nach `gitea:3000/scholz/mcp-oauth-gateway` (`latest` und `sha-<7 Zeichen>`). Er hat keinen `pull_request`-Trigger; vor einem Merge lässt sich der Build per `workflow_dispatch` auf dem Branch prüfen (baut nur, pusht nicht). Der Job `dockerhub` läuft nur auf GitHub bei Push nach `main`.
+- Pull: `git.scholz-cloud.de/scholz/mcp-oauth-gateway:sha-<kurz>`.
 
 ## Quellen (NAS-Wiki, intern)
 - `infrastruktur/github-gitea-umzug/plan`, `.../ci-umstellung`, `.../vorlage-docker-workflow`
