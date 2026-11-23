@@ -1890,7 +1890,7 @@ func ensureEnvLine(raw string, key string, value string) string {
 func newArtifactBuildFormData(cfg config.BuildManagementConfig) artifactBuildFormData {
 	return artifactBuildFormData{
 		SourceKind:   artifactSourceURL,
-		BaseImage:    defaultIfEmpty(cfg.DefaultBaseImage, "debian:bookworm-slim"),
+		BaseImage:    defaultIfEmpty(cfg.DefaultBaseImage, "debian:trixie-slim"),
 		InternalPort: "8080",
 		ExtractMode:  extractNone,
 	}
@@ -3227,7 +3227,7 @@ const adminDashboardTemplate = `
           <div class="field-grid">
             <div class="field" style="margin-top:0;">
               <label for="build_base_image">Base Image</label>
-              <input id="build_base_image" name="base_image" type="text" class="mono" value="{{.BuildForm.BaseImage}}" placeholder="debian:bookworm-slim">
+              <input id="build_base_image" name="base_image" type="text" class="mono" value="{{.BuildForm.BaseImage}}" placeholder="debian:trixie-slim">
               <p class="hint">Erlaubt: <code>{{.BuildBaseImages}}</code></p>
             </div>
             <div class="field" style="margin-top:0;">

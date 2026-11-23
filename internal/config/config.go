@@ -289,7 +289,7 @@ func Load() (*Config, error) {
 			MaxArtifactBytes:     int64(getIntEnv("MCP_GATEWAY_BUILD_MAX_ARTIFACT_MB", defaultBuildMaxArtifactMB)) << 20,
 			AllowedDownloadHosts: parseCSVEnv("MCP_GATEWAY_BUILD_ALLOWED_DOWNLOAD_HOSTS"),
 			AllowAnyDownloadHost: getBoolEnv("MCP_GATEWAY_BUILD_ALLOW_ANY_DOWNLOAD_HOST", false),
-			DefaultBaseImage:     getEnvOrDefault("MCP_GATEWAY_BUILD_DEFAULT_BASE_IMAGE", "debian:bookworm-slim"),
+			DefaultBaseImage:     getEnvOrDefault("MCP_GATEWAY_BUILD_DEFAULT_BASE_IMAGE", "debian:trixie-slim"),
 			AllowedBaseImages:    parseCSVEnv("MCP_GATEWAY_BUILD_ALLOWED_BASE_IMAGES"),
 		},
 		StdioInstaller: StdioInstallerConfig{
