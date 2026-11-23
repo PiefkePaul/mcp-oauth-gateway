@@ -99,6 +99,9 @@ Wichtig:
 - `MCP_GATEWAY_ROUTE_SECRETS_RELOAD` (Standard `10s`, mindestens `1s`)
 - `MCP_GATEWAY_ROUTE_SECRETS_STRICT` (Standard `false`)
 - `MCP_GATEWAY_ROUTE_SECRETS_HINT` (optional, Hinweis im Routen-Formular, wo der Wert gepflegt wird; `{route_id}` und `{key}` werden ersetzt)
+- `MCP_GATEWAY_SECRET_BROKER_URL` (optional, Endpunkt eines Token-Brokers fuer Routen-Bearer, z. B. `http://192.168.178.254:40081/api/route-secret`; braucht `MCP_GATEWAY_ROUTE_SECRETS_FILE`)
+- `MCP_GATEWAY_SECRET_BROKER_TOKEN` (Client-Token fuer den Broker; darf dort nur Routen-Bearer setzen)
+- `MCP_GATEWAY_SECRET_BROKER_TIMEOUT` (Standard `20s`), `MCP_GATEWAY_SECRET_BROKER_DELAY` (Standard `5m`, nur Anzeige: bis wann der Wert ueblicherweise in der Datei steht)
 
 Der Master-Key muss genau 32 Bytes nach Base64-, Base64URL- oder Hex-Decoding ergeben.
 
@@ -426,6 +429,7 @@ GERMAN_LEGAL_MCP='wert'
 - `MCP_GATEWAY_ROUTE_SECRETS_STRICT=true`: Der im Gateway gespeicherte Bearer der Route wird nicht mehr gesendet. Eine Route, die noch einen gespeicherten Bearer oder ein `upstream_bearer_key` hat, deren Schluessel aber in der Datei fehlt, wird mit `503 upstream_bearer_missing` beantwortet und nicht weitergeleitet. Routen, die nie einen Upstream-Bearer hatten, sind nicht betroffen.
 - Das Dashboard zeigt je Route die Quelle (Datei mit Schluesselname, Admin-Formular, fehlt), nie den Wert. Kommt der Wert aus der Datei, ist das Bearer-Feld gesperrt; ein noch gespeicherter Wert laesst sich ueber "Globalen Upstream Bearer loeschen" entfernen.
 - Der Gateway schreibt nie in die Datei oder in den Secret-Manager. Ein im Formular eingetragener Bearer landet nur im Auth-Store. Damit das nicht versehentlich passiert, zeigt das Routen-Formular bei aktiver Secrets-Datei, wo der Wert gepflegt wird: den Text aus `MCP_GATEWAY_ROUTE_SECRETS_HINT`, zum Beispiel `Infisical nas-stacks/prod/gateway/routen/{route_id}/UPSTREAM_BEARER`, sonst Schluessel und Dateipfad.
+- Mit Token-Broker (`MCP_GATEWAY_SECRET_BROKER_URL`): Ein im Formular eingetragener globaler Upstream-Bearer wird NICHT im Gateway gespeichert, sondern per `POST` (JSON `route_id`, `key`, `value`, `Authorization: Bearer <MCP_GATEWAY_SECRET_BROKER_TOKEN>`) an den Broker uebergeben. Der Broker legt ihn im Secret-Manager ab; das Gateway nutzt ihn, sobald er in der Secrets-Datei steht. Das Gateway ruft den Broker erst auf, nachdem die Route geprueft und gespeichert ist; eine ungueltige Route hinterlaesst also nichts im Secret-Manager. Antwortet der Broker nicht mit `200` und `{"ok":true}`, bleibt die Route gespeichert, der Bearer aber nirgends (auch nicht im Auth-Store), und die Seite meldet das als Fehler. Redirects werden nicht verfolgt. Nutzer-spezifische Bearer bleiben im Auth-Store. Werte mit `${` (Secret-Verweise des Secret-Managers) werden immer abgelehnt, mit und ohne Broker: aufgeloest wuerden sie ein fremdes Secret an den Upstream der Route schicken. Das Gateway bekommt so keinen Lesezugang zum Secret-Manager.
 - Rueckweg: `MCP_GATEWAY_ROUTE_SECRETS_FILE` leeren, dann gilt wieder nur der gespeicherte Bearer. Gespeicherte Werte bleiben erhalten, bis sie bewusst geloescht werden.
 
 Nicht aus der Datei gespeist werden bisher `forward_headers`, `openapi.headers` und `stdio.env`.
