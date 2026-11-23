@@ -55,6 +55,7 @@ type Config struct {
 	HealthCheck         HealthCheckConfig
 	OpenAPIStoreDir     string
 	RouteSecrets        RouteSecretsConfig
+	SecretBroker        SecretBrokerConfig
 	Routes              []Route
 }
 
@@ -210,6 +211,27 @@ type RouteSecretsConfig struct {
 	Strict bool
 }
 
+// SecretBrokerConfig describes an external secret broker that takes a
+// route's upstream bearer from the admin form and writes it into the secret
+// manager. The gateway then reads the value back from the route secrets file
+// like every other route and never stores it itself.
+type SecretBrokerConfig struct {
+	// URL is the broker's endpoint for setting a route secret, for example
+	// http://192.168.178.254:40081/api/route-secret. Empty turns it off.
+	URL string
+	// Token authenticates the gateway at the broker. It allows nothing but
+	// setting route secrets.
+	Token string
+	// Timeout limits one call to the broker.
+	Timeout time.Duration
+	// Delay is shown to admins: how long it usually takes until the value
+	// is in the route secrets file (agent polling plus file reload).
+	Delay time.Duration
+}
+
+// Enabled reports whether a broker is configured.
+func (c SecretBrokerConfig) Enabled() bool { return c.URL != "" }
+
 // UpstreamBearerSecretKey returns the name under which the route secrets
 // file holds this route's upstream bearer: upstream_bearer_key if set,
 // otherwise the route id in upper case with every character outside A-Z
@@ -315,6 +337,12 @@ func Load() (*Config, error) {
 			Strict: getBoolEnv("MCP_GATEWAY_ROUTE_SECRETS_STRICT", false),
 			Hint:   strings.TrimSpace(os.Getenv("MCP_GATEWAY_ROUTE_SECRETS_HINT")),
 		},
+		SecretBroker: SecretBrokerConfig{
+			URL:     strings.TrimSpace(os.Getenv("MCP_GATEWAY_SECRET_BROKER_URL")),
+			Token:   strings.TrimSpace(os.Getenv("MCP_GATEWAY_SECRET_BROKER_TOKEN")),
+			Timeout: getDurationEnv("MCP_GATEWAY_SECRET_BROKER_TIMEOUT", 20*time.Second),
+			Delay:   getDurationEnv("MCP_GATEWAY_SECRET_BROKER_DELAY", 5*time.Minute),
+		},
 	}
 	if cfg.RouteSecrets.File != "" && !filepath.IsAbs(cfg.RouteSecrets.File) {
 		return nil, fmt.Errorf("MCP_GATEWAY_ROUTE_SECRETS_FILE must be an absolute path")
@@ -324,6 +352,9 @@ func Load() (*Config, error) {
 	}
 	if cfg.RouteSecrets.Strict && cfg.RouteSecrets.File == "" {
 		return nil, fmt.Errorf("MCP_GATEWAY_ROUTE_SECRETS_STRICT needs MCP_GATEWAY_ROUTE_SECRETS_FILE")
+	}
+	if err := validateSecretBroker(cfg.SecretBroker, cfg.RouteSecrets); err != nil {
+		return nil, err
 	}
 	if len(cfg.BuildManagement.AllowedDownloadHosts) == 0 {
 		cfg.BuildManagement.AllowedDownloadHosts = []string{
@@ -1091,6 +1122,30 @@ func getEnvOrDefault(key, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func validateSecretBroker(broker SecretBrokerConfig, routeSecrets RouteSecretsConfig) error {
+	if broker.URL == "" {
+		if broker.Token != "" {
+			return fmt.Errorf("MCP_GATEWAY_SECRET_BROKER_TOKEN is set but MCP_GATEWAY_SECRET_BROKER_URL is empty")
+		}
+		return nil
+	}
+	parsed, err := url.Parse(broker.URL)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.User != nil {
+		return fmt.Errorf("MCP_GATEWAY_SECRET_BROKER_URL must be an absolute http(s) URL without credentials")
+	}
+	if broker.Token == "" {
+		return fmt.Errorf("MCP_GATEWAY_SECRET_BROKER_URL needs MCP_GATEWAY_SECRET_BROKER_TOKEN")
+	}
+	if routeSecrets.File == "" {
+		// Without the file the gateway would never see the value it handed over.
+		return fmt.Errorf("MCP_GATEWAY_SECRET_BROKER_URL needs MCP_GATEWAY_ROUTE_SECRETS_FILE")
+	}
+	if broker.Timeout < time.Second {
+		return fmt.Errorf("MCP_GATEWAY_SECRET_BROKER_TIMEOUT must be at least 1s")
+	}
+	return nil
 }
 
 func getDurationEnv(key string, fallback time.Duration) time.Duration {

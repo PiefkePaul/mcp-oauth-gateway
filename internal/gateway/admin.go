@@ -52,6 +52,9 @@ type dashboardData struct {
 	DeploymentForm      deploymentFormData
 	BuildForm           artifactBuildFormData
 	StdioInstallForm    stdioInstallFormData
+	// SecretBrokerEnabled: a global upstream bearer typed into the admin
+	// form goes to the token broker, the gateway stores none.
+	SecretBrokerEnabled bool
 }
 
 type dashboardRouteView struct {
@@ -320,6 +323,17 @@ func (s *Server) handleAdminRouteSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// With a token broker the global bearer goes to the broker before the
+	// route is saved, so a refused value leaves nothing half done.
+	brokerNotice, err := s.handOverUpstreamBearer(r.Context(), route, bearerForm.token)
+	if err != nil {
+		s.renderAdminDashboard(w, r, identity, formData, "", err.Error(), http.StatusBadGateway)
+		return
+	}
+	if brokerNotice != "" {
+		bearerForm.token = ""
+	}
+
 	if err := s.upsertRoute(formData.OriginalID, route); err != nil {
 		s.renderAdminDashboard(w, r, identity, formData, "", err.Error(), http.StatusBadRequest)
 		return
@@ -336,6 +350,9 @@ func (s *Server) handleAdminRouteSave(w http.ResponseWriter, r *http.Request) {
 	notice := "Route saved successfully"
 	if bearerForm.unquoted {
 		notice += "; quotes around the Upstream Bearer were removed"
+	}
+	if brokerNotice != "" {
+		notice += "; " + brokerNotice
 	}
 	// Verify the route right away so misconfigurations show up on save.
 	checkNotice, checkError := healthCheckMessages(route.ID, s.checkRoute(r.Context(), route.ID))
@@ -999,6 +1016,19 @@ func (s *Server) handleAdminDeploymentCreate(w http.ResponseWriter, r *http.Requ
 			return
 		}
 	}
+	brokerNotice, err := s.handOverUpstreamBearer(r.Context(), route, formData.UpstreamBearerToken)
+	if err != nil {
+		if spec != nil {
+			rollbackCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			_ = s.dockerManager.Remove(rollbackCtx, spec.ContainerName)
+		}
+		s.renderAdminDashboard(w, r, identity, newEmptyRouteFormData(), "", err.Error(), http.StatusBadGateway)
+		return
+	}
+	if brokerNotice != "" {
+		formData.UpstreamBearerToken = ""
+	}
 	if err := s.upsertRoute("", route); err != nil {
 		if spec != nil {
 			rollbackCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -1020,7 +1050,11 @@ func (s *Server) handleAdminDeploymentCreate(w http.ResponseWriter, r *http.Requ
 		time.Sleep(deploymentHealthCheckDelay)
 		s.checkRoute(context.Background(), routeID)
 	}(route.ID)
-	http.Redirect(w, r, adminRedirectURLWithTab("deployments", route.ID, "Deployment created successfully; its reachability is checked in a few seconds", ""), http.StatusFound)
+	deploymentNotice := "Deployment created successfully; its reachability is checked in a few seconds"
+	if brokerNotice != "" {
+		deploymentNotice += "; " + brokerNotice
+	}
+	http.Redirect(w, r, adminRedirectURLWithTab("deployments", route.ID, deploymentNotice, ""), http.StatusFound)
 }
 
 func (s *Server) handleAdminDeploymentStart(w http.ResponseWriter, r *http.Request) {
@@ -1417,6 +1451,7 @@ func (s *Server) renderAdminDashboard(w http.ResponseWriter, r *http.Request, id
 		DeploymentForm:      newDeploymentFormData(s.cfg.DockerManagement),
 		BuildForm:           newArtifactBuildFormData(s.cfg.BuildManagement),
 		StdioInstallForm:    newStdioInstallFormData(),
+		SecretBrokerEnabled: s.secretBroker != nil,
 	}
 
 	renderAdminHTML(w, status, data)
@@ -2648,11 +2683,11 @@ const adminDashboardTemplate = `
                   <p class="hint">Fuer MCP-Server wie n8n-mcp, die zusaetzlich zum Gateway-OAuth einen internen Bearer erwarten. Werte werden verschluesselt gespeichert und nicht nach <code>routes.yaml</code> exportiert.</p>
                   <div class="field">
                     <label for="upstream_bearer_token">Globaler Upstream Bearer</label>
-                    <input id="upstream_bearer_token" name="upstream_bearer_token" type="password" {{if .SelectedRoute.UpstreamBearerFromFile}}disabled{{end}} placeholder="{{if .SelectedRoute.UpstreamBearerFromFile}}Wert kommt aus der Secrets-Datei{{else if .SelectedRoute.UpstreamBearerConfigured}}Token ist gesetzt; leer lassen zum Beibehalten{{else}}n8n AUTH_TOKEN oder anderer Upstream-Bearer{{end}}">
+                    <input id="upstream_bearer_token" name="upstream_bearer_token" type="password" autocomplete="off" {{if and .SelectedRoute.UpstreamBearerFromFile (not $.SecretBrokerEnabled)}}disabled{{end}} placeholder="{{if $.SecretBrokerEnabled}}{{if .SelectedRoute.UpstreamBearerFromFile}}Wert kommt aus Infisical; neuer Wert ersetzt ihn dort{{else}}Wird an den Token-Broker uebergeben und in Infisical gespeichert{{end}}{{else if .SelectedRoute.UpstreamBearerFromFile}}Wert kommt aus der Secrets-Datei{{else if .SelectedRoute.UpstreamBearerConfigured}}Token ist gesetzt; leer lassen zum Beibehalten{{else}}n8n AUTH_TOKEN oder anderer Upstream-Bearer{{end}}">
                     <p class="hint">{{if .SelectedRoute.UpstreamBearerConfigured}}Im Gateway ist ein globaler Upstream-Bearer gespeichert.{{else}}Im Gateway ist kein globaler Upstream-Bearer gespeichert.{{end}} Nutzer-spezifische Tokens haben Vorrang.</p>
                     {{if .SelectedRoute.RouteSecretsFile}}<p class="hint">Verwendet wird: {{.SelectedRoute.UpstreamBearerSource}}. Die Secrets-Datei <code>{{.SelectedRoute.RouteSecretsFile}}</code> hat Vorrang vor dem gespeicherten Wert{{if .SelectedRoute.UpstreamBearerFromFile}}; das Feld ist deshalb gesperrt. Ein noch gespeicherter Wert laesst sich unten loeschen{{end}}.</p>{{end}}
                   </div>
-                  {{if .SelectedRoute.RouteSecretsHint}}<p class="hint"><strong>Wert nicht hier eintragen.</strong> Der Gateway schreibt nichts in die Secrets-Datei oder in den Secret-Manager. Der Upstream-Bearer dieser Route wird gepflegt unter: <code>{{.SelectedRoute.RouteSecretsHint}}</code>. Ein hier eingetragener Wert landet nur im Gateway und gilt, solange der Schluessel in der Datei fehlt{{if .SelectedRoute.RouteSecretsStrict}}; im Strict-Modus wird die Route dann nicht weitergeleitet{{end}}.</p>{{end}}
+                  {{if $.SecretBrokerEnabled}}<p class="hint"><strong>Token-Broker aktiv.</strong> Ein hier eingetragener globaler Bearer wird nicht im Gateway gespeichert, sondern an den Token-Broker uebergeben. Der legt ihn in Infisical ab (Ordner der Route) und verknuepft ihn mit dem Schluessel dieser Route in der Secrets-Datei. Das Gateway nutzt ihn, sobald er in der Datei steht (meist binnen weniger Minuten). Lehnt der Broker ab, wird nichts gespeichert. Nutzer-spezifische Bearer unten bleiben im Gateway.</p>{{else if .SelectedRoute.RouteSecretsHint}}<p class="hint"><strong>Wert nicht hier eintragen.</strong> Der Gateway schreibt nichts in die Secrets-Datei oder in den Secret-Manager. Der Upstream-Bearer dieser Route wird gepflegt unter: <code>{{.SelectedRoute.RouteSecretsHint}}</code>. Ein hier eingetragener Wert landet nur im Gateway und gilt, solange der Schluessel in der Datei fehlt{{if .SelectedRoute.RouteSecretsStrict}}; im Strict-Modus wird die Route dann nicht weitergeleitet{{end}}.</p>{{end}}
                   {{if .SelectedRoute.RouteSecretsFile}}
                   <div class="field">
                     <label for="upstream_bearer_key">Schluessel in der Secrets-Datei</label>
@@ -2944,8 +2979,8 @@ const adminDashboardTemplate = `
               </div>
               <div class="field">
                 <label for="deployment_upstream_bearer_token">Gateway Upstream Bearer</label>
-                <input id="deployment_upstream_bearer_token" name="deployment_upstream_bearer_token" type="password" placeholder="Optional: derselbe Wert wie AUTH_TOKEN bei n8n-mcp">
-                <p class="hint">Verschluesselt gespeichert, vom Gateway als <code>Authorization: Bearer ...</code> zum Upstream gesendet.</p>
+                <input id="deployment_upstream_bearer_token" name="deployment_upstream_bearer_token" type="password" autocomplete="off" placeholder="Optional: derselbe Wert wie AUTH_TOKEN bei n8n-mcp">
+                <p class="hint">{{if $.SecretBrokerEnabled}}Wird an den Token-Broker uebergeben und in Infisical gespeichert, nicht im Gateway.{{else}}Verschluesselt gespeichert,{{end}} vom Gateway als <code>Authorization: Bearer ...</code> zum Upstream gesendet.</p>
               </div>
             </div>
 

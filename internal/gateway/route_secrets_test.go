@@ -313,7 +313,7 @@ func TestAdminFormShowsSourceAndLocksTheBearerField(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("admin page: %d", rec.Code)
 	}
-	for _, want := range []string{"aus der Secrets-Datei (GERMAN_LEGAL_MCP", `name="upstream_bearer_key"`, `type="password" disabled`} {
+	for _, want := range []string{"aus der Secrets-Datei (GERMAN_LEGAL_MCP", `name="upstream_bearer_key"`, `type="password" autocomplete="off" disabled`} {
 		if !strings.Contains(body, want) {
 			t.Errorf("admin page lacks %q", want)
 		}

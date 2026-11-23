@@ -35,7 +35,10 @@ type Server struct {
 
 	// routeSecrets is the file an external agent writes the routes'
 	// upstream bearers to; nil when none is configured.
-	routeSecrets        *secretsfile.Store
+	routeSecrets *secretsfile.Store
+	// secretBroker takes upstream bearers from the admin form and writes
+	// them into the secret manager; nil when none is configured.
+	secretBroker        *secretBroker
 	missingBearerMu     sync.Mutex
 	missingBearerLogged map[string]time.Time
 }
@@ -58,6 +61,7 @@ func New(cfg *config.Config, authManager *auth.Manager) (*Server, error) {
 	if cfg.RouteSecrets.File != "" {
 		server.routeSecrets = secretsfile.Open(cfg.RouteSecrets.File)
 	}
+	server.secretBroker = newSecretBroker(cfg.SecretBroker)
 	if cfg.DockerManagement.Enabled {
 		dockerManager, err := newDockerManager(cfg.DockerManagement)
 		if err != nil {
@@ -134,6 +138,9 @@ func Run(cfg *config.Config) error {
 		log.Printf("route secrets file=%s reload=%s strict=%t", cfg.RouteSecrets.File, cfg.RouteSecrets.Reload, cfg.RouteSecrets.Strict)
 		go handler.routeSecrets.Watch(context.Background(), cfg.RouteSecrets.Reload)
 		go reloadOnHangup(handler.routeSecrets)
+	}
+	if handler.secretBroker != nil {
+		log.Printf("secret broker url=%s: the admin form hands upstream bearers to the broker and stores none", cfg.SecretBroker.URL)
 	}
 
 	return httpServer.ListenAndServe()
