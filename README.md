@@ -98,6 +98,7 @@ Wichtig:
 - `MCP_GATEWAY_ROUTE_SECRETS_FILE` (optional, Datei mit den Upstream-Bearern der Routen; leer = aus)
 - `MCP_GATEWAY_ROUTE_SECRETS_RELOAD` (Standard `10s`, mindestens `1s`)
 - `MCP_GATEWAY_ROUTE_SECRETS_STRICT` (Standard `false`)
+- `MCP_GATEWAY_ROUTE_SECRETS_HINT` (optional, Hinweis im Routen-Formular, wo der Wert gepflegt wird; `{route_id}` und `{key}` werden ersetzt)
 
 Der Master-Key muss genau 32 Bytes nach Base64-, Base64URL- oder Hex-Decoding ergeben.
 
@@ -424,6 +425,7 @@ GERMAN_LEGAL_MCP='wert'
 - Ist die Datei nicht lesbar oder fehlerhaft, bleibt der letzte gute Stand. Das Log nennt die Zeilennummer und die Namen der geaenderten Schluessel, nie Werte.
 - `MCP_GATEWAY_ROUTE_SECRETS_STRICT=true`: Der im Gateway gespeicherte Bearer der Route wird nicht mehr gesendet. Eine Route, die noch einen gespeicherten Bearer oder ein `upstream_bearer_key` hat, deren Schluessel aber in der Datei fehlt, wird mit `503 upstream_bearer_missing` beantwortet und nicht weitergeleitet. Routen, die nie einen Upstream-Bearer hatten, sind nicht betroffen.
 - Das Dashboard zeigt je Route die Quelle (Datei mit Schluesselname, Admin-Formular, fehlt), nie den Wert. Kommt der Wert aus der Datei, ist das Bearer-Feld gesperrt; ein noch gespeicherter Wert laesst sich ueber "Globalen Upstream Bearer loeschen" entfernen.
+- Der Gateway schreibt nie in die Datei oder in den Secret-Manager. Ein im Formular eingetragener Bearer landet nur im Auth-Store. Damit das nicht versehentlich passiert, zeigt das Routen-Formular bei aktiver Secrets-Datei, wo der Wert gepflegt wird: den Text aus `MCP_GATEWAY_ROUTE_SECRETS_HINT`, zum Beispiel `Infisical nas-stacks/prod/gateway/routen/{route_id}/UPSTREAM_BEARER`, sonst Schluessel und Dateipfad.
 - Rueckweg: `MCP_GATEWAY_ROUTE_SECRETS_FILE` leeren, dann gilt wieder nur der gespeicherte Bearer. Gespeicherte Werte bleiben erhalten, bis sie bewusst geloescht werden.
 
 Nicht aus der Datei gespeist werden bisher `forward_headers`, `openapi.headers` und `stdio.env`.

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/PiefkePaul/mcp-oauth-gateway/internal/auth"
@@ -116,4 +117,27 @@ func (s *Server) logMissingBearer(route config.Route) {
 	}
 	s.missingBearerLogged[route.ID] = now
 	log.Printf("gateway does not forward route=%s: key %s is not in the route secrets file (strict mode)", route.ID, route.UpstreamBearerSecretKey())
+}
+
+// routeSecretsHint says where the upstream bearer of a route is maintained:
+// the configured hint with the route's id and key filled in, or the key in
+// the secrets file if no hint is configured. For a route that has no id yet
+// the placeholders stay readable.
+func (s *Server) routeSecretsHint(routeID, explicitKey string) string {
+	if s.routeSecrets == nil {
+		return ""
+	}
+	routeID = strings.TrimSpace(routeID)
+	key := "<ROUTE_ID>"
+	if routeID != "" || strings.TrimSpace(explicitKey) != "" {
+		key = config.Route{ID: routeID, UpstreamBearerKey: explicitKey}.UpstreamBearerSecretKey()
+	}
+	if routeID == "" {
+		routeID = "<route-id>"
+	}
+	hint := s.cfg.RouteSecrets.Hint
+	if hint == "" {
+		return fmt.Sprintf("%s in %s", key, s.routeSecrets.Path())
+	}
+	return strings.NewReplacer("{route_id}", routeID, "{key}", key).Replace(hint)
 }

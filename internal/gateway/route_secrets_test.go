@@ -319,3 +319,46 @@ func TestAdminFormShowsSourceAndLocksTheBearerField(t *testing.T) {
 		}
 	}
 }
+
+func TestAdminFormSaysWhereTheBearerIsMaintained(t *testing.T) {
+	f := newRouteSecretsFixture(t, "OTHER='"+fileBearer+"'\n", false)
+	f.server.cfg.RouteSecrets.Hint = "Infisical nas-stacks/prod/gateway/routen/{route_id}/UPSTREAM_BEARER ({key})"
+	cookies := adminTestSession(t, f.server)
+	page := func(query string) string {
+		req := httptest.NewRequest(http.MethodGet, "https://mcp.example.com/admin?"+query, nil)
+		for _, cookie := range cookies {
+			req.AddCookie(cookie)
+		}
+		rec := httptest.NewRecorder()
+		f.server.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("admin page %s: %d", query, rec.Code)
+		}
+		return rec.Body.String()
+	}
+
+	existing := page("route=german-legal-mcp")
+	if want := "Infisical nas-stacks/prod/gateway/routen/german-legal-mcp/UPSTREAM_BEARER (GERMAN_LEGAL_MCP)"; !strings.Contains(existing, want) {
+		t.Errorf("form of an existing route lacks %q", want)
+	}
+	if !strings.Contains(existing, "Wert nicht hier eintragen") {
+		t.Errorf("form lacks the warning")
+	}
+
+	fresh := page("new=1")
+	if want := "routen/&lt;route-id&gt;/UPSTREAM_BEARER (&lt;ROUTE_ID&gt;)"; !strings.Contains(fresh, want) {
+		t.Errorf("form of a new route lacks %q", want)
+	}
+
+	// Without a configured hint the key and the file are named.
+	f.server.cfg.RouteSecrets.Hint = ""
+	if want := "GERMAN_LEGAL_MCP in " + f.path; !strings.Contains(page("route=german-legal-mcp"), want) {
+		t.Errorf("default hint lacks %q", want)
+	}
+
+	// Without a secrets file there is no hint at all.
+	f.server.routeSecrets = nil
+	if strings.Contains(page("route=german-legal-mcp"), "Wert nicht hier eintragen") {
+		t.Errorf("hint shown although no secrets file is configured")
+	}
+}

@@ -201,6 +201,10 @@ type RouteSecretsConfig struct {
 	File string
 	// Reload is how often the file is checked for changes.
 	Reload time.Duration
+	// Hint tells admins where the value of a route's key is maintained,
+	// for example a path in the secret manager. "{route_id}" and "{key}"
+	// are replaced. It is only shown in the admin form.
+	Hint string
 	// Strict stops the gateway from falling back to the upstream bearer
 	// stored in the auth store when the file has no value for a route.
 	Strict bool
@@ -309,6 +313,7 @@ func Load() (*Config, error) {
 			File:   strings.TrimSpace(os.Getenv("MCP_GATEWAY_ROUTE_SECRETS_FILE")),
 			Reload: getDurationEnv("MCP_GATEWAY_ROUTE_SECRETS_RELOAD", defaultRouteSecretsReload),
 			Strict: getBoolEnv("MCP_GATEWAY_ROUTE_SECRETS_STRICT", false),
+			Hint:   strings.TrimSpace(os.Getenv("MCP_GATEWAY_ROUTE_SECRETS_HINT")),
 		},
 	}
 	if cfg.RouteSecrets.File != "" && !filepath.IsAbs(cfg.RouteSecrets.File) {

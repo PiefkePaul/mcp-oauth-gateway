@@ -221,16 +221,19 @@ type routeFormData struct {
 	UpstreamBearerFromFile   bool
 	UpstreamBearerDerivedKey string
 	RouteSecretsFile         string
-	StdioCommand             string
-	StdioArgs                string
-	StdioEnv                 string
-	StdioWorkingDir          string
-	OpenAPISpecPath          string
-	OpenAPISpecURL           string
-	OpenAPIBaseURL           string
-	OpenAPIHeaders           string
-	OpenAPITimeoutSeconds    string
-	Notes                    string
+	// RouteSecretsHint says where the value for this route is maintained.
+	RouteSecretsHint      string
+	RouteSecretsStrict    bool
+	StdioCommand          string
+	StdioArgs             string
+	StdioEnv              string
+	StdioWorkingDir       string
+	OpenAPISpecPath       string
+	OpenAPISpecURL        string
+	OpenAPIBaseURL        string
+	OpenAPIHeaders        string
+	OpenAPITimeoutSeconds string
+	Notes                 string
 }
 
 func (s *Server) handleAdminDashboard(w http.ResponseWriter, r *http.Request) {
@@ -1464,15 +1467,17 @@ func (s *Server) decorateRouteSecretFormData(form *routeFormData) {
 	if routeID == "" {
 		routeID = strings.TrimSpace(form.ID)
 	}
+	if s.routeSecrets != nil {
+		form.RouteSecretsFile = s.routeSecrets.Path()
+		form.RouteSecretsHint = s.routeSecretsHint(routeID, form.UpstreamBearerKey)
+		form.RouteSecretsStrict = s.cfg.RouteSecrets.Strict
+	}
 	if routeID == "" {
 		return
 	}
 	globalBearer, userBearers := s.authManager.RouteUpstreamBearerConfigured(routeID)
 	form.UpstreamBearerConfigured = globalBearer
 	form.UserUpstreamBearerConfigured = userBearers
-	if s.routeSecrets != nil {
-		form.RouteSecretsFile = s.routeSecrets.Path()
-	}
 	if route, ok := s.routeByID(routeID); ok {
 		form.UpstreamBearerSource = s.routeBearerSourceLabel(route)
 		form.UpstreamBearerFromFile = s.routeBearerSource(route) == bearerSourceFile
@@ -2647,6 +2652,7 @@ const adminDashboardTemplate = `
                     <p class="hint">{{if .SelectedRoute.UpstreamBearerConfigured}}Im Gateway ist ein globaler Upstream-Bearer gespeichert.{{else}}Im Gateway ist kein globaler Upstream-Bearer gespeichert.{{end}} Nutzer-spezifische Tokens haben Vorrang.</p>
                     {{if .SelectedRoute.RouteSecretsFile}}<p class="hint">Verwendet wird: {{.SelectedRoute.UpstreamBearerSource}}. Die Secrets-Datei <code>{{.SelectedRoute.RouteSecretsFile}}</code> hat Vorrang vor dem gespeicherten Wert{{if .SelectedRoute.UpstreamBearerFromFile}}; das Feld ist deshalb gesperrt. Ein noch gespeicherter Wert laesst sich unten loeschen{{end}}.</p>{{end}}
                   </div>
+                  {{if .SelectedRoute.RouteSecretsHint}}<p class="hint"><strong>Wert nicht hier eintragen.</strong> Der Gateway schreibt nichts in die Secrets-Datei oder in den Secret-Manager. Der Upstream-Bearer dieser Route wird gepflegt unter: <code>{{.SelectedRoute.RouteSecretsHint}}</code>. Ein hier eingetragener Wert landet nur im Gateway und gilt, solange der Schluessel in der Datei fehlt{{if .SelectedRoute.RouteSecretsStrict}}; im Strict-Modus wird die Route dann nicht weitergeleitet{{end}}.</p>{{end}}
                   {{if .SelectedRoute.RouteSecretsFile}}
                   <div class="field">
                     <label for="upstream_bearer_key">Schluessel in der Secrets-Datei</label>
