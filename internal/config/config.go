@@ -452,8 +452,14 @@ func SaveRoutesFile(routesPath string, routes []Route) error {
 	}
 
 	tempPath := routesPath + ".tmp"
-	if err := os.WriteFile(tempPath, payload, 0o644); err != nil {
+	// 0600 like the auth store: the routes file names upstreams and notes,
+	// and only the gateway needs it. Chmod covers a leftover temp file,
+	// whose mode WriteFile would keep.
+	if err := os.WriteFile(tempPath, payload, 0o600); err != nil {
 		return fmt.Errorf("failed to write routes config: %w", err)
+	}
+	if err := os.Chmod(tempPath, 0o600); err != nil {
+		return fmt.Errorf("failed to set routes config permissions: %w", err)
 	}
 	if err := os.Rename(tempPath, routesPath); err != nil {
 		return fmt.Errorf("failed to replace routes config: %w", err)

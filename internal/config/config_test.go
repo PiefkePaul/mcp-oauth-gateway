@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -196,5 +197,29 @@ func TestUpstreamBearerSecretKey(t *testing.T) {
 	routes := []Route{{ID: "a-b"}, {ID: "a_b"}}
 	if err := ValidateRouteSecretKeys(routes); err == nil {
 		t.Errorf("expected a collision for a-b and a_b")
+	}
+}
+
+func TestSaveRoutesFileIsOwnerOnly(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("file modes are not meaningful on Windows")
+	}
+	path := filepath.Join(t.TempDir(), "routes.yaml")
+	// An existing, world-readable file and a leftover temp file must both
+	// end up owner-only after a save.
+	for _, name := range []string{path, path + ".tmp"} {
+		if err := os.WriteFile(name, []byte("routes: []\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := SaveRoutesFile(path, []Route{{ID: "demo", PathPrefix: "/demo", Upstream: "http://demo:8080"}}); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode := info.Mode().Perm(); mode != 0o600 {
+		t.Errorf("routes file mode = %o, want 600", mode)
 	}
 }
